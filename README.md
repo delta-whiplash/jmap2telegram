@@ -1,0 +1,163 @@
+# jmap2telegram
+
+A self-hosted Telegram bot that turns a [JMAP](https://jmap.io/) mailbox
+(Fastmail, Stalwart Mail Server, and any other JMAP-compliant provider)
+into Telegram notifications — read, mark read, archive, and delete your
+mail without leaving the chat.
+
+This is the JMAP equivalent of Telegram's own GmailBot: instead of Google
+OAuth, you connect your mailbox by sending your provider's server URL and
+an API (Bearer) token directly to the bot in a private message. Because
+JMAP providers authenticate with a bearer token rather than a redirect
+flow, the bot needs no public callback URL, no webhook, and no inbound
+network exposure at all — it only makes outbound connections to Telegram
+and to your JMAP server.
+
+## Why JMAP instead of Gmail
+
+- **No OAuth app to register.** A bearer token from your provider's
+  security settings is all you need.
+- **Push, not polling.** JMAP's `EventSource` mechanism notifies the bot
+  the moment new mail arrives (RFC 8620 §7.3).
+- **Provider-agnostic.** Works with any JMAP server that supports RFC 8620
+  autodiscovery (`/.well-known/jmap`) — Fastmail, Stalwart, and others.
+
+## Security & privacy by design
+
+- **Two environment variables, full stop.** `TELEGRAM_BOT_TOKEN` and
+  `AUTHORIZED_CHAT_IDS` are the only configuration the deployment needs.
+  Everything else (your JMAP server + token) is entered live, per user,
+  through the bot's chat — never through config files or CI secrets.
+- **Hard allowlist.** Only the Telegram chat ids listed in
+  `AUTHORIZED_CHAT_IDS` can interact with the bot at all; everyone else is
+  refused before anything is read, stored, or logged.
+- **Encrypted at rest.** Credentials are stored AES-256-GCM encrypted,
+  with a random master key generated on first boot and kept at 0600 on
+  disk. No email content is ever written to disk — full message bodies
+  are fetched on demand and only held in memory long enough to relay them
+  to Telegram.
+- **The `/login` message self-destructs.** The message carrying your JMAP
+  token is deleted from the chat immediately after the bot reads it.
+- **Right to erasure.** `/logout` permanently and immediately wipes that
+  chat's stored credentials and stops all notifications — no soft delete,
+  no retention window.
+- **No third-party data flows.** The bot talks to exactly two services:
+  the Telegram Bot API and your own JMAP server, both over TLS
+  (`rustls`, no OpenSSL in the dependency tree).
+- **Minimal attack surface.** No inbound ports, no webhook server, no
+  database — a single static binary long-polling Telegram outbound.
+
+See [`SECURITY.md`](SECURITY.md) for the full threat model and how to
+report a vulnerability.
+
+## Quickstart (Docker)
+
+```bash
+docker run -d \
+  --name jmap2telegram \
+  -e TELEGRAM_BOT_TOKEN="123456:ABC-your-bot-token" \
+  -e AUTHORIZED_CHAT_IDS="111111111,222222222" \
+  -v jmap2telegram-data:/data \
+  ghcr.io/delta-whiplash/jmap2telegram:latest
+```
+
+Or with Compose:
+
+```bash
+cp .env.example .env   # fill in TELEGRAM_BOT_TOKEN and AUTHORIZED_CHAT_IDS
+docker compose up -d
+```
+
+Then, in Telegram, from one of the authorized chats:
+
+```
+/start
+/login <server_url> <token>
+```
+
+- `server_url` is your provider's JMAP server root (e.g. Fastmail:
+  `https://jmap.fastmail.com`) — the bot discovers the actual session
+  endpoint itself via `/.well-known/jmap`.
+- `token` is an API (Bearer) token from your provider's security
+  settings — not your account password.
+
+The `/login` message is deleted automatically right after the bot reads
+it, so the token doesn't linger in the chat history.
+
+### Commands
+
+| Command   | Effect                                                        |
+|-----------|----------------------------------------------------------------|
+| `/start`  | Onboarding, or current status if already connected            |
+| `/login`  | `/login <server_url> <token>` — connect a JMAP account         |
+| `/status` | Show the connected account and watcher health                 |
+| `/logout` | Erase stored credentials immediately (GDPR right to erasure)  |
+| `/help`   | List commands                                                 |
+
+Each new-mail notification comes with inline buttons: **Lire tout** (full
+body), **Lu** (mark read), **Archiver**, **Supprimer**.
+
+## Kubernetes (Helm, OCI)
+
+```bash
+helm install jmap2telegram oci://ghcr.io/delta-whiplash/charts/jmap2telegram \
+  --version <chart-version> \
+  --set telegram.botToken="123456:ABC-your-bot-token" \
+  --set telegram.authorizedChatIds="111111111,222222222"
+```
+
+For a real deployment, keep the bot token out of your values files with a
+pre-existing Secret instead:
+
+```bash
+kubectl create secret generic jmap2telegram-token \
+  --from-literal=bot-token="123456:ABC-your-bot-token"
+
+helm install jmap2telegram oci://ghcr.io/delta-whiplash/charts/jmap2telegram \
+  --version <chart-version> \
+  --set telegram.existingSecret=jmap2telegram-token \
+  --set telegram.authorizedChatIds="111111111,222222222"
+```
+
+See [`charts/jmap2telegram/values.yaml`](charts/jmap2telegram/values.yaml)
+for every option (persistence, resources, security context, ...). The
+chart intentionally creates no Service/Ingress — the bot only makes
+outbound connections — and always runs exactly one replica, since it's a
+single stateful long-poller backed by one local encrypted file store.
+
+## Building from source
+
+```bash
+cargo build --release
+cargo test
+```
+
+Requires no system TLS library (rustls throughout). `cargo test` includes
+a mock-server integration test of the JMAP session bootstrap in addition
+to unit tests for the config, encrypted store, and message formatting.
+
+## Releases
+
+Tagging `vX.Y.Z` and pushing it triggers
+[`.github/workflows/release.yml`](.github/workflows/release.yml), which:
+
+1. re-runs the full CI suite (fmt, clippy, tests, `cargo audit`, Docker
+   build, Helm lint);
+2. builds and pushes a multi-arch (`amd64`/`arm64`) Docker image to
+   `ghcr.io/delta-whiplash/jmap2telegram`, tagged `X.Y.Z`, `X.Y`, `X`, and
+   `latest`;
+3. packages and pushes the Helm chart as an OCI artifact to
+   `oci://ghcr.io/delta-whiplash/charts/jmap2telegram`, versioned from the
+   same tag;
+4. cuts a GitHub Release with autogenerated notes.
+
+Dependency updates (Cargo, Docker base images, GitHub Actions) are kept
+current by Dependabot (`.github/dependabot.yml`), opening weekly PRs that
+go through the same CI gate.
+
+## Limitations (v1 scope)
+
+- Notifications and reading/triage only — no compose/reply/forward from
+  Telegram yet (mirrors GmailBot's core loop, not its full feature set).
+- One JMAP account per authorized Telegram chat (multi-tenant); there's no
+  shared-mailbox-to-many-viewers mode.

@@ -1,0 +1,59 @@
+mod bot;
+mod config;
+mod format;
+mod jmap;
+mod state;
+mod store;
+mod watcher;
+
+use std::sync::Arc;
+
+use teloxide::prelude::*;
+
+use config::Config;
+use state::AppState;
+use store::Store;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        .init();
+
+    let config = Arc::new(Config::from_env()?);
+    let store = Arc::new(Store::open(&config.data_dir)?);
+    let state = AppState::new(config.clone(), store.clone());
+
+    let bot = Bot::new(&config.telegram_token);
+
+    // Resume watching every account that survived a restart, without
+    // re-notifying about anything already seen (last_state is resumed
+    // from the encrypted store).
+    for (chat_id, account) in store.all() {
+        match jmap::connect(&account.server_url, &account.token).await {
+            Ok(client) => {
+                let client = Arc::new(client);
+                state.clients.write().await.insert(chat_id, client.clone());
+                let handle = watcher::spawn(bot.clone(), state.clone(), chat_id, client);
+                state.watchers.write().await.insert(chat_id, handle);
+                tracing::info!(chat_id, email = %account.email, "resumed JMAP watcher");
+            }
+            Err(e) => {
+                tracing::warn!(chat_id, error = %e, "failed to resume JMAP account, it will need /login again");
+            }
+        }
+    }
+
+    tracing::info!("jmap2telegram starting");
+
+    Dispatcher::builder(bot, bot::schema())
+        .dependencies(dptree::deps![state])
+        .enable_ctrlc_handler()
+        .build()
+        .dispatch()
+        .await;
+
+    Ok(())
+}

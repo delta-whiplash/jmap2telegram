@@ -1,0 +1,13 @@
+services:
+  jmap2telegram:
+    build: .
+    # Or, once published: image: ghcr.io/<owner>/jmap2telegram:latest
+    restart: unless-stopped
+    environment:
+      TELEGRAM_BOT_TOKEN: "${TELEGRAM_BOT_TOKEN:?set TELEGRAM_BOT_TOKEN in .env}"
+      AUTHORIZED_CHAT_IDS: "${AUTHORIZED_CHAT_IDS:?set AUTHORIZED_CHAT_IDS in .env}"
+    volumes:
+      - jmap2telegram-data:/data
+
+volumes:
+  jmap2telegram-data:

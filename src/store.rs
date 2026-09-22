@@ -1,0 +1,301 @@
+use std::collections::HashMap;
+use std::fs;
+use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::sync::RwLock;
+
+use aes_gcm::aead::{Aead, KeyInit};
+use aes_gcm::{Aes256Gcm, Key, Nonce};
+use anyhow::{Context, Result, bail};
+use rand::{Rng, rng};
+use serde::{Deserialize, Serialize};
+
+const NONCE_LEN: usize = 12;
+const KEY_LEN: usize = 32;
+
+/// A single authorized user's JMAP account, as entered live through the bot.
+///
+/// This is the only personal data the bot ever persists. No email content
+/// is ever written to disk: `last_state` is just an opaque JMAP sync
+/// cursor, not a copy of any message.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Account {
+    pub server_url: String,
+    pub token: String,
+    pub email: String,
+    pub last_state: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct StoreData {
+    /// Telegram chat id -> connected JMAP account.
+    accounts: HashMap<i64, Account>,
+}
+
+/// Encrypted-at-rest, on-disk key/value store for per-chat JMAP accounts.
+///
+/// The state file (`state.enc`) is AES-256-GCM encrypted with a random key
+/// generated on first boot and kept in `master.key` next to it, both under
+/// 0600 permissions. This protects credentials against casual disk/backup
+/// leakage; anyone with access to the running container's filesystem still
+/// has access to both files, which is the accepted trade-off for a
+/// deployment with no third env var / external KMS.
+pub struct Store {
+    state_path: PathBuf,
+    key: [u8; KEY_LEN],
+    data: RwLock<StoreData>,
+}
+
+impl Store {
+    pub fn open(dir: &Path) -> Result<Self> {
+        fs::create_dir_all(dir).with_context(|| format!("creating data dir {dir:?}"))?;
+
+        let key_path = dir.join("master.key");
+        let key = load_or_create_key(&key_path)?;
+
+        let state_path = dir.join("state.enc");
+        let data = if state_path.exists() {
+            let ciphertext = fs::read(&state_path).context("reading state file")?;
+            decrypt(&key, &ciphertext)
+                .context("decrypting state file (master key changed or corrupted state?)")?
+        } else {
+            StoreData::default()
+        };
+
+        Ok(Self {
+            state_path,
+            key,
+            data: RwLock::new(data),
+        })
+    }
+
+    pub fn get(&self, chat_id: i64) -> Option<Account> {
+        self.data.read().unwrap().accounts.get(&chat_id).cloned()
+    }
+
+    pub fn all(&self) -> Vec<(i64, Account)> {
+        self.data
+            .read()
+            .unwrap()
+            .accounts
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect()
+    }
+
+    pub fn set(&self, chat_id: i64, account: Account) -> Result<()> {
+        {
+            let mut data = self.data.write().unwrap();
+            data.accounts.insert(chat_id, account);
+        }
+        self.persist()
+    }
+
+    pub fn update_state(&self, chat_id: i64, state: String) -> Result<()> {
+        {
+            let mut data = self.data.write().unwrap();
+            match data.accounts.get_mut(&chat_id) {
+                Some(acc) => acc.last_state = Some(state),
+                None => return Ok(()),
+            }
+        }
+        self.persist()
+    }
+
+    /// Removes a chat's account. This is the GDPR "right to erasure" path:
+    /// once this returns, nothing about that user remains on disk.
+    pub fn remove(&self, chat_id: i64) -> Result<bool> {
+        let removed = {
+            let mut data = self.data.write().unwrap();
+            data.accounts.remove(&chat_id).is_some()
+        };
+        if removed {
+            self.persist()?;
+        }
+        Ok(removed)
+    }
+
+    fn persist(&self) -> Result<()> {
+        let plaintext = {
+            let data = self.data.read().unwrap();
+            serde_json::to_vec(&*data)?
+        };
+        let ciphertext = encrypt(&self.key, &plaintext)?;
+
+        // Write-then-rename for crash safety; never leave a half-written
+        // state file in place of a good one.
+        let tmp_path = self.state_path.with_extension("tmp");
+        {
+            let mut f = fs::File::create(&tmp_path)?;
+            f.write_all(&ciphertext)?;
+            f.sync_all()?;
+        }
+        fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600))?;
+        fs::rename(&tmp_path, &self.state_path)?;
+        Ok(())
+    }
+}
+
+fn load_or_create_key(key_path: &Path) -> Result<[u8; KEY_LEN]> {
+    if key_path.exists() {
+        let bytes = fs::read(key_path).context("reading master key")?;
+        if bytes.len() != KEY_LEN {
+            bail!(
+                "master key file has unexpected length ({} bytes)",
+                bytes.len()
+            );
+        }
+        let mut key = [0u8; KEY_LEN];
+        key.copy_from_slice(&bytes);
+        Ok(key)
+    } else {
+        let mut key = [0u8; KEY_LEN];
+        rng().fill_bytes(&mut key);
+        fs::write(key_path, key).context("writing master key")?;
+        fs::set_permissions(key_path, fs::Permissions::from_mode(0o600))?;
+        Ok(key)
+    }
+}
+
+fn encrypt(key: &[u8; KEY_LEN], plaintext: &[u8]) -> Result<Vec<u8>> {
+    let cipher = Aes256Gcm::new(&Key::<Aes256Gcm>::from(*key));
+    let mut nonce_bytes = [0u8; NONCE_LEN];
+    rng().fill_bytes(&mut nonce_bytes);
+    let nonce = Nonce::from(nonce_bytes);
+
+    let mut ciphertext = cipher
+        .encrypt(&nonce, plaintext)
+        .map_err(|e| anyhow::anyhow!("encryption failed: {e}"))?;
+
+    let mut out = nonce_bytes.to_vec();
+    out.append(&mut ciphertext);
+    Ok(out)
+}
+
+fn decrypt(key: &[u8; KEY_LEN], data: &[u8]) -> Result<StoreData> {
+    if data.len() < NONCE_LEN {
+        bail!("state file too short");
+    }
+    let (nonce_bytes, ciphertext) = data.split_at(NONCE_LEN);
+    let cipher = Aes256Gcm::new(&Key::<Aes256Gcm>::from(*key));
+    let nonce_arr: [u8; NONCE_LEN] = nonce_bytes.try_into().expect("checked length above");
+    let nonce = Nonce::from(nonce_arr);
+
+    let plaintext = cipher
+        .decrypt(&nonce, ciphertext)
+        .map_err(|e| anyhow::anyhow!("decryption failed: {e}"))?;
+
+    Ok(serde_json::from_slice(&plaintext)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn account(email: &str) -> Account {
+        Account {
+            server_url: "https://jmap.example.org/session".to_string(),
+            token: "s3cr3t-token".to_string(),
+            email: email.to_string(),
+            last_state: None,
+        }
+    }
+
+    #[test]
+    fn encrypt_decrypt_roundtrip() {
+        let key = [7u8; KEY_LEN];
+        let plaintext = b"hello world, this is a secret".to_vec();
+        let ciphertext = encrypt(&key, &plaintext).unwrap();
+        assert_ne!(ciphertext, plaintext, "ciphertext must not equal plaintext");
+
+        let mut data = StoreData::default();
+        data.accounts.insert(1, account("a@b.c"));
+        let plaintext = serde_json::to_vec(&data).unwrap();
+        let ciphertext = encrypt(&key, &plaintext).unwrap();
+        let decrypted = decrypt(&key, &ciphertext).unwrap();
+        assert_eq!(decrypted.accounts.len(), 1);
+        assert_eq!(decrypted.accounts[&1].email, "a@b.c");
+    }
+
+    #[test]
+    fn decrypt_fails_with_wrong_key() {
+        let key_a = [1u8; KEY_LEN];
+        let key_b = [2u8; KEY_LEN];
+        let ciphertext = encrypt(&key_a, b"top secret").unwrap();
+        assert!(decrypt(&key_b, &ciphertext).is_err());
+    }
+
+    #[test]
+    fn decrypt_fails_on_truncated_data() {
+        let key = [3u8; KEY_LEN];
+        assert!(decrypt(&key, b"short").is_err());
+    }
+
+    #[test]
+    fn two_encryptions_of_same_plaintext_use_different_nonces() {
+        let key = [9u8; KEY_LEN];
+        let a = encrypt(&key, b"same plaintext").unwrap();
+        let b = encrypt(&key, b"same plaintext").unwrap();
+        assert_ne!(a, b, "nonce reuse would leak that plaintexts are identical");
+    }
+
+    #[test]
+    fn set_get_and_persist_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.set(42, account("user@example.org")).unwrap();
+        assert_eq!(store.get(42).unwrap().email, "user@example.org");
+
+        // Reopen: must survive a restart using the same on-disk key/state.
+        drop(store);
+        let reopened = Store::open(dir.path()).unwrap();
+        assert_eq!(reopened.get(42).unwrap().email, "user@example.org");
+    }
+
+    #[test]
+    fn master_key_file_has_owner_only_permissions() {
+        let dir = tempfile::tempdir().unwrap();
+        let _store = Store::open(dir.path()).unwrap();
+        let meta = fs::metadata(dir.path().join("master.key")).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn remove_erases_account_and_reports_whether_it_existed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.set(1, account("a@b.c")).unwrap();
+
+        assert!(store.remove(1).unwrap());
+        assert!(store.get(1).is_none());
+        // Erasure must be durable, not just in-memory.
+        let reopened = Store::open(dir.path()).unwrap();
+        assert!(reopened.get(1).is_none());
+
+        // Removing again is a no-op, not an error.
+        assert!(!store.remove(1).unwrap());
+    }
+
+    #[test]
+    fn update_state_is_ignored_for_unknown_chat() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        // Must not panic or create a phantom account.
+        store.update_state(999, "state-x".to_string()).unwrap();
+        assert!(store.get(999).is_none());
+    }
+
+    #[test]
+    fn all_lists_every_stored_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.set(1, account("a@b.c")).unwrap();
+        store.set(2, account("d@e.f")).unwrap();
+        let mut all = store.all();
+        all.sort_by_key(|(id, _)| *id);
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].0, 1);
+        assert_eq!(all[1].0, 2);
+    }
+}

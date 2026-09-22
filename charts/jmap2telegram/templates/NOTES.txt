@@ -1,0 +1,18 @@
+jmap2telegram is deploying.
+
+This bot makes no inbound connections (no Service/Ingress is created): it
+long-polls the Telegram Bot API outbound, so there's nothing to expose.
+
+Check it came up:
+  kubectl get pods -l app.kubernetes.io/instance={{ .Release.Name }} -n {{ .Release.Namespace }}
+  kubectl logs -l app.kubernetes.io/instance={{ .Release.Name }} -n {{ .Release.Namespace }} -f
+
+Then open Telegram, start a chat with your bot, and send /start from one of
+the chat ids listed in telegram.authorizedChatIds.
+
+{{- if not .Values.persistence.enabled }}
+
+⚠️  persistence.enabled=false: connected JMAP accounts will be lost on every
+    pod restart, and everyone will need to /login again. Fine for a quick
+    test, not recommended otherwise.
+{{- end }}

@@ -1,0 +1,72 @@
+# Default values for jmap2telegram.
+
+image:
+  repository: ghcr.io/delta-whiplash/jmap2telegram
+  tag: "latest"
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+telegram:
+  # Bearer token from @BotFather. Required unless existingSecret is set.
+  botToken: ""
+  # Name of a pre-existing Secret carrying the bot token, so the token
+  # never needs to sit in values.yaml / a values file / your git history.
+  # The secret must have a key named "bot-token".
+  existingSecret: ""
+  # Comma-separated Telegram chat ids allowed to use the bot. Not a
+  # credential (it's a numeric allowlist), so it's passed as a plain env
+  # var rather than through a Secret.
+  authorizedChatIds: ""
+
+# Persistent storage for the AES-256-GCM-encrypted credential store
+# (master.key + state.enc). This is the only state the bot keeps; losing
+# the volume just means every user has to run /login again.
+persistence:
+  enabled: true
+  # If set, use an existing PVC instead of creating one.
+  existingClaim: ""
+  storageClassName: ""
+  accessMode: ReadWriteOnce
+  size: 64Mi
+
+# This app is a single stateful long-poller against the Telegram Bot API
+# with a local encrypted file store: it must run as exactly one replica.
+# Do not scale this up — multiple replicas would double-notify and race
+# on the same volume.
+replicaCount: 1
+
+resources:
+  requests:
+    cpu: 10m
+    memory: 32Mi
+  limits:
+    memory: 128Mi
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 100
+  runAsGroup: 101
+  fsGroup: 101
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+podAnnotations: {}
+podLabels: {}
+
+extraEnv: []
+# - name: RUST_LOG
+#   value: info
+
+logLevel: info

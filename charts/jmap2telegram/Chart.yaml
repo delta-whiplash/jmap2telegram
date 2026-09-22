@@ -1,0 +1,16 @@
+apiVersion: v2
+name: jmap2telegram
+description: A secure, self-hosted Telegram bot that turns JMAP mailboxes into Telegram notifications
+type: application
+version: 0.0.0-dev
+appVersion: "0.0.0-dev"
+home: https://github.com/delta-whiplash/jmap2telegram
+sources:
+  - https://github.com/delta-whiplash/jmap2telegram
+keywords:
+  - jmap
+  - telegram
+  - email
+  - notifications
+maintainers:
+  - name: delta-whiplash
