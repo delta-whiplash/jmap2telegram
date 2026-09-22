@@ -67,6 +67,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: azure/setup-helm@v4
+      - uses: azure/setup-helm@v5
       - run: helm lint charts/jmap2telegram
       - run: helm template charts/jmap2telegram --set telegram.botToken=dummy --set telegram.authorizedChatIds=1 > /dev/null
