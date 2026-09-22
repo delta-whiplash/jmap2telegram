@@ -50,8 +50,10 @@ spec:
               value: /data
             - name: ALLOW_PRIVATE_JMAP_HOSTS
               value: {{ .Values.telegram.allowPrivateJmapHosts | quote }}
-            - name: RUST_LOG
+            - name: LOG_LEVEL
               value: {{ .Values.logLevel | quote }}
+            - name: TIMEZONE
+              value: {{ .Values.timezone | quote }}
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

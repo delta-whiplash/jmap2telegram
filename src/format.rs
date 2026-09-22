@@ -1,3 +1,4 @@
+use chrono_tz::Tz;
 use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup};
 
 use crate::jmap::EmailSummary;
@@ -22,7 +23,7 @@ fn truncate(input: &str, limit: usize) -> String {
     }
 }
 
-pub fn notification_text(summary: &EmailSummary) -> String {
+pub fn notification_text(summary: &EmailSummary, tz: Tz) -> String {
     let from = match (&summary.from_name, &summary.from_addr) {
         (Some(name), Some(addr)) if !name.is_empty() => format!(
             "{} <{}>",
@@ -36,7 +37,11 @@ pub fn notification_text(summary: &EmailSummary) -> String {
     let when = summary
         .received_at
         .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0))
-        .map(|dt| dt.format("%d/%m/%Y %H:%M UTC").to_string())
+        .map(|dt| {
+            dt.with_timezone(&tz)
+                .format("%d/%m/%Y %H:%M %Z")
+                .to_string()
+        })
         .unwrap_or_default();
 
     let subject = truncate(summary.subject.trim(), FIELD_LIMIT);
@@ -178,7 +183,7 @@ mod tests {
             Some("alice@example.org"),
             "Hi there",
         );
-        let text = notification_text(&s);
+        let text = notification_text(&s, Tz::UTC);
         assert!(text.contains("Alice"));
         // '.' is a MarkdownV2 special char, so the address is expected
         // escaped in the rendered text, not verbatim.
@@ -190,14 +195,14 @@ mod tests {
     #[test]
     fn notification_text_falls_back_when_sender_unknown() {
         let s = summary("Hello", None, None, "Hi there");
-        let text = notification_text(&s);
+        let text = notification_text(&s, Tz::UTC);
         assert!(text.contains("expéditeur inconnu"));
     }
 
     #[test]
     fn notification_text_uses_address_when_name_missing() {
         let s = summary("Hello", None, Some("bob@example.org"), "Hi");
-        let text = notification_text(&s);
+        let text = notification_text(&s, Tz::UTC);
         assert!(text.contains(r"bob@example\.org"));
     }
 
@@ -211,7 +216,7 @@ mod tests {
             Some("a@b.c"),
             "",
         );
-        let text = notification_text(&s);
+        let text = notification_text(&s, Tz::UTC);
         assert!(text.contains(r"\*bold\* \_italic\_ \[link\]\(evil\) \`code\`"));
     }
 
@@ -219,7 +224,7 @@ mod tests {
     fn notification_text_truncates_long_preview() {
         let long_preview = "a".repeat(1000);
         let s = summary("Subject", None, Some("a@b.c"), &long_preview);
-        let text = notification_text(&s);
+        let text = notification_text(&s, Tz::UTC);
         // 400 chars kept + ellipsis marker, well short of the original 1000.
         assert!(text.len() < 700);
         assert!(text.contains('…'));
@@ -232,7 +237,7 @@ mod tests {
         // dropped (send_message fails, but the JMAP cursor still advances).
         let long_subject = "s".repeat(5000);
         let s = summary(&long_subject, None, Some("a@b.c"), "preview");
-        let text = notification_text(&s);
+        let text = notification_text(&s, Tz::UTC);
         assert!(text.chars().count() < TELEGRAM_MAX_MESSAGE_LEN);
         assert!(text.contains('…'));
     }
@@ -241,7 +246,7 @@ mod tests {
     fn notification_text_truncates_malicious_long_sender_name() {
         let long_name = "n".repeat(5000);
         let s = summary("Subject", Some(&long_name), Some("a@b.c"), "preview");
-        let text = notification_text(&s);
+        let text = notification_text(&s, Tz::UTC);
         assert!(text.chars().count() < TELEGRAM_MAX_MESSAGE_LEN);
     }
 
@@ -252,12 +257,25 @@ mod tests {
         // a display name is also present.
         let long_addr = format!("{}@example.org", "a".repeat(5000));
         let s = summary("Subject", None, Some(&long_addr), "preview");
-        let text = notification_text(&s);
+        let text = notification_text(&s, Tz::UTC);
         assert!(text.chars().count() < TELEGRAM_MAX_MESSAGE_LEN);
 
         let s_with_name = summary("Subject", Some("Alice"), Some(&long_addr), "preview");
-        let text_with_name = notification_text(&s_with_name);
+        let text_with_name = notification_text(&s_with_name, Tz::UTC);
         assert!(text_with_name.chars().count() < TELEGRAM_MAX_MESSAGE_LEN);
+    }
+
+    #[test]
+    fn notification_text_renders_received_at_in_the_configured_timezone() {
+        // 1_700_000_000 is 2023-11-14T22:13:20Z; Europe/Paris was on
+        // CET (UTC+1) at that instant, so the rendered hour must differ
+        // from the UTC rendering rather than silently always being UTC.
+        let s = summary("Subject", None, Some("a@b.c"), "preview");
+        let utc_text = notification_text(&s, Tz::UTC);
+        let paris_text = notification_text(&s, chrono_tz::Europe::Paris);
+        assert!(utc_text.contains("22:13"));
+        assert!(paris_text.contains("23:13"));
+        assert_ne!(utc_text, paris_text);
     }
 
     #[test]

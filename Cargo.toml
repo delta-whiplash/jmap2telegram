@@ -7,13 +7,27 @@ edition = "2024"
 aes-gcm = "0.11.1"
 anyhow = "1.0.104"
 chrono = "0.4.45"
+chrono-tz = "0.10.4"
 futures-util = "0.3.34"
-jmap-client = { version = "0.4.2", features = ["async"] }
+# default-features = false matters here: jmap-client's defaults are
+# [async, websockets, aws_lc_rs] and we only need `async` (plain
+# HTTP + EventSource, not JMAP-over-WebSocket) — this drops the unused
+# tokio-tungstenite/tungstenite stack entirely. It does NOT drop
+# aws-lc-sys (still the single biggest compile-time cost in this
+# project, ~75s of C/assembly): jmap-client's [dependencies.reqwest]
+# requests reqwest's plain "rustls" feature unconditionally (not behind
+# any of its own optional flags), and on reqwest 0.13.x that feature
+# name resolves to the aws-lc-rs backend. teloxide-core still pins the
+# older reqwest 0.12.x, whose equivalently-named "rustls-tls" feature
+# resolves to `ring` instead — two incompatible reqwest majors that
+# Cargo can't merge, so both TLS backends get compiled. Not fixable from
+# here without patching one of the two upstream crates; see README.
+jmap-client = { version = "0.4.2", default-features = false, features = ["async"] }
 rand = "0.10.3"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 teloxide = { version = "0.17.0", default-features = false, features = ["macros", "ctrlc_handler", "rustls", "throttle"] }
-tokio = { version = "1.53.1", features = ["full"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 url = "2.5.8"
@@ -21,3 +35,6 @@ url = "2.5.8"
 [dev-dependencies]
 tempfile = "3.27.0"
 wiremock = "0.6.5"
+
+[profile.release]
+strip = true

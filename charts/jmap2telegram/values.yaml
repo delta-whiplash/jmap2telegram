@@ -74,7 +74,14 @@ podAnnotations: {}
 podLabels: {}
 
 extraEnv: []
+# For advanced per-module filtering (tracing's EnvFilter syntax), which
+# always overrides logLevel below:
 # - name: RUST_LOG
-#   value: info
+#   value: jmap2telegram=debug,teloxide=info
 
+# Simple level knob: trace, debug, info, warn, or error.
 logLevel: info
+
+# IANA zone name (e.g. "Europe/Paris"), used to render notification and
+# log timestamps. Defaults to UTC.
+timezone: UTC

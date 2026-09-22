@@ -106,7 +106,7 @@ async fn sync_and_notify(bot: &Bot, state: &AppState, chat_id: i64, client: &Arc
     };
 
     for summary in &summaries {
-        let text = notification_text(summary);
+        let text = notification_text(summary, state.config.timezone);
         let keyboard = notification_keyboard(&summary.id);
         if let Err(e) = bot
             .send_message(ChatId(chat_id), text)

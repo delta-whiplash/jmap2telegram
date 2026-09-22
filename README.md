@@ -33,8 +33,8 @@ and to your JMAP server.
   `AUTHORIZED_CHAT_IDS` are the only configuration the deployment needs.
   Everything else (your JMAP server + token) is entered live, per user,
   through the bot's chat — never through config files or CI secrets.
-  (`DATA_DIR` and `ALLOW_PRIVATE_JMAP_HOSTS` are optional, off-by-default
-  overrides for advanced setups — see below.)
+  (`DATA_DIR`, `ALLOW_PRIVATE_JMAP_HOSTS`, `TIMEZONE`, and `LOG_LEVEL` are
+  optional overrides for advanced setups — see below.)
 - **SSRF-safe by default.** `/login`'s `server_url` is only ever used if
   it resolves to a public address; private/loopback/link-local/metadata
   addresses are refused unless you explicitly opt in with
@@ -111,6 +111,18 @@ it, so the token doesn't linger in the chat history.
 
 Each new-mail notification comes with inline buttons: **Lire tout** (full
 body), **Lu** (mark read), **Archiver**, **Supprimer**.
+
+### Environment variables
+
+| Variable                  | Required | Default | Effect                                                                 |
+|----------------------------|----------|---------|-------------------------------------------------------------------------|
+| `TELEGRAM_BOT_TOKEN`       | yes      | —       | Bearer token from @BotFather                                           |
+| `AUTHORIZED_CHAT_IDS`      | yes      | —       | Comma-separated allowlist of Telegram chat ids                        |
+| `DATA_DIR`                 | no       | `/data` | Where the encrypted credential store lives                            |
+| `ALLOW_PRIVATE_JMAP_HOSTS` | no       | `0`     | Set to `1` to allow `/login` to a private/internal JMAP server (SSRF guard bypass) |
+| `TIMEZONE`                 | no       | `UTC`   | IANA zone name (e.g. `Europe/Paris`) for notification and log timestamps |
+| `LOG_LEVEL`                | no       | `info`  | `trace`, `debug`, `info`, `warn`, or `error`                           |
+| `RUST_LOG`                 | no       | —       | Advanced per-module filter (tracing's `EnvFilter` syntax); overrides `LOG_LEVEL` when set |
 
 ## Kubernetes (Helm, OCI)
 

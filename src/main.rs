@@ -2,6 +2,7 @@ mod bot;
 mod config;
 mod format;
 mod jmap;
+mod logging;
 mod state;
 mod store;
 mod watcher;
@@ -26,11 +27,12 @@ pub type Bot = teloxide::adaptors::Throttle<teloxide::Bot>;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .init();
+    // Timezone is needed before `Config` is fully loaded (to time-stamp
+    // even the earliest log lines), so it's parsed once here and again
+    // inside `Config::parse` — both go through the same validated helper.
+    let early_timezone = config::parse_timezone(std::env::var("TIMEZONE").ok().as_deref())
+        .unwrap_or(chrono_tz::Tz::UTC);
+    logging::init(std::env::var("LOG_LEVEL").ok().as_deref(), early_timezone);
 
     let config = Arc::new(Config::from_env()?);
     let store = Arc::new(Store::open(&config.data_dir)?);
