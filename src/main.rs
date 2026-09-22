@@ -8,11 +8,21 @@ mod watcher;
 
 use std::sync::Arc;
 
+use teloxide::adaptors::throttle::Limits;
 use teloxide::prelude::*;
+use teloxide::requests::RequesterExt;
 
 use config::Config;
 use state::AppState;
 use store::Store;
+
+/// Every Telegram request goes through here, not a bare `teloxide::Bot`:
+/// Telegram enforces per-chat (1 msg/s) and overall (30 msg/s) rate
+/// limits, and a chat that receives a burst of notifications (a mailing
+/// list flood, a newsletter blast) would otherwise start getting
+/// `RetryAfter` errors with no retry logic of our own to handle them.
+/// `Limits::default()` matches Telegram's own documented defaults.
+pub type Bot = teloxide::adaptors::Throttle<teloxide::Bot>;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -26,7 +36,7 @@ async fn main() -> anyhow::Result<()> {
     let store = Arc::new(Store::open(&config.data_dir)?);
     let state = AppState::new(config.clone(), store.clone());
 
-    let bot = Bot::new(&config.telegram_token);
+    let bot = teloxide::Bot::new(&config.telegram_token).throttle(Limits::default());
 
     // Resume watching every account that survived a restart, without
     // re-notifying about anything already seen (last_state is resumed

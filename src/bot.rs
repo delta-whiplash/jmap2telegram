@@ -3,6 +3,7 @@ use teloxide::prelude::*;
 use teloxide::types::{InlineKeyboardMarkup, Me};
 use teloxide::utils::command::BotCommands;
 
+use crate::Bot;
 use crate::format::{TELEGRAM_MAX_MESSAGE_LEN, chunk_text};
 use crate::jmap;
 use crate::state::AppState;

@@ -12,7 +12,7 @@ jmap-client = { version = "0.4.2", features = ["async"] }
 rand = "0.10.3"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
-teloxide = { version = "0.17.0", default-features = false, features = ["macros", "ctrlc_handler", "rustls"] }
+teloxide = { version = "0.17.0", default-features = false, features = ["macros", "ctrlc_handler", "rustls", "throttle"] }
 tokio = { version = "1.53.1", features = ["full"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

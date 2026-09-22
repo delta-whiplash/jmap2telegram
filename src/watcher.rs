@@ -7,6 +7,7 @@ use jmap_client::event_source::PushNotification;
 use teloxide::prelude::*;
 use teloxide::types::ParseMode;
 
+use crate::Bot;
 use crate::format::{notification_keyboard, notification_text};
 use crate::jmap;
 use crate::state::AppState;

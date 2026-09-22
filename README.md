@@ -21,6 +21,11 @@ and to your JMAP server.
   the moment new mail arrives (RFC 8620 §7.3).
 - **Provider-agnostic.** Works with any JMAP server that supports RFC 8620
   autodiscovery (`/.well-known/jmap`) — Fastmail, Stalwart, and others.
+- **Respects Telegram's rate limits.** Every outbound Telegram request goes
+  through `teloxide`'s throttle adaptor at Telegram's own documented
+  defaults (1 msg/s per chat, 30 msg/s overall) with automatic retry on
+  `RetryAfter`, so a burst of new mail (a mailing list flood, a newsletter)
+  can't get individual notifications dropped or delayed out of order.
 
 ## Security & privacy by design
 
