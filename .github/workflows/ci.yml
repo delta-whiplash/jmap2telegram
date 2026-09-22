@@ -60,6 +60,8 @@ jobs:
           push: false
           load: true
           tags: jmap2telegram:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
   helm-lint:
     runs-on: ubuntu-latest

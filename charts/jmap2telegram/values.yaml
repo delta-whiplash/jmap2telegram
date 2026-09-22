@@ -52,9 +52,10 @@ resources:
 
 podSecurityContext:
   runAsNonRoot: true
-  runAsUser: 100
-  runAsGroup: 101
-  fsGroup: 101
+  # Matches gcr.io/distroless/cc-debian12:nonroot's fixed identity.
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
   seccompProfile:
     type: RuntimeDefault
 

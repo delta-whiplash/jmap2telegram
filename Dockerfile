@@ -1,14 +1,29 @@
 # syntax=docker/dockerfile:1
 #
-# Two-stage build producing a small, statically-linked (musl) binary with
-# no OpenSSL/native-tls in the dependency tree (TLS is rustls end to end),
-# so the runtime image needs nothing but the binary and CA roots.
+# Two-stage build. Deliberately glibc (Debian), not musl/Alpine: musl's
+# allocator makes multi-core rustc/cargo builds noticeably slower than
+# glibc for a dependency tree this size, and that difference is the
+# dominant cost in CI, not final image size (we don't ship OpenSSL either
+# way — TLS is rustls end to end, so glibc adds no extra runtime
+# dependency risk). The runtime stage is distroless: no shell, no package
+# manager, nothing beyond the binary, libc, and CA roots.
 
-FROM rust:1-alpine AS builder
-RUN apk add --no-cache musl-dev
+FROM rust:1-slim-bookworm AS builder
+RUN apt-get update && apt-get install -y --no-install-recommends mold \
+    && rm -rf /var/lib/apt/lists/*
+RUN mkdir -p /build/.cargo && printf '%s\n' \
+    '[target.x86_64-unknown-linux-gnu]' \
+    'rustflags = ["-C", "link-arg=-fuse-ld=mold"]' \
+    '[target.aarch64-unknown-linux-gnu]' \
+    'rustflags = ["-C", "link-arg=-fuse-ld=mold"]' \
+    > /build/.cargo/config.toml
 WORKDIR /build
 
-# Cache dependency builds separately from source changes.
+# Cache dependency builds separately from source changes: this layer is
+# only invalidated when Cargo.toml/Cargo.lock change, not on every source
+# edit. Combined with the GitHub Actions buildx cache (see release.yml /
+# ci.yml), it's what makes repeat builds fast rather than the Dockerfile
+# structure alone.
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir src && echo "fn main() {}" > src/main.rs \
     && cargo build --release \
@@ -18,18 +33,11 @@ COPY src ./src
 RUN touch src/main.rs && cargo build --release \
     && strip target/release/jmap2telegram
 
-FROM alpine:3.20 AS runtime
-# Fixed, non-root UID/GID so Kubernetes securityContext (runAsUser/fsGroup)
-# can pin the same identity without depending on adduser's auto-assignment.
-RUN apk add --no-cache ca-certificates \
-    && addgroup -S -g 101 jmap2telegram \
-    && adduser -S -u 100 -G jmap2telegram -H -h /data jmap2telegram \
-    && mkdir -p /data \
-    && chown jmap2telegram:jmap2telegram /data
-
+FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
+# distroless nonroot's fixed identity (65532:65532) — keep the Helm
+# chart's securityContext in sync with this.
 COPY --from=builder /build/target/release/jmap2telegram /usr/local/bin/jmap2telegram
 
-USER jmap2telegram
 WORKDIR /data
 VOLUME ["/data"]
 ENV DATA_DIR=/data
