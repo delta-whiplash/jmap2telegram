@@ -54,6 +54,28 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: docker/setup-buildx-action@v4
+        id: buildx
+
+      # type=gha (below) only caches image layers, not the Dockerfile's
+      # RUN --mount=type=cache dirs (cargo registry + target): those are
+      # builder-local state that a fresh-per-job GHA runner never has.
+      # buildkit-cache-dance extracts/injects them through actions/cache
+      # instead, so a Cargo.lock bump only recompiles what changed rather
+      # than the whole dependency tree.
+      - uses: actions/cache@v4
+        id: cache
+        with:
+          path: cache-mount
+          key: docker-cache-mount-${{ hashFiles('Dockerfile', 'Cargo.lock') }}
+          restore-keys: docker-cache-mount-
+
+      - uses: reproducible-containers/buildkit-cache-dance@v3
+        with:
+          builder: ${{ steps.buildx.outputs.name }}
+          cache-dir: cache-mount
+          dockerfile: Dockerfile
+          skip-extraction: ${{ steps.cache.outputs.cache-hit }}
+
       - uses: docker/build-push-action@v7
         with:
           context: .
