@@ -38,24 +38,37 @@ jobs:
             echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Create release tag (manual dispatch only)
+      - name: Create or move release tag (manual dispatch only)
         if: github.event_name == 'workflow_dispatch'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: v${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
-          status=$(curl -s -o /dev/null -w '%{http_code}' \
+          # A manual dispatch always means "release what's at this ref
+          # right now" — so an existing tag for this version gets moved
+          # to the dispatched commit rather than silently reused, or a
+          # rebuild from an unrelated later commit would build the wrong
+          # code while the tag/release still pointed at the old one.
+          existing_sha=$(curl -s \
             -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${{ github.repository }}/git/refs/tags/${TAG}")
-          if [ "$status" = "200" ]; then
-            echo "Tag ${TAG} already exists, reusing it."
-          else
+            "https://api.github.com/repos/${{ github.repository }}/git/refs/tags/${TAG}" \
+            | jq -r '.object.sha // empty')
+
+          if [ -z "$existing_sha" ]; then
             curl -sS -f -X POST \
               -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
               "https://api.github.com/repos/${{ github.repository }}/git/refs" \
               -d "{\"ref\":\"refs/tags/${TAG}\",\"sha\":\"${{ github.sha }}\"}"
             echo "Created tag ${TAG} at ${{ github.sha }}."
+          elif [ "$existing_sha" != "${{ github.sha }}" ]; then
+            curl -sS -f -X PATCH \
+              -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${{ github.repository }}/git/refs/tags/${TAG}" \
+              -d "{\"sha\":\"${{ github.sha }}\",\"force\":true}"
+            echo "Moved tag ${TAG} from ${existing_sha} to ${{ github.sha }}."
+          else
+            echo "Tag ${TAG} already points at ${{ github.sha }}."
           fi
 
   test:
