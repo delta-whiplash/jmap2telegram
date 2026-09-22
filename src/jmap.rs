@@ -38,12 +38,26 @@ pub async fn connect(server_url: &str, token: &str, allow_private_hosts: bool) -
         bail!("l'URL du serveur JMAP doit commencer par https://");
     }
 
+    let host = url::Url::parse(server_url)
+        .context("URL de serveur JMAP invalide")?
+        .host_str()
+        .context("URL de serveur JMAP sans nom d'hôte")?
+        .to_string();
+
     if !allow_private_hosts {
-        assert_public_host(server_url).await?;
+        assert_public_host(&host, server_url).await?;
     }
 
+    // jmap-client only follows a redirect to a host in this explicit
+    // allowlist (anything else is aborted); RFC 8620 autodiscovery
+    // (`/.well-known/jmap`) commonly 30x-redirects to a same-host session
+    // path (e.g. Stalwart redirects to `/jmap/session`), so without this
+    // every real-world provider that does that would fail to connect.
+    // Trusting only the host the user themselves supplied keeps this from
+    // widening the SSRF surface checked above.
     let client = Client::new()
         .credentials(Credentials::bearer(token))
+        .follow_redirects([host])
         .connect(server_url)
         .await
         .context("connexion/authentification JMAP échouée")?;
@@ -51,15 +65,11 @@ pub async fn connect(server_url: &str, token: &str, allow_private_hosts: bool) -
     Ok(client)
 }
 
-async fn assert_public_host(server_url: &str) -> Result<()> {
+async fn assert_public_host(host: &str, server_url: &str) -> Result<()> {
     let parsed = url::Url::parse(server_url).context("URL de serveur JMAP invalide")?;
-    let host = parsed
-        .host_str()
-        .context("URL de serveur JMAP sans nom d'hôte")?
-        .to_string();
     let port = parsed.port_or_known_default().unwrap_or(443);
 
-    let addrs = tokio::net::lookup_host((host.as_str(), port))
+    let addrs = tokio::net::lookup_host((host, port))
         .await
         .with_context(|| format!("résolution DNS impossible pour {host}"))?;
 
@@ -436,5 +446,46 @@ mod tests {
             .await
             .expect("Email/get(ids: []) should succeed against the mock");
         assert_eq!(state, "email-state-1");
+    }
+
+    /// Regression test: Stalwart (and likely other JMAP servers) 30x-
+    /// redirects `/.well-known/jmap` to a same-host session path (e.g.
+    /// `/jmap/session`) instead of serving the session object directly.
+    /// jmap-client's `connect()` only follows a redirect to a host in its
+    /// explicit `follow_redirects` allowlist, aborting anything else — our
+    /// `connect()` wrapper must populate that allowlist with the server's
+    /// own host, or every provider that redirects like this fails to log
+    /// in. Caught live against a real Stalwart deployment before this test
+    /// existed.
+    #[tokio::test]
+    async fn connect_follows_same_host_redirect_from_well_known_jmap() {
+        let server = MockServer::start().await;
+        let host = url::Url::parse(&server.uri())
+            .unwrap()
+            .host_str()
+            .unwrap()
+            .to_string();
+
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jmap"))
+            .respond_with(ResponseTemplate::new(307).insert_header("Location", "/jmap/session"))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/jmap/session"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(session_body(&server.uri())))
+            .mount(&server)
+            .await;
+
+        // Mirrors this module's connect(): trusts only the server's own host.
+        let client = Client::new()
+            .credentials(Credentials::bearer("test-token-123"))
+            .follow_redirects([host])
+            .connect(&server.uri())
+            .await
+            .expect("same-host redirect from /.well-known/jmap must be followed");
+
+        assert_eq!(account_email(&client), "user@example.org");
     }
 }
