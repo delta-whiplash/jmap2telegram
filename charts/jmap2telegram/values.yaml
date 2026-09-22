@@ -18,6 +18,13 @@ telegram:
   # credential (it's a numeric allowlist), so it's passed as a plain env
   # var rather than through a Secret.
   authorizedChatIds: ""
+  # Off by default: refuses to /login to a JMAP server that resolves to a
+  # private/loopback/link-local address, since AUTHORIZED_CHAT_IDS can
+  # list several mutually-untrusted chats and this closes an SSRF path
+  # into the cluster's internal network. Only enable this if you're
+  # deliberately pointing the bot at a JMAP server on an internal network
+  # you control (and trust every authorized chat with that access).
+  allowPrivateJmapHosts: false
 
 # Persistent storage for the AES-256-GCM-encrypted credential store
 # (master.key + state.enc). This is the only state the bot keeps; losing

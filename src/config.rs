@@ -14,6 +14,15 @@ pub struct Config {
     pub telegram_token: String,
     pub authorized_chat_ids: HashSet<ChatId>,
     pub data_dir: PathBuf,
+    /// Off by default: a `/login`'d server_url that resolves to a
+    /// private/loopback/link-local address is refused, since
+    /// `AUTHORIZED_CHAT_IDS` can list several mutually-untrusted chats and
+    /// nothing should let one of them turn the bot's outbound HTTPS client
+    /// (carrying an attacker-chosen bearer token) into an SSRF probe of
+    /// the deployment's internal network. Self-hosters running their own
+    /// JMAP server on an internal network (e.g. a home LAN) can opt back
+    /// in explicitly.
+    pub allow_private_jmap_hosts: bool,
 }
 
 impl Config {
@@ -22,6 +31,7 @@ impl Config {
             std::env::var("TELEGRAM_BOT_TOKEN").ok(),
             std::env::var("AUTHORIZED_CHAT_IDS").ok(),
             std::env::var("DATA_DIR").ok(),
+            std::env::var("ALLOW_PRIVATE_JMAP_HOSTS").ok(),
         )
     }
 
@@ -33,6 +43,7 @@ impl Config {
         telegram_token: Option<String>,
         raw_ids: Option<String>,
         data_dir: Option<String>,
+        allow_private_jmap_hosts: Option<String>,
     ) -> Result<Self> {
         let telegram_token = telegram_token.context("TELEGRAM_BOT_TOKEN is not set")?;
         if telegram_token.trim().is_empty() {
@@ -60,10 +71,16 @@ impl Config {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/data"));
 
+        let allow_private_jmap_hosts = matches!(
+            allow_private_jmap_hosts.as_deref(),
+            Some("1") | Some("true") | Some("yes")
+        );
+
         Ok(Self {
             telegram_token,
             authorized_chat_ids,
             data_dir,
+            allow_private_jmap_hosts,
         })
     }
 }
@@ -74,33 +91,44 @@ mod tests {
 
     #[test]
     fn rejects_missing_token() {
-        let err = Config::parse(None, Some("123".to_string()), None).unwrap_err();
+        let err = Config::parse(None, Some("123".to_string()), None, None).unwrap_err();
         assert!(err.to_string().contains("TELEGRAM_BOT_TOKEN"));
     }
 
     #[test]
     fn rejects_empty_token() {
-        let err = Config::parse(Some("  ".to_string()), Some("123".to_string()), None).unwrap_err();
+        let err =
+            Config::parse(Some("  ".to_string()), Some("123".to_string()), None, None).unwrap_err();
         assert!(err.to_string().contains("empty"));
     }
 
     #[test]
     fn rejects_missing_chat_ids() {
-        let err = Config::parse(Some("tok".to_string()), None, None).unwrap_err();
+        let err = Config::parse(Some("tok".to_string()), None, None, None).unwrap_err();
         assert!(err.to_string().contains("AUTHORIZED_CHAT_IDS"));
     }
 
     #[test]
     fn rejects_empty_chat_id_list() {
-        let err =
-            Config::parse(Some("tok".to_string()), Some("  , ,".to_string()), None).unwrap_err();
+        let err = Config::parse(
+            Some("tok".to_string()),
+            Some("  , ,".to_string()),
+            None,
+            None,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("at least one"));
     }
 
     #[test]
     fn rejects_non_numeric_chat_id() {
-        let err =
-            Config::parse(Some("tok".to_string()), Some("123,abc".to_string()), None).unwrap_err();
+        let err = Config::parse(
+            Some("tok".to_string()),
+            Some("123,abc".to_string()),
+            None,
+            None,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("invalid chat id"));
     }
 
@@ -109,6 +137,7 @@ mod tests {
         let cfg = Config::parse(
             Some("tok".to_string()),
             Some(" 111 , 222,333 ".to_string()),
+            None,
             None,
         )
         .unwrap();
@@ -120,7 +149,8 @@ mod tests {
 
     #[test]
     fn defaults_data_dir_when_unset() {
-        let cfg = Config::parse(Some("tok".to_string()), Some("1".to_string()), None).unwrap();
+        let cfg =
+            Config::parse(Some("tok".to_string()), Some("1".to_string()), None, None).unwrap();
         assert_eq!(cfg.data_dir, PathBuf::from("/data"));
     }
 
@@ -130,8 +160,40 @@ mod tests {
             Some("tok".to_string()),
             Some("1".to_string()),
             Some("/custom".to_string()),
+            None,
         )
         .unwrap();
         assert_eq!(cfg.data_dir, PathBuf::from("/custom"));
+    }
+
+    #[test]
+    fn private_jmap_hosts_disallowed_by_default() {
+        let cfg =
+            Config::parse(Some("tok".to_string()), Some("1".to_string()), None, None).unwrap();
+        assert!(!cfg.allow_private_jmap_hosts);
+    }
+
+    #[test]
+    fn private_jmap_hosts_can_be_opted_into() {
+        let cfg = Config::parse(
+            Some("tok".to_string()),
+            Some("1".to_string()),
+            None,
+            Some("true".to_string()),
+        )
+        .unwrap();
+        assert!(cfg.allow_private_jmap_hosts);
+    }
+
+    #[test]
+    fn private_jmap_hosts_ignores_unrecognized_values() {
+        let cfg = Config::parse(
+            Some("tok".to_string()),
+            Some("1".to_string()),
+            None,
+            Some("maybe".to_string()),
+        )
+        .unwrap();
+        assert!(!cfg.allow_private_jmap_hosts);
     }
 }

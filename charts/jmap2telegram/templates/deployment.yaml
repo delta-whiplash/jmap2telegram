@@ -48,6 +48,8 @@ spec:
               value: {{ .Values.telegram.authorizedChatIds | required "telegram.authorizedChatIds is required" | quote }}
             - name: DATA_DIR
               value: /data
+            - name: ALLOW_PRIVATE_JMAP_HOSTS
+              value: {{ .Values.telegram.allowPrivateJmapHosts | quote }}
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}
             {{- with .Values.extraEnv }}

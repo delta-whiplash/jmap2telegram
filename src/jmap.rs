@@ -1,3 +1,5 @@
+use std::net::{IpAddr, Ipv4Addr};
+
 use anyhow::{Context, Result, bail};
 use jmap_client::DataType;
 use jmap_client::client::{Client, Credentials};
@@ -23,9 +25,21 @@ pub struct EmailSummary {
 /// `server_url` is the provider's server root (e.g. `https://jmap.fastmail.com`),
 /// *not* a full session endpoint: `jmap-client` performs RFC 8620
 /// autodiscovery by fetching `{server_url}/.well-known/jmap` itself.
-pub async fn connect(server_url: &str, token: &str) -> Result<Client> {
+///
+/// `server_url` is attacker-controlled: it's whatever an authorized chat
+/// typed into `/login`, and `AUTHORIZED_CHAT_IDS` can list several
+/// mutually-untrusted chats. Unless `allow_private_hosts` is set, any
+/// hostname that resolves to a private/loopback/link-local address is
+/// refused before we ever send it the bearer token — otherwise this
+/// would be a ready-made SSRF primitive against the deployment's internal
+/// network (cluster services, cloud metadata endpoints, ...).
+pub async fn connect(server_url: &str, token: &str, allow_private_hosts: bool) -> Result<Client> {
     if !server_url.starts_with("https://") {
         bail!("l'URL du serveur JMAP doit commencer par https://");
+    }
+
+    if !allow_private_hosts {
+        assert_public_host(server_url).await?;
     }
 
     let client = Client::new()
@@ -35,6 +49,66 @@ pub async fn connect(server_url: &str, token: &str) -> Result<Client> {
         .context("connexion/authentification JMAP échouée")?;
 
     Ok(client)
+}
+
+async fn assert_public_host(server_url: &str) -> Result<()> {
+    let parsed = url::Url::parse(server_url).context("URL de serveur JMAP invalide")?;
+    let host = parsed
+        .host_str()
+        .context("URL de serveur JMAP sans nom d'hôte")?
+        .to_string();
+    let port = parsed.port_or_known_default().unwrap_or(443);
+
+    let addrs = tokio::net::lookup_host((host.as_str(), port))
+        .await
+        .with_context(|| format!("résolution DNS impossible pour {host}"))?;
+
+    let mut resolved_any = false;
+    for addr in addrs {
+        resolved_any = true;
+        if is_disallowed_host(addr.ip()) {
+            bail!(
+                "le serveur JMAP '{host}' se résout vers une adresse non publique ({}) : \
+                 refusé pour éviter une attaque SSRF contre le réseau interne du déploiement. \
+                 Si c'est un serveur auto-hébergé volontairement sur un réseau privé, active \
+                 ALLOW_PRIVATE_JMAP_HOSTS=1.",
+                addr.ip()
+            );
+        }
+    }
+    if !resolved_any {
+        bail!("la résolution DNS de '{host}' n'a retourné aucune adresse");
+    }
+    Ok(())
+}
+
+fn is_disallowed_host(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_disallowed_v4(v4),
+        IpAddr::V6(v6) => {
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                return is_disallowed_v4(mapped);
+            }
+            let seg0 = v6.segments()[0];
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || (seg0 & 0xfe00) == 0xfc00 // unique local fc00::/7
+                || (seg0 & 0xffc0) == 0xfe80 // link-local unicast fe80::/10
+        }
+    }
+}
+
+fn is_disallowed_v4(v4: Ipv4Addr) -> bool {
+    v4.is_private()
+        || v4.is_loopback()
+        // Covers 169.254.0.0/16, which includes the 169.254.169.254 cloud
+        // metadata endpoint commonly targeted by SSRF exploits.
+        || v4.is_link_local()
+        || v4.is_unspecified()
+        || v4.is_multicast()
+        || v4.is_broadcast()
+        || v4.is_documentation()
 }
 
 pub fn account_email(client: &Client) -> String {
@@ -190,11 +264,75 @@ mod tests {
 
     #[tokio::test]
     async fn connect_rejects_non_https_url() {
-        let err = connect("http://jmap.example.org/session", "tok")
+        let err = connect("http://jmap.example.org/session", "tok", false)
             .await
             .err()
             .expect("non-https URL must be rejected");
         assert!(err.to_string().contains("https://"));
+    }
+
+    #[tokio::test]
+    async fn connect_rejects_loopback_host_by_default() {
+        let err = connect("https://127.0.0.1", "tok", false)
+            .await
+            .err()
+            .expect("loopback address must be rejected by default (SSRF guard)");
+        assert!(err.to_string().contains("SSRF") || err.to_string().contains("non publique"));
+    }
+
+    #[tokio::test]
+    async fn connect_rejects_cloud_metadata_address_by_default() {
+        // 169.254.169.254 is the cloud-provider metadata endpoint commonly
+        // targeted by SSRF exploits; it falls under is_link_local().
+        let err = connect("https://169.254.169.254", "tok", false)
+            .await
+            .err()
+            .expect("link-local/metadata address must be rejected by default");
+        assert!(err.to_string().contains("non publique"));
+    }
+
+    #[tokio::test]
+    async fn connect_rejects_private_lan_host_by_default() {
+        let err = connect("https://10.0.0.5", "tok", false)
+            .await
+            .err()
+            .expect("RFC1918 address must be rejected by default");
+        assert!(err.to_string().contains("non publique"));
+    }
+
+    #[tokio::test]
+    async fn connect_allows_loopback_when_opted_in() {
+        // With the guard disabled, the request should get past the SSRF
+        // check and fail for a *different* reason (nothing listening),
+        // proving the guard itself was bypassed as intended rather than
+        // some other check silently blocking it too.
+        let err = connect("https://127.0.0.1:1", "tok", true)
+            .await
+            .err()
+            .expect("nothing listens on port 1, connection should still fail");
+        assert!(!err.to_string().contains("non publique"));
+    }
+
+    #[test]
+    fn is_disallowed_host_flags_private_ranges() {
+        assert!(is_disallowed_host("127.0.0.1".parse().unwrap()));
+        assert!(is_disallowed_host("10.1.2.3".parse().unwrap()));
+        assert!(is_disallowed_host("172.16.0.1".parse().unwrap()));
+        assert!(is_disallowed_host("192.168.1.1".parse().unwrap()));
+        assert!(is_disallowed_host("169.254.169.254".parse().unwrap()));
+        assert!(is_disallowed_host("0.0.0.0".parse().unwrap()));
+        assert!(is_disallowed_host("::1".parse().unwrap()));
+        assert!(is_disallowed_host("fc00::1".parse().unwrap()));
+        assert!(is_disallowed_host("fe80::1".parse().unwrap()));
+        // IPv4-mapped IPv6 must not bypass the IPv4 checks.
+        assert!(is_disallowed_host("::ffff:127.0.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn is_disallowed_host_allows_public_ranges() {
+        assert!(!is_disallowed_host("1.1.1.1".parse().unwrap()));
+        assert!(!is_disallowed_host("8.8.8.8".parse().unwrap()));
+        assert!(!is_disallowed_host("2606:4700:4700::1111".parse().unwrap()));
     }
 
     fn session_body(mock_uri: &str) -> serde_json::Value {

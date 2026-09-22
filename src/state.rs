@@ -43,7 +43,14 @@ impl AppState {
             return Ok(None);
         };
 
-        let client = Arc::new(crate::jmap::connect(&account.server_url, &account.token).await?);
+        let client = Arc::new(
+            crate::jmap::connect(
+                &account.server_url,
+                &account.token,
+                self.config.allow_private_jmap_hosts,
+            )
+            .await?,
+        );
         self.clients.write().await.insert(chat_id, client.clone());
         Ok(Some(client))
     }

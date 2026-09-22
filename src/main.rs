@@ -32,7 +32,13 @@ async fn main() -> anyhow::Result<()> {
     // re-notifying about anything already seen (last_state is resumed
     // from the encrypted store).
     for (chat_id, account) in store.all() {
-        match jmap::connect(&account.server_url, &account.token).await {
+        match jmap::connect(
+            &account.server_url,
+            &account.token,
+            config.allow_private_jmap_hosts,
+        )
+        .await
+        {
             Ok(client) => {
                 let client = Arc::new(client);
                 state.clients.write().await.insert(chat_id, client.clone());

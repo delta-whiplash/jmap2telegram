@@ -28,6 +28,16 @@ and to your JMAP server.
   `AUTHORIZED_CHAT_IDS` are the only configuration the deployment needs.
   Everything else (your JMAP server + token) is entered live, per user,
   through the bot's chat — never through config files or CI secrets.
+  (`DATA_DIR` and `ALLOW_PRIVATE_JMAP_HOSTS` are optional, off-by-default
+  overrides for advanced setups — see below.)
+- **SSRF-safe by default.** `/login`'s `server_url` is only ever used if
+  it resolves to a public address; private/loopback/link-local/metadata
+  addresses are refused unless you explicitly opt in with
+  `ALLOW_PRIVATE_JMAP_HOSTS=1`. This matters because `AUTHORIZED_CHAT_IDS`
+  can list several mutually-untrusted users on one deployment.
+- **Private chats only.** The bot ignores anything that isn't a 1:1 DM, so
+  a group chat id in `AUTHORIZED_CHAT_IDS` can't silently hand every
+  member of that group control over one shared mailbox.
 - **Hard allowlist.** Only the Telegram chat ids listed in
   `AUTHORIZED_CHAT_IDS` can interact with the bot at all; everyone else is
   refused before anything is read, stored, or logged.

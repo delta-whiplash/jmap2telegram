@@ -5,9 +5,28 @@ use crate::jmap::EmailSummary;
 /// Telegram's hard limit for a single message's text.
 pub const TELEGRAM_MAX_MESSAGE_LEN: usize = 4096;
 
+/// Every field below (subject, sender name, preview) comes straight from
+/// whatever mail showed up in the mailbox, so all of them are bounded
+/// before being sent: an unbounded field could push the rendered message
+/// past Telegram's 4096-char limit, and `send_message` would then fail
+/// for that notification alone — silently and permanently losing it,
+/// since the JMAP sync cursor still advances past it.
+const FIELD_LIMIT: usize = 300;
+const PREVIEW_LIMIT: usize = 400;
+
+fn truncate(input: &str, limit: usize) -> String {
+    if input.chars().count() > limit {
+        input.chars().take(limit).collect::<String>() + "…"
+    } else {
+        input.to_string()
+    }
+}
+
 pub fn notification_text(summary: &EmailSummary) -> String {
     let from = match (&summary.from_name, &summary.from_addr) {
-        (Some(name), Some(addr)) if !name.is_empty() => format!("{name} <{addr}>"),
+        (Some(name), Some(addr)) if !name.is_empty() => {
+            format!("{} <{addr}>", truncate(name, FIELD_LIMIT))
+        }
         (_, Some(addr)) => addr.clone(),
         _ => "(expéditeur inconnu)".to_string(),
     };
@@ -18,16 +37,13 @@ pub fn notification_text(summary: &EmailSummary) -> String {
         .map(|dt| dt.format("%d/%m/%Y %H:%M UTC").to_string())
         .unwrap_or_default();
 
-    let mut preview = summary.preview.trim().to_string();
-    const PREVIEW_LIMIT: usize = 400;
-    if preview.chars().count() > PREVIEW_LIMIT {
-        preview = preview.chars().take(PREVIEW_LIMIT).collect::<String>() + "…";
-    }
+    let subject = truncate(summary.subject.trim(), FIELD_LIMIT);
+    let preview = truncate(summary.preview.trim(), PREVIEW_LIMIT);
 
     format!(
         "📧 *Nouveau message*\n\n*De :* {from}\n*Objet :* {subject}\n*Reçu :* {when}\n\n{preview}",
         from = escape_markdown(&from),
-        subject = escape_markdown(&summary.subject),
+        subject = escape_markdown(&subject),
         when = escape_markdown(&when),
         preview = escape_markdown(&preview),
     )
@@ -205,6 +221,26 @@ mod tests {
         // 400 chars kept + ellipsis marker, well short of the original 1000.
         assert!(text.len() < 700);
         assert!(text.contains('…'));
+    }
+
+    #[test]
+    fn notification_text_truncates_malicious_long_subject() {
+        // A hostile sender could otherwise push the rendered message past
+        // Telegram's 4096-char cap and get that notification silently
+        // dropped (send_message fails, but the JMAP cursor still advances).
+        let long_subject = "s".repeat(5000);
+        let s = summary(&long_subject, None, Some("a@b.c"), "preview");
+        let text = notification_text(&s);
+        assert!(text.chars().count() < TELEGRAM_MAX_MESSAGE_LEN);
+        assert!(text.contains('…'));
+    }
+
+    #[test]
+    fn notification_text_truncates_malicious_long_sender_name() {
+        let long_name = "n".repeat(5000);
+        let s = summary("Subject", Some(&long_name), Some("a@b.c"), "preview");
+        let text = notification_text(&s);
+        assert!(text.chars().count() < TELEGRAM_MAX_MESSAGE_LEN);
     }
 
     #[test]

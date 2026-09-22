@@ -3,7 +3,7 @@ use std::fs;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
 
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
@@ -45,6 +45,14 @@ pub struct Store {
     state_path: PathBuf,
     key: [u8; KEY_LEN],
     data: RwLock<StoreData>,
+    /// Serializes `persist()` calls. Several tokio tasks (one watcher per
+    /// connected chat, plus message handlers) can call `set`/`update_state`/
+    /// `remove` concurrently; without this, two `persist()` calls could
+    /// interleave their create/write/chmod/rename on the *same* fixed tmp
+    /// path, so one call's rename can vanish from under the other's,
+    /// surfacing a spurious I/O error (or worse, a torn file) even though
+    /// the in-memory state was updated correctly.
+    persist_lock: Mutex<()>,
 }
 
 impl Store {
@@ -67,6 +75,7 @@ impl Store {
             state_path,
             key,
             data: RwLock::new(data),
+            persist_lock: Mutex::new(()),
         })
     }
 
@@ -117,6 +126,16 @@ impl Store {
     }
 
     fn persist(&self) -> Result<()> {
+        // Serializes the whole read-encrypt-write-rename sequence,
+        // including the snapshot of `data`: several tokio tasks (one
+        // watcher per connected chat, plus message handlers) can call
+        // `set`/`update_state`/`remove` concurrently, and without this
+        // lock two persist() calls could interleave their file I/O on the
+        // same fixed tmp path (one's rename disappearing from under the
+        // other), or a slower call could overwrite a newer one's file
+        // with a stale snapshot taken before the lock.
+        let _guard = self.persist_lock.lock().unwrap();
+
         let plaintext = {
             let data = self.data.read().unwrap();
             serde_json::to_vec(&*data)?

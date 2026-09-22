@@ -37,6 +37,15 @@ pub fn schema() -> UpdateHandler<Box<dyn std::error::Error + Send + Sync + 'stat
 async fn message_handler(bot: Bot, msg: Message, me: Me, state: AppState) -> HandlerResult {
     let chat_id = msg.chat.id;
 
+    // Every stored JMAP account is fully controlled (read, archive,
+    // delete) by whoever can talk in its chat. That's a reasonable model
+    // for a 1:1 DM, but silently extends to every member of a group if an
+    // operator ever puts a group chat id in AUTHORIZED_CHAT_IDS — so
+    // refuse non-private chats outright rather than let that happen.
+    if !msg.chat.is_private() {
+        return Ok(());
+    }
+
     if !state.config.authorized_chat_ids.contains(&chat_id) {
         tracing::warn!(chat_id = chat_id.0, "unauthorized access attempt");
         bot.send_message(
@@ -59,8 +68,20 @@ async fn message_handler(bot: Bot, msg: Message, me: Me, state: AppState) -> Han
         }
         Ok(Command::Login { server_url, token }) => {
             // The token is sensitive: remove it from the chat history as
-            // soon as we've read it, regardless of outcome.
-            let _ = bot.delete_message(chat_id, msg.id).await;
+            // soon as we've read it, regardless of outcome. If Telegram
+            // refuses the deletion (e.g. the bot lacks rights in this
+            // chat), the token is left sitting in plain sight, so make
+            // sure the user actually finds out instead of trusting a
+            // promise the bot couldn't keep.
+            if bot.delete_message(chat_id, msg.id).await.is_err() {
+                bot.send_message(
+                    chat_id,
+                    "⚠️ Je n'ai pas pu supprimer ton message /login. Le jeton reste visible \
+                     dans l'historique : supprime-le manuellement et envisage de le révoquer \
+                     et d'en générer un nouveau chez ton fournisseur JMAP.",
+                )
+                .await?;
+            }
             cmd_login(&bot, &state, chat_id, server_url, token).await?;
         }
         Ok(Command::Logout) => cmd_logout(&bot, &state, chat_id).await?,
@@ -107,14 +128,15 @@ async fn cmd_login(
     server_url: String,
     token: String,
 ) -> HandlerResult {
-    let client = match jmap::connect(&server_url, &token).await {
-        Ok(c) => c,
-        Err(e) => {
-            bot.send_message(chat_id, format!("❌ Connexion impossible : {e}"))
-                .await?;
-            return Ok(());
-        }
-    };
+    let client =
+        match jmap::connect(&server_url, &token, state.config.allow_private_jmap_hosts).await {
+            Ok(c) => c,
+            Err(e) => {
+                bot.send_message(chat_id, format!("❌ Connexion impossible : {e}"))
+                    .await?;
+                return Ok(());
+            }
+        };
 
     let email = jmap::account_email(&client);
     let initial_state = match jmap::current_email_state(&client).await {
@@ -138,6 +160,13 @@ async fn cmd_login(
             .await?;
         return Ok(());
     }
+
+    // Re-login while already connected must not leak the previous
+    // watcher: without this, the old task's JoinHandle is silently
+    // overwritten below and keeps running forever with its own JMAP
+    // connection, since its only exit check (the store entry existing)
+    // stays true after a reconnect.
+    state.forget(chat_id.0).await;
 
     let client = std::sync::Arc::new(client);
     state
@@ -213,7 +242,7 @@ async fn callback_handler(bot: Bot, q: CallbackQuery, state: AppState) -> Handle
     let chat_id = message.chat.id;
     let message_id = message.id;
 
-    if !state.config.authorized_chat_ids.contains(&chat_id) {
+    if !message.chat.is_private() || !state.config.authorized_chat_ids.contains(&chat_id) {
         bot.answer_callback_query(q.id).await?;
         return Ok(());
     }
