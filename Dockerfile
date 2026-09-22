@@ -18,7 +18,7 @@ COPY src ./src
 RUN touch src/main.rs && cargo build --release \
     && strip target/release/jmap2telegram
 
-FROM alpine:3.20 AS runtime
+FROM alpine:3.24 AS runtime
 # Fixed, non-root UID/GID so Kubernetes securityContext (runAsUser/fsGroup)
 # can pin the same identity without depending on adduser's auto-assignment.
 RUN apk add --no-cache ca-certificates \
