@@ -165,7 +165,13 @@ async fn cmd_login(
     // watcher: without this, the old task's JoinHandle is silently
     // overwritten below and keeps running forever with its own JMAP
     // connection, since its only exit check (the store entry existing)
-    // stays true after a reconnect.
+    // stays true after a reconnect. This is safe against a concurrent
+    // /login (or a button tap racing this one) for the *same* chat only
+    // because teloxide's default distribution function serializes all
+    // updates for a given chat id onto one worker (see
+    // `teloxide::dispatching::distribution`); this handler never sets
+    // `.distribution_function(...)` on the dispatcher, so don't add one
+    // without re-checking this invariant.
     state.forget(chat_id.0).await;
 
     let client = std::sync::Arc::new(client);

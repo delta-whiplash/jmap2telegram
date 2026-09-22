@@ -109,6 +109,12 @@ fn is_disallowed_v4(v4: Ipv4Addr) -> bool {
         || v4.is_multicast()
         || v4.is_broadcast()
         || v4.is_documentation()
+        // RFC 6598 Carrier-Grade NAT / shared address space (100.64.0.0/10):
+        // not covered by is_private(), but used as real internal-network
+        // space by some deployments (it's Tailscale's default overlay
+        // range, among others). Ipv4Addr::is_shared() would cover this but
+        // is still unstable, so check the range manually.
+        || (v4.octets()[0] == 100 && (v4.octets()[1] & 0b1100_0000) == 0b0100_0000)
 }
 
 pub fn account_email(client: &Client) -> String {
@@ -326,6 +332,20 @@ mod tests {
         assert!(is_disallowed_host("fe80::1".parse().unwrap()));
         // IPv4-mapped IPv6 must not bypass the IPv4 checks.
         assert!(is_disallowed_host("::ffff:127.0.0.1".parse().unwrap()));
+        // RFC 6598 CGNAT/shared address space (100.64.0.0/10) — not covered
+        // by is_private(), used as internal-network space by some
+        // deployments (e.g. Tailscale's default overlay range).
+        assert!(is_disallowed_host("100.64.0.1".parse().unwrap()));
+        assert!(is_disallowed_host("100.100.100.100".parse().unwrap()));
+        assert!(is_disallowed_host("100.127.255.255".parse().unwrap()));
+    }
+
+    #[test]
+    fn is_disallowed_host_does_not_over_block_adjacent_public_ranges() {
+        // Bit-math sanity check: 100.63.x.x and 100.128.x.x sit just
+        // outside 100.64.0.0/10 and must stay allowed.
+        assert!(!is_disallowed_host("100.63.0.1".parse().unwrap()));
+        assert!(!is_disallowed_host("100.128.0.1".parse().unwrap()));
     }
 
     #[test]

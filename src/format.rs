@@ -24,10 +24,12 @@ fn truncate(input: &str, limit: usize) -> String {
 
 pub fn notification_text(summary: &EmailSummary) -> String {
     let from = match (&summary.from_name, &summary.from_addr) {
-        (Some(name), Some(addr)) if !name.is_empty() => {
-            format!("{} <{addr}>", truncate(name, FIELD_LIMIT))
-        }
-        (_, Some(addr)) => addr.clone(),
+        (Some(name), Some(addr)) if !name.is_empty() => format!(
+            "{} <{}>",
+            truncate(name, FIELD_LIMIT),
+            truncate(addr, FIELD_LIMIT)
+        ),
+        (_, Some(addr)) => truncate(addr, FIELD_LIMIT),
         _ => "(expéditeur inconnu)".to_string(),
     };
 
@@ -241,6 +243,21 @@ mod tests {
         let s = summary("Subject", Some(&long_name), Some("a@b.c"), "preview");
         let text = notification_text(&s);
         assert!(text.chars().count() < TELEGRAM_MAX_MESSAGE_LEN);
+    }
+
+    #[test]
+    fn notification_text_truncates_malicious_long_sender_address() {
+        // The sender name isn't the only unbounded field JMAP hands us —
+        // a crafted long From address must be capped too, whether or not
+        // a display name is also present.
+        let long_addr = format!("{}@example.org", "a".repeat(5000));
+        let s = summary("Subject", None, Some(&long_addr), "preview");
+        let text = notification_text(&s);
+        assert!(text.chars().count() < TELEGRAM_MAX_MESSAGE_LEN);
+
+        let s_with_name = summary("Subject", Some("Alice"), Some(&long_addr), "preview");
+        let text_with_name = notification_text(&s_with_name);
+        assert!(text_with_name.chars().count() < TELEGRAM_MAX_MESSAGE_LEN);
     }
 
     #[test]
