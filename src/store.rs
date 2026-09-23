@@ -31,6 +31,13 @@ pub struct Account {
     /// written before this field existed.
     #[serde(default)]
     pub shared_accounts: HashMap<String, SharedAccount>,
+    /// Lowercased sender-address/keyword filters from `/mute`: a new
+    /// message whose sender or subject contains any of these is not
+    /// notified about (the JMAP sync cursor still advances past it — this
+    /// is purely "don't tell me about this", not "don't sync it").
+    /// Applies across the chat's own mailbox and every shared account.
+    #[serde(default)]
+    pub muted: Vec<String>,
 }
 
 /// A shared JMAP account the user has opted into. Presence in
@@ -189,6 +196,48 @@ impl Store {
         self.persist()
     }
 
+    /// Adds a mute filter for a chat. No-ops (without error) if the chat
+    /// has no primary account. Returns `false` if the (case-insensitively
+    /// normalized) term was already muted, so the caller can say so rather
+    /// than claiming to have added a duplicate.
+    pub fn mute(&self, chat_id: i64, term: &str) -> Result<bool> {
+        let term = term.trim().to_lowercase();
+        let added = {
+            let mut data = self.data.write().unwrap();
+            match data.accounts.get_mut(&chat_id) {
+                Some(acc) if !acc.muted.contains(&term) => {
+                    acc.muted.push(term);
+                    true
+                }
+                _ => false,
+            }
+        };
+        if added {
+            self.persist()?;
+        }
+        Ok(added)
+    }
+
+    /// Removes a mute filter. Returns whether it was actually muted.
+    pub fn unmute(&self, chat_id: i64, term: &str) -> Result<bool> {
+        let term = term.trim().to_lowercase();
+        let removed = {
+            let mut data = self.data.write().unwrap();
+            match data.accounts.get_mut(&chat_id) {
+                Some(acc) => {
+                    let before = acc.muted.len();
+                    acc.muted.retain(|m| m != &term);
+                    acc.muted.len() != before
+                }
+                None => false,
+            }
+        };
+        if removed {
+            self.persist()?;
+        }
+        Ok(removed)
+    }
+
     /// Removes a chat's account. This is the GDPR "right to erasure" path:
     /// once this returns, nothing about that user remains on disk.
     pub fn remove(&self, chat_id: i64) -> Result<bool> {
@@ -296,6 +345,7 @@ mod tests {
             email: email.to_string(),
             last_state: None,
             shared_accounts: HashMap::new(),
+            muted: Vec::new(),
         }
     }
 
@@ -455,6 +505,41 @@ mod tests {
         let json = r#"{"server_url":"https://jmap.example.org","token":"t","email":"a@b.c","last_state":null}"#;
         let acc: Account = serde_json::from_str(json).unwrap();
         assert!(acc.shared_accounts.is_empty());
+        assert!(acc.muted.is_empty());
+    }
+
+    #[test]
+    fn mute_adds_a_lowercased_trimmed_term_and_reports_novelty() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.set(1, account("a@b.c")).unwrap();
+
+        assert!(store.mute(1, "  Newsletter@Example.org  ").unwrap());
+        assert_eq!(store.get(1).unwrap().muted, vec!["newsletter@example.org"]);
+
+        // Muting the same term again (any casing/whitespace) is not new.
+        assert!(!store.mute(1, "NEWSLETTER@example.org").unwrap());
+        assert_eq!(store.get(1).unwrap().muted.len(), 1);
+    }
+
+    #[test]
+    fn mute_is_ignored_for_unknown_chat() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        assert!(!store.mute(999, "spam").unwrap());
+        assert!(store.get(999).is_none());
+    }
+
+    #[test]
+    fn unmute_removes_a_term_and_reports_whether_it_was_muted() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.set(1, account("a@b.c")).unwrap();
+        store.mute(1, "spam").unwrap();
+
+        assert!(store.unmute(1, "SPAM").unwrap());
+        assert!(store.get(1).unwrap().muted.is_empty());
+        assert!(!store.unmute(1, "spam").unwrap());
     }
 
     #[test]

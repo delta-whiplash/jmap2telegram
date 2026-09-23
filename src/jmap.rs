@@ -5,7 +5,13 @@ use jmap_client::DataType;
 use jmap_client::client::{Client, Credentials};
 use jmap_client::core::response::EmailGetResponse;
 use jmap_client::email::Property;
+use jmap_client::email::query as email_query;
 use jmap_client::mailbox::{self, Role};
+
+/// How many results `search` returns at most, so a broad query (e.g. a
+/// single common word) can't pull an unbounded number of full Email/get
+/// lookups and produce an unusably long Telegram reply.
+const SEARCH_RESULT_LIMIT: usize = 10;
 
 pub struct EmailSummary {
     pub id: String,
@@ -231,6 +237,62 @@ pub async fn fetch_changed_emails(
     }
 
     Ok((summaries, new_state))
+}
+
+/// Full-text search across the account (`Email/query` with a `text`
+/// filter, matching subject/body/from/to per RFC 8620 §5.5), newest first,
+/// capped at `SEARCH_RESULT_LIMIT` results. Read-only — unlike every other
+/// action in this module, it never advances the sync cursor or changes
+/// anything server-side, so it carries none of the risk a write action
+/// would.
+pub async fn search(client: &Client, query: &str) -> Result<Vec<EmailSummary>> {
+    let mut request = client.build();
+    request
+        .query_email()
+        .filter(email_query::Filter::text(query))
+        .sort([email_query::Comparator::received_at().descending()])
+        .limit(SEARCH_RESULT_LIMIT);
+    let query_response = request
+        .send_query_email()
+        .await
+        .context("Email/query a échoué")?;
+    let ids = query_response.ids().to_vec();
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut request = client.build();
+    request.get_email().ids(ids).properties([
+        Property::Subject,
+        Property::Preview,
+        Property::From,
+        Property::ReceivedAt,
+    ]);
+    let mut response = request
+        .send_get_email()
+        .await
+        .context("Email/get (recherche) a échoué")?;
+
+    Ok(response
+        .take_list()
+        .into_iter()
+        .filter_map(|email| {
+            let id = email.id()?.to_string();
+            let (from_name, from_addr) = email
+                .from()
+                .and_then(|addrs| addrs.first())
+                .map(|a| (a.name().map(str::to_string), Some(a.email().to_string())))
+                .unwrap_or((None, None));
+            Some(EmailSummary {
+                id,
+                subject: email.subject().unwrap_or("(sans objet)").to_string(),
+                from_name,
+                from_addr,
+                preview: email.preview().unwrap_or_default().to_string(),
+                received_at: email.received_at(),
+            })
+        })
+        .collect())
 }
 
 /// Fetches the full plain-text body of a message on demand (never cached

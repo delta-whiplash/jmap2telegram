@@ -31,6 +31,14 @@ pub enum Command {
     Status,
     #[command(description = "gérer les notifications des boîtes JMAP partagées")]
     Partages,
+    #[command(
+        description = "filtrer un expéditeur/mot-clé : /mute <terme> (sans argument : liste les filtres actifs)"
+    )]
+    Mute { term: String },
+    #[command(description = "annule un filtre : /unmute <terme>")]
+    Unmute { term: String },
+    #[command(description = "recherche plein texte dans la boîte : /rechercher <texte>")]
+    Rechercher { query: String },
     #[command(description = "afficher l'aide")]
     Help,
 }
@@ -94,6 +102,9 @@ async fn message_handler(bot: Bot, msg: Message, me: Me, state: AppState) -> Han
         Ok(Command::Logout) => cmd_logout(&bot, &state, chat_id).await?,
         Ok(Command::Status) => cmd_status(&bot, &state, chat_id).await?,
         Ok(Command::Partages) => cmd_partages(&bot, &state, chat_id).await?,
+        Ok(Command::Mute { term }) => cmd_mute(&bot, &state, chat_id, term).await?,
+        Ok(Command::Unmute { term }) => cmd_unmute(&bot, &state, chat_id, term).await?,
+        Ok(Command::Rechercher { query }) => cmd_rechercher(&bot, &state, chat_id, query).await?,
         Err(_) => {
             bot.send_message(
                 chat_id,
@@ -162,6 +173,7 @@ async fn cmd_login(
         email: email.clone(),
         last_state: Some(initial_state),
         shared_accounts: std::collections::HashMap::new(),
+        muted: Vec::new(),
     };
 
     if let Err(e) = state.store.set(chat_id.0, account) {
@@ -438,6 +450,162 @@ async fn toggle_shared_account(
     }
 
     refresh_partages_keyboard(bot, state, chat_id, message_id).await
+}
+
+/// `/mute <terme>` adds a filter; `/mute` with no argument lists the
+/// chat's active filters instead of erroring, since "what's currently
+/// muted" is something a user reasonably wants to check without having to
+/// remember what they typed weeks ago.
+async fn cmd_mute(bot: &Bot, state: &AppState, chat_id: ChatId, term: String) -> HandlerResult {
+    let term = term.trim();
+    if term.is_empty() {
+        let Some(account) = state.store.get(chat_id.0) else {
+            bot.send_message(
+                chat_id,
+                "Aucun compte connecté. Tape /login pour commencer.",
+            )
+            .await?;
+            return Ok(());
+        };
+        let text = if account.muted.is_empty() {
+            "Aucun filtre actif. /mute <expéditeur ou mot-clé> pour en ajouter un.".to_string()
+        } else {
+            let list = account
+                .muted
+                .iter()
+                .map(|m| format!("• {m}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!(
+                "🔇 Filtres actifs (plus de notification, le mail reste bien synchronisé) :\n{list}"
+            )
+        };
+        bot.send_message(chat_id, text).await?;
+        return Ok(());
+    }
+
+    match state.store.mute(chat_id.0, term) {
+        Ok(true) => {
+            bot.send_message(
+                chat_id,
+                format!("🔇 « {term} » est maintenant filtré : plus de notification pour les mails correspondants."),
+            )
+            .await?;
+        }
+        Ok(false) if state.store.get(chat_id.0).is_none() => {
+            bot.send_message(
+                chat_id,
+                "Aucun compte connecté. Tape /login pour commencer.",
+            )
+            .await?;
+        }
+        Ok(false) => {
+            bot.send_message(chat_id, format!("« {term} » est déjà filtré."))
+                .await?;
+        }
+        Err(e) => {
+            bot.send_message(chat_id, format!("❌ Erreur : {e}"))
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_unmute(bot: &Bot, state: &AppState, chat_id: ChatId, term: String) -> HandlerResult {
+    let term = term.trim();
+    if term.is_empty() {
+        bot.send_message(
+            chat_id,
+            "Usage : /unmute <expéditeur ou mot-clé>. Tape /mute sans argument pour voir la liste.",
+        )
+        .await?;
+        return Ok(());
+    }
+
+    match state.store.unmute(chat_id.0, term) {
+        Ok(true) => {
+            bot.send_message(chat_id, format!("🔔 « {term} » n'est plus filtré."))
+                .await?;
+        }
+        Ok(false) => {
+            bot.send_message(chat_id, format!("« {term} » n'était pas filtré."))
+                .await?;
+        }
+        Err(e) => {
+            bot.send_message(chat_id, format!("❌ Erreur : {e}"))
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+/// Read-only full-text search against the chat's own mailbox (not its
+/// shared accounts — those would need their own per-account search, kept
+/// out of scope here). Results are rendered as ordinary notification
+/// messages, complete with the same action buttons, so triage works the
+/// same way whether a message arrived live or was dug up by search.
+async fn cmd_rechercher(
+    bot: &Bot,
+    state: &AppState,
+    chat_id: ChatId,
+    query: String,
+) -> HandlerResult {
+    let query = query.trim();
+    if query.is_empty() {
+        bot.send_message(chat_id, "Usage : /rechercher <texte>")
+            .await?;
+        return Ok(());
+    }
+
+    let client = match state.client_for(chat_id.0).await {
+        Ok(Some(c)) => c,
+        Ok(None) => {
+            bot.send_message(
+                chat_id,
+                "Aucun compte connecté. Tape /login pour commencer.",
+            )
+            .await?;
+            return Ok(());
+        }
+        Err(e) => {
+            bot.send_message(chat_id, format!("Erreur de connexion : {e}"))
+                .await?;
+            return Ok(());
+        }
+    };
+
+    let _ = bot
+        .send_chat_action(chat_id, teloxide::types::ChatAction::Typing)
+        .await;
+
+    let results = match jmap::search(&client, query).await {
+        Ok(r) => r,
+        Err(e) => {
+            bot.send_message(chat_id, format!("❌ {e}")).await?;
+            return Ok(());
+        }
+    };
+
+    if results.is_empty() {
+        bot.send_message(chat_id, format!("Aucun résultat pour « {query} »."))
+            .await?;
+        return Ok(());
+    }
+
+    bot.send_message(
+        chat_id,
+        format!("🔎 {} résultat(s) pour « {query} » :", results.len()),
+    )
+    .await?;
+    for summary in &results {
+        let text = format::notification_text(summary, state.config.timezone, None);
+        let keyboard = format::notification_keyboard(&summary.id, None, false);
+        bot.send_message(chat_id, text)
+            .parse_mode(teloxide::types::ParseMode::MarkdownV2)
+            .reply_markup(keyboard)
+            .await?;
+    }
+    Ok(())
 }
 
 async fn callback_handler(bot: Bot, q: CallbackQuery, state: AppState) -> HandlerResult {

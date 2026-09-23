@@ -253,6 +253,10 @@ async fn sync_and_notify(
     };
 
     for summary in &summaries {
+        if is_muted(summary, &account.muted) {
+            continue;
+        }
+
         let text = notification_text(summary, state.config.timezone, target.label());
         let keyboard = notification_keyboard(&summary.id, target.account_id(), false);
         if let Err(e) = bot
@@ -268,6 +272,34 @@ async fn sync_and_notify(
     if new_state != since_state {
         target.update_state(&state.store, chat_id, new_state);
     }
+}
+
+/// Whether a `/mute`d term (already lowercased) appears in this message's
+/// subject or sender (name or address). Matching is deliberately broad
+/// (substring, case-insensitive) rather than exact-address matching, so
+/// `/mute newsletter` also catches `newsletter@example.org` and a subject
+/// containing "Newsletter" — the same trade-off GmailBot's own Blacklist
+/// makes. The JMAP sync cursor still advances past a muted message; this
+/// only decides whether to notify, not whether to see it as unread later.
+fn is_muted(summary: &jmap::EmailSummary, muted: &[String]) -> bool {
+    if muted.is_empty() {
+        return false;
+    }
+    let haystack = format!(
+        "{} {} {}",
+        summary.subject.to_lowercase(),
+        summary
+            .from_name
+            .as_deref()
+            .unwrap_or_default()
+            .to_lowercase(),
+        summary
+            .from_addr
+            .as_deref()
+            .unwrap_or_default()
+            .to_lowercase(),
+    );
+    muted.iter().any(|term| haystack.contains(term.as_str()))
 }
 
 #[cfg(test)]
@@ -290,6 +322,7 @@ mod tests {
                     last_state: Some("shared-state".to_string()),
                 },
             )]),
+            muted: Vec::new(),
         }
     }
 
@@ -364,5 +397,41 @@ mod tests {
             label: "contact@delta-net.ovh".to_string(),
         });
         assert!(shared.contains("contact@delta-net.ovh"));
+    }
+
+    fn summary(
+        subject: &str,
+        from_name: Option<&str>,
+        from_addr: Option<&str>,
+    ) -> jmap::EmailSummary {
+        jmap::EmailSummary {
+            id: "M1".to_string(),
+            subject: subject.to_string(),
+            from_name: from_name.map(str::to_string),
+            from_addr: from_addr.map(str::to_string),
+            preview: String::new(),
+            received_at: None,
+        }
+    }
+
+    #[test]
+    fn is_muted_matches_subject_case_insensitively() {
+        let s = summary("Big Newsletter Blast", None, Some("a@b.c"));
+        assert!(is_muted(&s, &["newsletter".to_string()]));
+        assert!(!is_muted(&s, &["invoice".to_string()]));
+    }
+
+    #[test]
+    fn is_muted_matches_sender_name_or_address() {
+        let s = summary("Hello", Some("Marketing Team"), Some("promo@shop.example"));
+        assert!(is_muted(&s, &["marketing".to_string()]));
+        assert!(is_muted(&s, &["shop.example".to_string()]));
+    }
+
+    #[test]
+    fn is_muted_is_false_with_no_filters_or_no_match() {
+        let s = summary("Hello", Some("Alice"), Some("alice@example.org"));
+        assert!(!is_muted(&s, &[]));
+        assert!(!is_muted(&s, &["bob".to_string()]));
     }
 }
