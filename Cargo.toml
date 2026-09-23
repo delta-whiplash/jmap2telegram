@@ -1,6 +1,6 @@
 [package]
 name = "jmap2telegram"
-version = "0.5.1"
+version = "0.5.2"
 edition = "2024"
 license-file = "LICENSE"
 description = "A self-hosted Telegram bot that turns a JMAP mailbox into Telegram notifications"
