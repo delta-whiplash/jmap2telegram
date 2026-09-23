@@ -101,16 +101,31 @@ it, so the token doesn't linger in the chat history.
 
 ### Commands
 
-| Command   | Effect                                                        |
-|-----------|----------------------------------------------------------------|
-| `/start`  | Onboarding, or current status if already connected            |
-| `/login`  | `/login <server_url> <token>` — connect a JMAP account         |
-| `/status` | Show the connected account and watcher health                 |
-| `/logout` | Erase stored credentials immediately (GDPR right to erasure)  |
-| `/help`   | List commands                                                 |
+| Command     | Effect                                                            |
+|-------------|--------------------------------------------------------------------|
+| `/start`    | Onboarding, or current status if already connected                |
+| `/login`    | `/login <server_url> <token>` — connect a JMAP account             |
+| `/status`   | Show the connected account and watcher health                     |
+| `/partages` | Toggle notifications for shared/delegated JMAP accounts            |
+| `/logout`   | Erase stored credentials immediately (GDPR right to erasure)      |
+| `/help`     | List commands                                                     |
 
 Each new-mail notification comes with inline buttons: **Lire tout** (full
 body), **Lu** (mark read), **Archiver**, **Supprimer**.
+
+### Shared mailboxes
+
+Some JMAP servers (Stalwart in particular) can grant a token delegated
+access to other mailboxes — team/shared inboxes distinct from your own
+personal account. `/partages` lists whatever shared accounts your token
+currently has access to (fetched live from the server each time, not
+cached) with a toggle button per account. Enabling one starts its own
+background watcher and notifications for it, labeled with the shared
+mailbox's address so you can tell them apart from your own mail; disabling
+one stops its watcher and forgets its sync cursor. This is unrelated to
+Telegram group chats — the bot still only ever talks in 1:1 DMs (see
+[`SECURITY.md`](SECURITY.md)) — it's purely about how many JMAP accounts a
+single connected chat follows.
 
 ### Environment variables
 

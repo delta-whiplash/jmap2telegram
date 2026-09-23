@@ -23,7 +23,11 @@ fn truncate(input: &str, limit: usize) -> String {
     }
 }
 
-pub fn notification_text(summary: &EmailSummary, tz: Tz) -> String {
+/// `account_label` is `Some(name)` for a notification coming from a shared
+/// JMAP account rather than the chat's own mailbox, so the user can tell
+/// them apart; `None` renders exactly as before (the common single-mailbox
+/// case).
+pub fn notification_text(summary: &EmailSummary, tz: Tz, account_label: Option<&str>) -> String {
     let from = match (&summary.from_name, &summary.from_addr) {
         (Some(name), Some(addr)) if !name.is_empty() => format!(
             "{} <{}>",
@@ -47,8 +51,17 @@ pub fn notification_text(summary: &EmailSummary, tz: Tz) -> String {
     let subject = truncate(summary.subject.trim(), FIELD_LIMIT);
     let preview = truncate(summary.preview.trim(), PREVIEW_LIMIT);
 
+    let mailbox_line = account_label
+        .map(|label| {
+            format!(
+                "*Boîte :* {}\n",
+                escape_markdown(&truncate(label, FIELD_LIMIT))
+            )
+        })
+        .unwrap_or_default();
+
     format!(
-        "📧 *Nouveau message*\n\n*De :* {from}\n*Objet :* {subject}\n*Reçu :* {when}\n\n{preview}",
+        "📧 *Nouveau message*\n\n{mailbox_line}*De :* {from}\n*Objet :* {subject}\n*Reçu :* {when}\n\n{preview}",
         from = escape_markdown(&from),
         subject = escape_markdown(&subject),
         when = escape_markdown(&when),
@@ -64,22 +77,71 @@ pub fn notification_text(summary: &EmailSummary, tz: Tz) -> String {
 /// doesn't fit; the notification text itself is unaffected.
 const TELEGRAM_CALLBACK_DATA_MAX_LEN: usize = 64;
 
-pub fn notification_keyboard(email_id: &str) -> InlineKeyboardMarkup {
-    let longest_prefix = "d:"; // all action prefixes are 2 bytes, so any is representative
-    if longest_prefix.len() + email_id.len() > TELEGRAM_CALLBACK_DATA_MAX_LEN {
+/// Encodes which JMAP account an action button's email id belongs to.
+/// `account_id` is `None` for the chat's own mailbox (the common case,
+/// `"{action}:{email_id}"`) and `Some(id)` for a shared account
+/// (`"{action}:{id}:{email_id}"`), since JMAP email ids are only unique
+/// within their account and the callback handler must route the action to
+/// a JMAP client connected to the right one.
+fn action_callback_data(action: char, account_id: Option<&str>, email_id: &str) -> String {
+    match account_id {
+        Some(id) => format!("{action}:{id}:{email_id}"),
+        None => format!("{action}:{email_id}"),
+    }
+}
+
+pub fn notification_keyboard(email_id: &str, account_id: Option<&str>) -> InlineKeyboardMarkup {
+    // All action letters are 1 byte, so any is representative for the
+    // length check.
+    if action_callback_data('d', account_id, email_id).len() > TELEGRAM_CALLBACK_DATA_MAX_LEN {
         return InlineKeyboardMarkup::new(Vec::<Vec<InlineKeyboardButton>>::new());
     }
 
     InlineKeyboardMarkup::new([
         [
-            InlineKeyboardButton::callback("📖 Lire tout", format!("f:{email_id}")),
-            InlineKeyboardButton::callback("✅ Lu", format!("r:{email_id}")),
+            InlineKeyboardButton::callback(
+                "📖 Lire tout",
+                action_callback_data('f', account_id, email_id),
+            ),
+            InlineKeyboardButton::callback(
+                "✅ Lu",
+                action_callback_data('r', account_id, email_id),
+            ),
         ],
         [
-            InlineKeyboardButton::callback("📥 Archiver", format!("a:{email_id}")),
-            InlineKeyboardButton::callback("🗑 Supprimer", format!("d:{email_id}")),
+            InlineKeyboardButton::callback(
+                "📥 Archiver",
+                action_callback_data('a', account_id, email_id),
+            ),
+            InlineKeyboardButton::callback(
+                "🗑 Supprimer",
+                action_callback_data('d', account_id, email_id),
+            ),
         ],
     ])
+}
+
+/// Builds the `/partages` toggle menu: one button per shared JMAP account
+/// visible to the token right now, checked when the chat is currently
+/// opted into notifications for it. An account whose id is too long to fit
+/// Telegram's callback_data limit is left out rather than shown as a
+/// button that can never be tapped successfully.
+pub fn shared_accounts_keyboard(
+    accounts: &[(String, String)],
+    enabled: &std::collections::HashSet<String>,
+) -> InlineKeyboardMarkup {
+    let rows: Vec<Vec<InlineKeyboardButton>> = accounts
+        .iter()
+        .filter(|(id, _)| format!("s:{id}").len() <= TELEGRAM_CALLBACK_DATA_MAX_LEN)
+        .map(|(id, name)| {
+            let mark = if enabled.contains(id) { "✅" } else { "⬜" };
+            vec![InlineKeyboardButton::callback(
+                format!("{mark} {name}"),
+                format!("s:{id}"),
+            )]
+        })
+        .collect();
+    InlineKeyboardMarkup::new(rows)
 }
 
 /// Escapes text for Telegram's `MarkdownV2` parser. All content here
@@ -183,7 +245,7 @@ mod tests {
             Some("alice@example.org"),
             "Hi there",
         );
-        let text = notification_text(&s, Tz::UTC);
+        let text = notification_text(&s, Tz::UTC, None);
         assert!(text.contains("Alice"));
         // '.' is a MarkdownV2 special char, so the address is expected
         // escaped in the rendered text, not verbatim.
@@ -195,14 +257,14 @@ mod tests {
     #[test]
     fn notification_text_falls_back_when_sender_unknown() {
         let s = summary("Hello", None, None, "Hi there");
-        let text = notification_text(&s, Tz::UTC);
+        let text = notification_text(&s, Tz::UTC, None);
         assert!(text.contains("expéditeur inconnu"));
     }
 
     #[test]
     fn notification_text_uses_address_when_name_missing() {
         let s = summary("Hello", None, Some("bob@example.org"), "Hi");
-        let text = notification_text(&s, Tz::UTC);
+        let text = notification_text(&s, Tz::UTC, None);
         assert!(text.contains(r"bob@example\.org"));
     }
 
@@ -216,7 +278,7 @@ mod tests {
             Some("a@b.c"),
             "",
         );
-        let text = notification_text(&s, Tz::UTC);
+        let text = notification_text(&s, Tz::UTC, None);
         assert!(text.contains(r"\*bold\* \_italic\_ \[link\]\(evil\) \`code\`"));
     }
 
@@ -224,7 +286,7 @@ mod tests {
     fn notification_text_truncates_long_preview() {
         let long_preview = "a".repeat(1000);
         let s = summary("Subject", None, Some("a@b.c"), &long_preview);
-        let text = notification_text(&s, Tz::UTC);
+        let text = notification_text(&s, Tz::UTC, None);
         // 400 chars kept + ellipsis marker, well short of the original 1000.
         assert!(text.len() < 700);
         assert!(text.contains('…'));
@@ -237,7 +299,7 @@ mod tests {
         // dropped (send_message fails, but the JMAP cursor still advances).
         let long_subject = "s".repeat(5000);
         let s = summary(&long_subject, None, Some("a@b.c"), "preview");
-        let text = notification_text(&s, Tz::UTC);
+        let text = notification_text(&s, Tz::UTC, None);
         assert!(text.chars().count() < TELEGRAM_MAX_MESSAGE_LEN);
         assert!(text.contains('…'));
     }
@@ -246,7 +308,7 @@ mod tests {
     fn notification_text_truncates_malicious_long_sender_name() {
         let long_name = "n".repeat(5000);
         let s = summary("Subject", Some(&long_name), Some("a@b.c"), "preview");
-        let text = notification_text(&s, Tz::UTC);
+        let text = notification_text(&s, Tz::UTC, None);
         assert!(text.chars().count() < TELEGRAM_MAX_MESSAGE_LEN);
     }
 
@@ -257,11 +319,11 @@ mod tests {
         // a display name is also present.
         let long_addr = format!("{}@example.org", "a".repeat(5000));
         let s = summary("Subject", None, Some(&long_addr), "preview");
-        let text = notification_text(&s, Tz::UTC);
+        let text = notification_text(&s, Tz::UTC, None);
         assert!(text.chars().count() < TELEGRAM_MAX_MESSAGE_LEN);
 
         let s_with_name = summary("Subject", Some("Alice"), Some(&long_addr), "preview");
-        let text_with_name = notification_text(&s_with_name, Tz::UTC);
+        let text_with_name = notification_text(&s_with_name, Tz::UTC, None);
         assert!(text_with_name.chars().count() < TELEGRAM_MAX_MESSAGE_LEN);
     }
 
@@ -271,8 +333,8 @@ mod tests {
         // CET (UTC+1) at that instant, so the rendered hour must differ
         // from the UTC rendering rather than silently always being UTC.
         let s = summary("Subject", None, Some("a@b.c"), "preview");
-        let utc_text = notification_text(&s, Tz::UTC);
-        let paris_text = notification_text(&s, chrono_tz::Europe::Paris);
+        let utc_text = notification_text(&s, Tz::UTC, None);
+        let paris_text = notification_text(&s, chrono_tz::Europe::Paris, None);
         assert!(utc_text.contains("22:13"));
         assert!(paris_text.contains("23:13"));
         assert_ne!(utc_text, paris_text);
@@ -280,7 +342,7 @@ mod tests {
 
     #[test]
     fn notification_keyboard_has_action_buttons_for_short_id() {
-        let kb = notification_keyboard("M123");
+        let kb = notification_keyboard("M123", None);
         assert_eq!(kb.inline_keyboard.len(), 2);
         assert_eq!(kb.inline_keyboard[0].len(), 2);
     }
@@ -290,7 +352,73 @@ mod tests {
         // Telegram's callback_data hard limit is 64 bytes; a pathological
         // JMAP id must not produce a button Telegram will silently reject.
         let long_id = "x".repeat(100);
-        let kb = notification_keyboard(&long_id);
+        let kb = notification_keyboard(&long_id, None);
+        assert!(kb.inline_keyboard.is_empty());
+    }
+
+    #[test]
+    fn notification_text_includes_mailbox_line_for_shared_account() {
+        let s = summary("Hello", Some("Alice"), Some("alice@example.org"), "Hi");
+        let text = notification_text(&s, Tz::UTC, Some("contact@delta-net.ovh"));
+        assert!(text.contains(r"contact@delta\-net\.ovh"));
+        // The common (no shared account) case must stay unaffected.
+        let plain = notification_text(&s, Tz::UTC, None);
+        assert!(!plain.contains("Boîte"));
+    }
+
+    #[test]
+    fn notification_keyboard_encodes_account_id_for_shared_mailbox_actions() {
+        // Email ids are only unique within their JMAP account, so a shared
+        // mailbox's action buttons must carry the account id, not just the
+        // email id, or a tap would be routed to the wrong client.
+        let kb = notification_keyboard("M123", Some("acc7"));
+        let InlineKeyboardButton {
+            kind: teloxide::types::InlineKeyboardButtonKind::CallbackData(data),
+            ..
+        } = &kb.inline_keyboard[0][1]
+        else {
+            panic!("expected a callback button");
+        };
+        assert_eq!(data, "r:acc7:M123");
+    }
+
+    #[test]
+    fn notification_keyboard_drops_buttons_when_account_and_id_together_too_long() {
+        let long_account = "a".repeat(60);
+        let kb = notification_keyboard("M123", Some(&long_account));
+        assert!(kb.inline_keyboard.is_empty());
+    }
+
+    #[test]
+    fn shared_accounts_keyboard_marks_enabled_accounts() {
+        let accounts = vec![
+            ("acc7".to_string(), "contact@delta-net.ovh".to_string()),
+            ("acc8".to_string(), "contact@cardinalcodes.com".to_string()),
+        ];
+        let mut enabled = std::collections::HashSet::new();
+        enabled.insert("acc7".to_string());
+
+        let kb = shared_accounts_keyboard(&accounts, &enabled);
+        assert_eq!(kb.inline_keyboard.len(), 2);
+
+        let button_text = |row: usize| kb.inline_keyboard[row][0].text.clone();
+        assert!(button_text(0).starts_with("✅"));
+        assert!(button_text(1).starts_with("⬜"));
+
+        let InlineKeyboardButton {
+            kind: teloxide::types::InlineKeyboardButtonKind::CallbackData(data),
+            ..
+        } = &kb.inline_keyboard[0][0]
+        else {
+            panic!("expected a callback button");
+        };
+        assert_eq!(data, "s:acc7");
+    }
+
+    #[test]
+    fn shared_accounts_keyboard_omits_accounts_with_ids_too_long_for_telegram() {
+        let accounts = vec![("x".repeat(100), "unreachable".to_string())];
+        let kb = shared_accounts_keyboard(&accounts, &std::collections::HashSet::new());
         assert!(kb.inline_keyboard.is_empty());
     }
 

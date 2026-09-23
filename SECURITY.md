@@ -37,6 +37,14 @@
   which identifies a point in the server's change log, not any message
   content. `/logout` deletes the stored account synchronously and
   durably; nothing is soft-deleted or retained.
+- **Shared JMAP accounts (`/partages`).** A shared/delegated mailbox is
+  only ever offered for opt-in if the connected token is already granted
+  access to it by the JMAP server itself (`/partages` lists exactly what
+  `session.accounts()` returns for that token) — the bot cannot expand
+  access beyond what the server already granted. Opting in stores the
+  same minimal shape as the primary account (account id, display name,
+  sync cursor; no content), and opting out or `/logout` erases it the
+  same way.
 - **SSRF via `/login`.** `server_url` is attacker-controlled (it's
   whatever an authorized chat typed in), and `AUTHORIZED_CHAT_IDS` can
   list several mutually-untrusted chats. By default, any hostname that

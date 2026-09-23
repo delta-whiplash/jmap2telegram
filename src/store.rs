@@ -25,6 +25,23 @@ pub struct Account {
     pub token: String,
     pub email: String,
     pub last_state: Option<String>,
+    /// JMAP delegated/shared accounts (e.g. a shared team mailbox) the user
+    /// has opted into notifications for, keyed by JMAP account id.
+    /// `#[serde(default)]` keeps this backward compatible with state files
+    /// written before this field existed.
+    #[serde(default)]
+    pub shared_accounts: HashMap<String, SharedAccount>,
+}
+
+/// A shared JMAP account the user has opted into. Presence in
+/// `Account::shared_accounts` *is* the opt-in: there is no separate
+/// enabled flag to fall out of sync with the watcher/client state.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SharedAccount {
+    /// Display name from the JMAP session (e.g. the shared mailbox's
+    /// address), shown in notifications and the toggle menu.
+    pub name: String,
+    pub last_state: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -106,6 +123,66 @@ impl Store {
             let mut data = self.data.write().unwrap();
             match data.accounts.get_mut(&chat_id) {
                 Some(acc) => acc.last_state = Some(state),
+                None => return Ok(()),
+            }
+        }
+        self.persist()
+    }
+
+    /// Opts a chat into notifications for a shared JMAP account, or updates
+    /// its display name/cursor if already opted in. No-ops (without error)
+    /// if the chat has no primary account, since a shared account can't
+    /// outlive the login it was discovered through.
+    pub fn set_shared_account(
+        &self,
+        chat_id: i64,
+        account_id: String,
+        name: String,
+        last_state: Option<String>,
+    ) -> Result<()> {
+        {
+            let mut data = self.data.write().unwrap();
+            match data.accounts.get_mut(&chat_id) {
+                Some(acc) => {
+                    acc.shared_accounts
+                        .insert(account_id, SharedAccount { name, last_state });
+                }
+                None => return Ok(()),
+            }
+        }
+        self.persist()
+    }
+
+    /// Opts a chat out of notifications for a shared JMAP account. Returns
+    /// whether it was actually opted in.
+    pub fn remove_shared_account(&self, chat_id: i64, account_id: &str) -> Result<bool> {
+        let removed = {
+            let mut data = self.data.write().unwrap();
+            match data.accounts.get_mut(&chat_id) {
+                Some(acc) => acc.shared_accounts.remove(account_id).is_some(),
+                None => false,
+            }
+        };
+        if removed {
+            self.persist()?;
+        }
+        Ok(removed)
+    }
+
+    pub fn update_shared_account_state(
+        &self,
+        chat_id: i64,
+        account_id: &str,
+        state: String,
+    ) -> Result<()> {
+        {
+            let mut data = self.data.write().unwrap();
+            match data
+                .accounts
+                .get_mut(&chat_id)
+                .and_then(|acc| acc.shared_accounts.get_mut(account_id))
+            {
+                Some(shared) => shared.last_state = Some(state),
                 None => return Ok(()),
             }
         }
@@ -218,6 +295,7 @@ mod tests {
             token: "s3cr3t-token".to_string(),
             email: email.to_string(),
             last_state: None,
+            shared_accounts: HashMap::new(),
         }
     }
 
@@ -303,6 +381,80 @@ mod tests {
         // Must not panic or create a phantom account.
         store.update_state(999, "state-x".to_string()).unwrap();
         assert!(store.get(999).is_none());
+    }
+
+    #[test]
+    fn set_shared_account_adds_and_updates_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.set(1, account("a@b.c")).unwrap();
+
+        store
+            .set_shared_account(1, "acc7".to_string(), "shared@b.c".to_string(), None)
+            .unwrap();
+        let shared = &store.get(1).unwrap().shared_accounts["acc7"];
+        assert_eq!(shared.name, "shared@b.c");
+        assert_eq!(shared.last_state, None);
+
+        // Re-setting the same id updates it in place rather than erroring.
+        store
+            .set_shared_account(
+                1,
+                "acc7".to_string(),
+                "shared@b.c".to_string(),
+                Some("state-1".to_string()),
+            )
+            .unwrap();
+        assert_eq!(
+            store.get(1).unwrap().shared_accounts["acc7"].last_state,
+            Some("state-1".to_string())
+        );
+    }
+
+    #[test]
+    fn set_shared_account_is_ignored_for_unknown_chat() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store
+            .set_shared_account(999, "acc1".to_string(), "x@y.z".to_string(), None)
+            .unwrap();
+        assert!(store.get(999).is_none());
+    }
+
+    #[test]
+    fn remove_shared_account_erases_entry_and_reports_whether_it_existed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.set(1, account("a@b.c")).unwrap();
+        store
+            .set_shared_account(1, "acc7".to_string(), "shared@b.c".to_string(), None)
+            .unwrap();
+
+        assert!(store.remove_shared_account(1, "acc7").unwrap());
+        assert!(!store.get(1).unwrap().shared_accounts.contains_key("acc7"));
+        assert!(!store.remove_shared_account(1, "acc7").unwrap());
+    }
+
+    #[test]
+    fn update_shared_account_state_is_ignored_for_unknown_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.set(1, account("a@b.c")).unwrap();
+        // Must not panic or create a phantom shared account.
+        store
+            .update_shared_account_state(1, "does-not-exist", "state-x".to_string())
+            .unwrap();
+        assert!(store.get(1).unwrap().shared_accounts.is_empty());
+    }
+
+    /// Backward compatibility: state files written before `shared_accounts`
+    /// existed must still decrypt and parse, defaulting to an empty map,
+    /// rather than failing every deployment upgrading in place.
+    #[test]
+    fn account_without_shared_accounts_field_deserializes_with_empty_map() {
+        let json = r#"{"server_url":"https://jmap.example.org","token":"t","email":"a@b.c","last_state":null}"#;
+        let acc: Account = serde_json::from_str(json).unwrap();
+        assert!(acc.shared_accounts.is_empty());
     }
 
     #[test]

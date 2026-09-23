@@ -65,6 +65,45 @@ pub async fn connect(server_url: &str, token: &str, allow_private_hosts: bool) -
     Ok(client)
 }
 
+/// Connects the same way as [`connect`], then switches the client's default
+/// account to a specific JMAP account id (e.g. a delegated shared mailbox)
+/// instead of the token's personal account. `jmap-client` only tracks one
+/// default account per `Client` and every request method reads it, so a
+/// shared account needs its own dedicated `Client` rather than reusing the
+/// primary one with a mutated account id — the primary client is shared
+/// (`Arc`) across concurrent tasks and mutating it out from under them
+/// would race.
+pub async fn connect_shared(
+    server_url: &str,
+    token: &str,
+    allow_private_hosts: bool,
+    account_id: &str,
+) -> Result<Client> {
+    let mut client = connect(server_url, token, allow_private_hosts).await?;
+    client.set_default_account_id(account_id);
+    Ok(client)
+}
+
+/// Lists every non-personal (shared/delegated) account visible in the
+/// current session, as `(account_id, display_name)` pairs. Reflects
+/// whatever the token is granted access to *right now* — the caller should
+/// reconnect first if it wants a fresh view rather than a cached session
+/// from an earlier connect.
+pub fn list_shared_accounts(client: &Client) -> Vec<(String, String)> {
+    let session = client.session();
+    session
+        .accounts()
+        .filter_map(|id| {
+            let account = session.account(id)?;
+            if account.is_personal() {
+                None
+            } else {
+                Some((id.clone(), account.name().to_string()))
+            }
+        })
+        .collect()
+}
+
 async fn assert_public_host(host: &str, server_url: &str) -> Result<()> {
     let parsed = url::Url::parse(server_url).context("URL de serveur JMAP invalide")?;
     let port = parsed.port_or_known_default().unwrap_or(443);
@@ -487,5 +526,85 @@ mod tests {
             .expect("same-host redirect from /.well-known/jmap must be followed");
 
         assert_eq!(account_email(&client), "user@example.org");
+    }
+
+    fn session_body_with_shared_accounts(mock_uri: &str) -> serde_json::Value {
+        let mut body = session_body(mock_uri);
+        body["accounts"]["shared1"] = json!({
+            "name": "contact@delta-net.ovh",
+            "isPersonal": false,
+            "isReadOnly": false,
+            "accountCapabilities": {}
+        });
+        body["accounts"]["shared2"] = json!({
+            "name": "contact@cardinalcodes.com",
+            "isPersonal": false,
+            "isReadOnly": true,
+            "accountCapabilities": {}
+        });
+        body
+    }
+
+    #[tokio::test]
+    async fn list_shared_accounts_excludes_the_personal_account() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jmap"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(session_body_with_shared_accounts(&server.uri())),
+            )
+            .mount(&server)
+            .await;
+
+        let client = Client::new()
+            .credentials(Credentials::bearer("test-token-123"))
+            .connect(&server.uri())
+            .await
+            .expect("mock session negotiation should succeed");
+
+        let mut shared = list_shared_accounts(&client);
+        shared.sort();
+        assert_eq!(
+            shared,
+            vec![
+                ("shared1".to_string(), "contact@delta-net.ovh".to_string()),
+                (
+                    "shared2".to_string(),
+                    "contact@cardinalcodes.com".to_string()
+                ),
+            ]
+        );
+        // The personal account ("acc1") must never show up as "shared".
+        assert!(!shared.iter().any(|(id, _)| id == "acc1"));
+    }
+
+    /// `connect_shared` itself can't be exercised against a plain-http mock
+    /// server (it enforces the same https-only guard as `connect`, already
+    /// covered by `connect_rejects_non_https_url`); this verifies the
+    /// underlying `set_default_account_id` mechanism it relies on.
+    #[tokio::test]
+    async fn set_default_account_id_switches_the_active_account() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jmap"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(session_body_with_shared_accounts(&server.uri())),
+            )
+            .mount(&server)
+            .await;
+
+        // Bypasses this module's https-only guard on purpose, same as the
+        // other mock-server tests above.
+        let mut client = Client::new()
+            .credentials(Credentials::bearer("test-token-123"))
+            .connect(&server.uri())
+            .await
+            .expect("mock session negotiation should succeed");
+        assert_eq!(client.default_account_id(), "acc1");
+
+        client.set_default_account_id("shared1");
+        assert_eq!(client.default_account_id(), "shared1");
     }
 }

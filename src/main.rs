@@ -54,12 +54,54 @@ async fn main() -> anyhow::Result<()> {
             Ok(client) => {
                 let client = Arc::new(client);
                 state.clients.write().await.insert(chat_id, client.clone());
-                let handle = watcher::spawn(bot.clone(), state.clone(), chat_id, client);
+                let handle = watcher::spawn(
+                    bot.clone(),
+                    state.clone(),
+                    chat_id,
+                    client,
+                    watcher::WatchTarget::Primary,
+                );
                 state.watchers.write().await.insert(chat_id, handle);
                 tracing::info!(chat_id, email = %account.email, "resumed JMAP watcher");
             }
             Err(e) => {
                 tracing::warn!(chat_id, error = %e, "failed to resume JMAP account, it will need /login again");
+            }
+        }
+
+        for (account_id, shared) in &account.shared_accounts {
+            match jmap::connect_shared(
+                &account.server_url,
+                &account.token,
+                config.allow_private_jmap_hosts,
+                account_id,
+            )
+            .await
+            {
+                Ok(client) => {
+                    let client = Arc::new(client);
+                    let key = (chat_id, account_id.clone());
+                    state
+                        .shared_clients
+                        .write()
+                        .await
+                        .insert(key.clone(), client.clone());
+                    let handle = watcher::spawn(
+                        bot.clone(),
+                        state.clone(),
+                        chat_id,
+                        client,
+                        watcher::WatchTarget::Shared {
+                            account_id: account_id.clone(),
+                            label: shared.name.clone(),
+                        },
+                    );
+                    state.shared_watchers.write().await.insert(key, handle);
+                    tracing::info!(chat_id, account_id, name = %shared.name, "resumed shared-account JMAP watcher");
+                }
+                Err(e) => {
+                    tracing::warn!(chat_id, account_id, error = %e, "failed to resume shared JMAP account");
+                }
             }
         }
     }
