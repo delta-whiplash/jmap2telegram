@@ -26,6 +26,10 @@ and to your JMAP server.
   defaults (1 msg/s per chat, 30 msg/s overall) with automatic retry on
   `RetryAfter`, so a burst of new mail (a mailing list flood, a newsletter)
   can't get individual notifications dropped or delayed out of order.
+- **Tells you when a connection actually breaks.** A revoked token or an
+  unreachable server doesn't just fail silently in a log somewhere: after
+  about a minute of being unable to reconnect, the bot sends a message
+  telling you which account and why, and another once it's back.
 
 ## Security & privacy by design
 

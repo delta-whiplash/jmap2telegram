@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use futures_util::StreamExt;
@@ -14,6 +15,14 @@ use crate::state::AppState;
 
 const FALLBACK_POLL: Duration = Duration::from_secs(300);
 const MAX_BACKOFF: Duration = Duration::from_secs(300);
+
+/// How many *consecutive* failures to even open the EventSource connection
+/// (not counting a later drop of an already-working stream, which the
+/// backoff/retry loop already handles fine) before we tell the user
+/// something is actually wrong — e.g. a revoked token, not just a blip.
+/// With the doubling backoff below (2s, 4s, 8s, 16s, 32s, ...) this fires
+/// after roughly a minute of total inability to connect.
+const FAILURE_NOTIFY_THRESHOLD: u32 = 5;
 
 /// Which JMAP account a watcher is following: the chat's own mailbox, or
 /// one of its opted-in shared accounts. Threads through everything that
@@ -74,6 +83,33 @@ impl WatchTarget {
             WatchTarget::Shared { label, .. } => Some(label),
         }
     }
+
+    /// How this target is referred to in a connection-health notification.
+    fn scope_label(&self) -> String {
+        match self.label() {
+            Some(label) => format!("la boîte partagée « {label} »"),
+            None => "ta boîte JMAP".to_string(),
+        }
+    }
+}
+
+fn connection_broken_text(target: &WatchTarget, last_error: &anyhow::Error) -> String {
+    format!(
+        "⚠️ La connexion à {scope} échoue depuis plusieurs tentatives : le jeton a peut-être \
+         été révoqué, ou le serveur est injoignable. Les notifications sont en pause pour ce \
+         compte jusqu'à ce que la connexion reprenne d'elle-même.\n\n\
+         Dernière erreur : {last_error}\n\n\
+         Si le jeton a été révoqué, reconnecte-toi avec /login (ou /partages pour une boîte \
+         partagée).",
+        scope = target.scope_label(),
+    )
+}
+
+fn connection_recovered_text(target: &WatchTarget) -> String {
+    format!(
+        "✅ La connexion à {} est rétablie, les notifications reprennent.",
+        target.scope_label(),
+    )
 }
 
 /// Spawns the long-running per-account watcher: an EventSource connection
@@ -90,15 +126,42 @@ pub fn spawn(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut backoff = Duration::from_secs(2);
+        let mut consecutive_connect_failures: u32 = 0;
+        let mut notified_broken = false;
+        // Set by run_once as soon as the EventSource connection actually
+        // opens, so the outer loop can tell "never managed to connect this
+        // whole time" (worth alerting on) apart from "connected fine, then
+        // an already-open stream later dropped" (ordinary network hiccup,
+        // already handled by the backoff/retry below).
+        let connected = Arc::new(AtomicBool::new(false));
 
         loop {
-            match run_once(&bot, &state, chat_id, &client, &target).await {
+            connected.store(false, Ordering::Relaxed);
+            match run_once(&bot, &state, chat_id, &client, &target, &connected).await {
                 Ok(()) => {
                     // Clean shutdown requested (account removed/toggled off).
                     return;
                 }
                 Err(e) => {
                     tracing::warn!(chat_id, error = %e, "watcher JMAP EventSource error, reconnecting");
+
+                    if connected.load(Ordering::Relaxed) {
+                        consecutive_connect_failures = 0;
+                        backoff = Duration::from_secs(2);
+                        if notified_broken {
+                            notified_broken = false;
+                            notify(&bot, &state, chat_id, connection_recovered_text(&target)).await;
+                        }
+                    } else {
+                        consecutive_connect_failures += 1;
+                        if consecutive_connect_failures >= FAILURE_NOTIFY_THRESHOLD
+                            && !notified_broken
+                        {
+                            notified_broken = true;
+                            notify(&bot, &state, chat_id, connection_broken_text(&target, &e))
+                                .await;
+                        }
+                    }
                 }
             }
 
@@ -108,16 +171,29 @@ pub fn spawn(
     })
 }
 
+/// Sends a connection-health notice, unless the chat has since disconnected
+/// entirely (a race with /logout while we were mid-retry).
+async fn notify(bot: &Bot, state: &AppState, chat_id: i64, text: String) {
+    if state.store.get(chat_id).is_none() {
+        return;
+    }
+    if let Err(e) = bot.send_message(ChatId(chat_id), text).await {
+        tracing::warn!(chat_id, error = %e, "failed to deliver connection-health notice");
+    }
+}
+
 async fn run_once(
     bot: &Bot,
     state: &AppState,
     chat_id: i64,
     client: &Arc<JmapClient>,
     target: &WatchTarget,
+    connected: &AtomicBool,
 ) -> anyhow::Result<()> {
     let mut stream = client
         .event_source(Some(jmap::WATCHED_TYPES), false, Some(60), None)
         .await?;
+    connected.store(true, Ordering::Relaxed);
 
     let mut interval = tokio::time::interval(FALLBACK_POLL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -255,5 +331,38 @@ mod tests {
         };
         assert!(!target.still_active(&account()));
         assert_eq!(target.since_state(&account()), None);
+    }
+
+    #[test]
+    fn connection_broken_text_names_the_primary_mailbox_and_the_error() {
+        let err = anyhow::anyhow!("401 Unauthorized");
+        let text = connection_broken_text(&WatchTarget::Primary, &err);
+        assert!(text.contains("ta boîte JMAP"));
+        assert!(text.contains("401 Unauthorized"));
+        assert!(text.contains("/login"));
+    }
+
+    #[test]
+    fn connection_broken_text_names_the_shared_mailbox() {
+        let err = anyhow::anyhow!("connection refused");
+        let target = WatchTarget::Shared {
+            account_id: "acc7".to_string(),
+            label: "contact@delta-net.ovh".to_string(),
+        };
+        let text = connection_broken_text(&target, &err);
+        assert!(text.contains("contact@delta-net.ovh"));
+        assert!(text.contains("connection refused"));
+    }
+
+    #[test]
+    fn connection_recovered_text_names_the_target() {
+        let primary = connection_recovered_text(&WatchTarget::Primary);
+        assert!(primary.contains("ta boîte JMAP"));
+
+        let shared = connection_recovered_text(&WatchTarget::Shared {
+            account_id: "acc7".to_string(),
+            label: "contact@delta-net.ovh".to_string(),
+        });
+        assert!(shared.contains("contact@delta-net.ovh"));
     }
 }
