@@ -1,0 +1,41 @@
+name: Dependabot auto-merge
+
+# Dependabot (dependabot.yml) opens weekly PRs for Cargo/Docker/Actions
+# updates; those already go through the full CI gate (ci.yml) like any
+# other PR. This workflow is the other half: once CI is green, patch and
+# minor bumps merge themselves, so routine dependency maintenance doesn't
+# need a human to click merge every week. Major bumps are deliberately
+# left for manual review — a major version can carry breaking API or
+# behavior changes CI's own test suite won't catch.
+#
+# Requires the repository's own "Settings -> General -> Allow auto-merge"
+# to be enabled once; this workflow's GITHUB_TOKEN can't flip that
+# repository setting itself (it isn't a permission `permissions:` grants).
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  auto-merge:
+    if: github.actor == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dependabot metadata
+        id: metadata
+        uses: dependabot/fetch-metadata@v2
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Enable auto-merge for patch/minor updates
+        if: steps.metadata.outputs.update-type != 'version-update:semver-major'
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh pr review --approve "$PR_URL"
+          gh pr merge --auto --squash "$PR_URL"
