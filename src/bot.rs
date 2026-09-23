@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use teloxide::dispatching::UpdateHandler;
 use teloxide::prelude::*;
-use teloxide::types::{InlineKeyboardMarkup, Me, MessageId};
+use teloxide::types::{Me, MessageId};
 use teloxide::utils::command::BotCommands;
 
 use crate::Bot;
@@ -608,6 +608,96 @@ async fn cmd_rechercher(
     Ok(())
 }
 
+enum TriageAction {
+    Archive,
+    Junk,
+    Delete,
+}
+
+/// Which chat/message a callback tap came from — bundled together purely
+/// to keep `perform_triage_action`'s argument count sane.
+struct CallbackCtx {
+    chat_id: ChatId,
+    message_id: MessageId,
+    query_id: teloxide::types::CallbackQueryId,
+}
+
+/// Which email an action applies to, and in which JMAP account.
+struct EmailRef<'a> {
+    account_id: Option<&'a str>,
+    email_id: &'a str,
+}
+
+/// Archives/marks spam/moves-to-trash a message, snapshotting its current
+/// mailboxes first so `/undo` can put it back exactly where it was, then
+/// leaves a time-limited "↩️ Annuler" button in place of the usual cleared
+/// keyboard. Shared by all three triage actions since they only differ in
+/// which JMAP call to make and which mailbox the message ends up in.
+async fn perform_triage_action(
+    bot: &Bot,
+    state: &AppState,
+    ctx: CallbackCtx,
+    client: &jmap_client::client::Client,
+    target: EmailRef<'_>,
+    action: TriageAction,
+) -> HandlerResult {
+    let CallbackCtx {
+        chat_id,
+        message_id,
+        query_id,
+    } = ctx;
+    let EmailRef {
+        account_id,
+        email_id,
+    } = target;
+
+    let restore_mailbox_ids = match jmap::mailbox_ids_of(client, email_id).await {
+        Ok(ids) => ids,
+        Err(e) => {
+            bot.answer_callback_query(query_id)
+                .text(format!("❌ {e}"))
+                .show_alert(true)
+                .await?;
+            return Ok(());
+        }
+    };
+
+    let (result, toast) = match action {
+        TriageAction::Archive => (jmap::archive(client, email_id).await, "📥 Archivé."),
+        TriageAction::Junk => (jmap::junk(client, email_id).await, "🚫 Marqué comme spam."),
+        TriageAction::Delete => (
+            jmap::delete(client, email_id).await,
+            "🗑 Déplacé vers la corbeille.",
+        ),
+    };
+
+    match result {
+        Ok(()) => {
+            bot.answer_callback_query(query_id).text(toast).await?;
+            state.pending_undo.write().await.insert(
+                chat_id.0,
+                crate::state::PendingUndo {
+                    account_id: account_id.map(str::to_string),
+                    email_id: email_id.to_string(),
+                    restore_mailbox_ids,
+                    expires_at: std::time::Instant::now() + crate::state::UNDO_WINDOW,
+                },
+            );
+            let _ = bot
+                .edit_message_reply_markup(chat_id, message_id)
+                .reply_markup(format::undo_keyboard(email_id, account_id))
+                .await;
+        }
+        Err(e) => {
+            bot.answer_callback_query(query_id)
+                .text(format!("❌ {e}"))
+                .show_alert(true)
+                .await?;
+        }
+    }
+    Ok(())
+}
+
 async fn callback_handler(bot: Bot, q: CallbackQuery, state: AppState) -> HandlerResult {
     let Some(message) = q.regular_message() else {
         bot.answer_callback_query(q.id).await?;
@@ -689,53 +779,94 @@ async fn callback_handler(bot: Bot, q: CallbackQuery, state: AppState) -> Handle
                     .await?;
             }
         },
-        "a" => match jmap::archive(&client, email_id).await {
-            Ok(()) => {
-                bot.answer_callback_query(q.id).text("📥 Archivé.").await?;
-                let _ = bot
-                    .edit_message_reply_markup(chat_id, message_id)
-                    .reply_markup(InlineKeyboardMarkup::new(Vec::<Vec<_>>::new()))
-                    .await;
+        "a" => {
+            return perform_triage_action(
+                &bot,
+                &state,
+                CallbackCtx {
+                    chat_id,
+                    message_id,
+                    query_id: q.id,
+                },
+                &client,
+                EmailRef {
+                    account_id,
+                    email_id,
+                },
+                TriageAction::Archive,
+            )
+            .await;
+        }
+        "j" => {
+            return perform_triage_action(
+                &bot,
+                &state,
+                CallbackCtx {
+                    chat_id,
+                    message_id,
+                    query_id: q.id,
+                },
+                &client,
+                EmailRef {
+                    account_id,
+                    email_id,
+                },
+                TriageAction::Junk,
+            )
+            .await;
+        }
+        "d" => {
+            return perform_triage_action(
+                &bot,
+                &state,
+                CallbackCtx {
+                    chat_id,
+                    message_id,
+                    query_id: q.id,
+                },
+                &client,
+                EmailRef {
+                    account_id,
+                    email_id,
+                },
+                TriageAction::Delete,
+            )
+            .await;
+        }
+        "u" => {
+            let pending = state.pending_undo.write().await.remove(&chat_id.0);
+            match pending {
+                Some(p)
+                    if !p.is_expired()
+                        && p.account_id.as_deref() == account_id
+                        && p.email_id == email_id =>
+                {
+                    match jmap::restore_mailboxes(&client, email_id, p.restore_mailbox_ids).await {
+                        Ok(()) => {
+                            bot.answer_callback_query(q.id).text("↩️ Restauré.").await?;
+                            let _ = bot
+                                .edit_message_reply_markup(chat_id, message_id)
+                                .reply_markup(format::notification_keyboard(
+                                    email_id, account_id, false,
+                                ))
+                                .await;
+                        }
+                        Err(e) => {
+                            bot.answer_callback_query(q.id)
+                                .text(format!("❌ {e}"))
+                                .show_alert(true)
+                                .await?;
+                        }
+                    }
+                }
+                _ => {
+                    bot.answer_callback_query(q.id)
+                        .text("Trop tard pour annuler.")
+                        .show_alert(true)
+                        .await?;
+                }
             }
-            Err(e) => {
-                bot.answer_callback_query(q.id)
-                    .text(format!("❌ {e}"))
-                    .show_alert(true)
-                    .await?;
-            }
-        },
-        "j" => match jmap::junk(&client, email_id).await {
-            Ok(()) => {
-                bot.answer_callback_query(q.id)
-                    .text("🚫 Marqué comme spam.")
-                    .await?;
-                let _ = bot
-                    .edit_message_reply_markup(chat_id, message_id)
-                    .reply_markup(InlineKeyboardMarkup::new(Vec::<Vec<_>>::new()))
-                    .await;
-            }
-            Err(e) => {
-                bot.answer_callback_query(q.id)
-                    .text(format!("❌ {e}"))
-                    .show_alert(true)
-                    .await?;
-            }
-        },
-        "d" => match jmap::delete(&client, email_id).await {
-            Ok(()) => {
-                bot.answer_callback_query(q.id).text("🗑 Supprimé.").await?;
-                let _ = bot
-                    .edit_message_reply_markup(chat_id, message_id)
-                    .reply_markup(InlineKeyboardMarkup::new(Vec::<Vec<_>>::new()))
-                    .await;
-            }
-            Err(e) => {
-                bot.answer_callback_query(q.id)
-                    .text(format!("❌ {e}"))
-                    .show_alert(true)
-                    .await?;
-            }
-        },
+        }
         "f" => {
             let _ = bot
                 .send_chat_action(chat_id, teloxide::types::ChatAction::Typing)

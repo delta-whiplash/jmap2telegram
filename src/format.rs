@@ -190,6 +190,19 @@ pub fn notification_keyboard(
     ])
 }
 
+/// Replaces a triage action's cleared keyboard with a single "↩️ Annuler"
+/// button, so archiving/marking spam/deleting is a one-tap mistake to
+/// recover from instead of a silent, final action.
+pub fn undo_keyboard(email_id: &str, account_id: Option<&str>) -> InlineKeyboardMarkup {
+    if action_callback_data('u', account_id, email_id).len() > TELEGRAM_CALLBACK_DATA_MAX_LEN {
+        return InlineKeyboardMarkup::new(Vec::<Vec<InlineKeyboardButton>>::new());
+    }
+    InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::callback(
+        "↩️ Annuler",
+        action_callback_data('u', account_id, email_id),
+    )]])
+}
+
 /// Builds the `/partages` toggle menu: one button per shared JMAP account
 /// visible to the token right now, checked when the chat is currently
 /// opted into notifications for it. An account whose id is too long to fit
@@ -533,6 +546,21 @@ mod tests {
         let long_account = "a".repeat(60);
         let kb = notification_keyboard("M123", Some(&long_account), false);
         assert!(kb.inline_keyboard.is_empty());
+    }
+
+    #[test]
+    fn undo_keyboard_has_a_single_cancel_button() {
+        let kb = undo_keyboard("M123", None);
+        assert_eq!(kb.inline_keyboard.len(), 1);
+        assert_eq!(kb.inline_keyboard[0].len(), 1);
+        let InlineKeyboardButton {
+            kind: teloxide::types::InlineKeyboardButtonKind::CallbackData(data),
+            ..
+        } = &kb.inline_keyboard[0][0]
+        else {
+            panic!("expected a callback button");
+        };
+        assert_eq!(data, "u:M123");
     }
 
     #[test]

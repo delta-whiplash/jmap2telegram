@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use jmap_client::client::Client as JmapClient;
 use tokio::sync::RwLock;
@@ -11,6 +12,33 @@ use crate::store::Store;
 /// (chat id, JMAP account id): identifies one of a chat's opted-in shared
 /// accounts, distinct from its own mailbox (which only needs the chat id).
 type SharedAccountKey = (i64, String);
+
+/// How long `/undo` (the "↩️ Annuler" button left after a triage action)
+/// stays valid. Deliberately short and in-memory only: this is a "catch an
+/// accidental tap" safety net, not a durable trash — a bot restart or the
+/// window elapsing just means the action stands, same as if undo never
+/// existed.
+pub const UNDO_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A pending undo for the last triage action (archive/spam/delete) taken
+/// on a chat's notification, keyed by chat id — one slot per chat, so a
+/// second action before the first is undone simply replaces it, matching
+/// "undo the last thing" rather than a full history.
+#[derive(Clone)]
+pub struct PendingUndo {
+    pub account_id: Option<String>,
+    pub email_id: String,
+    /// The mailbox ids the message was in right before the action, so
+    /// undo restores exactly that rather than guessing "back to Inbox".
+    pub restore_mailbox_ids: Vec<String>,
+    pub expires_at: Instant,
+}
+
+impl PendingUndo {
+    pub fn is_expired(&self) -> bool {
+        Instant::now() >= self.expires_at
+    }
+}
 
 /// Shared application state, injected into every Telegram handler and into
 /// the background per-account JMAP watchers.
@@ -29,6 +57,10 @@ pub struct AppState {
     /// default account out from under concurrent tasks would race.
     pub shared_clients: Arc<RwLock<HashMap<SharedAccountKey, Arc<JmapClient>>>>,
     pub shared_watchers: Arc<RwLock<HashMap<SharedAccountKey, JoinHandle<()>>>>,
+    /// One pending `/undo` slot per chat. In-memory only, never persisted:
+    /// this is a short-lived safety net for an accidental tap, not
+    /// durable state anything depends on surviving a restart.
+    pub pending_undo: Arc<RwLock<HashMap<i64, PendingUndo>>>,
 }
 
 impl AppState {
@@ -40,6 +72,7 @@ impl AppState {
             watchers: Arc::new(RwLock::new(HashMap::new())),
             shared_clients: Arc::new(RwLock::new(HashMap::new())),
             shared_watchers: Arc::new(RwLock::new(HashMap::new())),
+            pending_undo: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -115,6 +148,7 @@ impl AppState {
         if let Some(handle) = self.watchers.write().await.remove(&chat_id) {
             handle.abort();
         }
+        self.pending_undo.write().await.remove(&chat_id);
 
         let mut shared_clients = self.shared_clients.write().await;
         shared_clients.retain(|(id, _), _| *id != chat_id);
@@ -140,5 +174,27 @@ impl AppState {
         if let Some(handle) = self.shared_watchers.write().await.remove(&key) {
             handle.abort();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pending_undo_is_expired_reflects_the_deadline() {
+        let fresh = PendingUndo {
+            account_id: None,
+            email_id: "M1".to_string(),
+            restore_mailbox_ids: vec!["inbox".to_string()],
+            expires_at: Instant::now() + std::time::Duration::from_secs(30),
+        };
+        assert!(!fresh.is_expired());
+
+        let stale = PendingUndo {
+            expires_at: Instant::now() - std::time::Duration::from_secs(1),
+            ..fresh
+        };
+        assert!(stale.is_expired());
     }
 }

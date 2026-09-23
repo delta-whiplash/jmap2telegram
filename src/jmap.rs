@@ -350,6 +350,33 @@ pub async fn mark_read(client: &Client, id: &str) -> Result<()> {
     Ok(())
 }
 
+/// The mailbox ids a message currently sits in, taken right before a
+/// triage action moves it elsewhere — the snapshot `/undo` restores.
+pub async fn mailbox_ids_of(client: &Client, id: &str) -> Result<Vec<String>> {
+    let email = client
+        .email_get(id, Some([Property::MailboxIds]))
+        .await
+        .context("Email/get (snapshot pour /undo) a échoué")?
+        .context("message introuvable (peut-être déjà supprimé)")?;
+    Ok(email
+        .mailbox_ids()
+        .into_iter()
+        .map(str::to_string)
+        .collect())
+}
+
+/// Puts a message back in a specific set of mailboxes — the undo half of
+/// archive/junk/delete, restoring whatever `mailbox_ids_of` snapshotted
+/// beforehand rather than assuming "back to Inbox" (a message filed into
+/// more than one mailbox should come back exactly as it was).
+pub async fn restore_mailboxes(client: &Client, id: &str, mailbox_ids: Vec<String>) -> Result<()> {
+    client
+        .email_set_mailboxes(id, mailbox_ids)
+        .await
+        .context("échec de la restauration")?;
+    Ok(())
+}
+
 pub async fn archive(client: &Client, id: &str) -> Result<()> {
     let Some(archive_id) = mailbox_with_role(client, Role::Archive).await? else {
         bail!("ce compte n'a pas de dossier Archive JMAP");
@@ -372,11 +399,18 @@ pub async fn junk(client: &Client, id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Moves a message to Trash rather than permanently destroying it via
+/// Email/destroy: "Supprimer" in a mail client conventionally means
+/// recoverable-for-now, not gone-forever-with-no-undo, and a permanent
+/// destroy would make /undo meaningless for this action specifically.
 pub async fn delete(client: &Client, id: &str) -> Result<()> {
+    let Some(trash_id) = mailbox_with_role(client, Role::Trash).await? else {
+        bail!("ce compte n'a pas de dossier Corbeille JMAP");
+    };
     client
-        .email_destroy(id)
+        .email_set_mailboxes(id, [trash_id])
         .await
-        .context("échec de la suppression")?;
+        .context("échec de la mise à la corbeille")?;
     Ok(())
 }
 
