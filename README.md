@@ -3,7 +3,7 @@
 [![CI](https://github.com/delta-whiplash/jmap2telegram/actions/workflows/ci.yml/badge.svg)](https://github.com/delta-whiplash/jmap2telegram/actions/workflows/ci.yml)
 [![Security audit](https://github.com/delta-whiplash/jmap2telegram/actions/workflows/security-audit.yml/badge.svg)](https://github.com/delta-whiplash/jmap2telegram/actions/workflows/security-audit.yml)
 [![Release](https://img.shields.io/github/v/release/delta-whiplash/jmap2telegram?label=release)](https://github.com/delta-whiplash/jmap2telegram/releases/latest)
-[![License: Attribution](https://img.shields.io/badge/license-Attribution-blueviolet)](LICENSE)
+[![License: Cardinal Code Open1 Attribution](https://img.shields.io/badge/license-Cardinal%20Code%20Open1%20Attribution-blueviolet)](LICENSE)
 [![Docker image](https://img.shields.io/badge/ghcr.io-jmap2telegram-blue?logo=docker&logoColor=white)](https://github.com/delta-whiplash/jmap2telegram/pkgs/container/jmap2telegram)
 [![Helm chart](https://img.shields.io/badge/oci-charts%2Fjmap2telegram-0F1689?logo=helm&logoColor=white)](https://github.com/delta-whiplash/jmap2telegram/pkgs/container/charts%2Fjmap2telegram)
 
@@ -292,10 +292,22 @@ fix (flagged automatically, fixed by hand when it needs more than a
 
 ## License
 
-[`LICENSE`](LICENSE) — free to use, modify, and redistribute, for any
-purpose including commercial, with one condition: any copy or derivative
-work must keep visible credit to **delta-whiplash** as the original
-author and **jmap2telegram** as the original project, even if you rename
-or repackage it. Not a standard SPDX license id, so tooling that expects
-one (e.g. `cargo package`) is pointed at the file directly via
-`license-file` in [`Cargo.toml`](Cargo.toml).
+[`LICENSE`](LICENSE) — the **Cardinal Code Open1 Attribution License**.
+Free to use, modify, sell, and redistribute for any purpose, commercial
+or not, subject to a few conditions:
+
+- **Attribution.** Keep a visible credit to **delta-whiplash** as the
+  original author and **jmap2telegram** as the original project,
+  wherever a user of your distribution would reasonably see it — even if
+  you rename or repackage it. The license spells out the exact wording.
+- **Naming.** You can fork and rename your own version freely, but you
+  can't call your fork "jmap2telegram" in a way that could be mistaken
+  for the original project.
+- **No implied endorsement.** Crediting the origin doesn't mean claiming
+  delta-whiplash endorses or is affiliated with your fork.
+- **Automatic termination.** Breaking any of the above ends your license
+  automatically (with a 30-day cure window).
+
+Not a standard SPDX license id, so tooling that expects one (e.g. `cargo
+package`) is pointed at the file directly via `license-file` in
+[`Cargo.toml`](Cargo.toml).

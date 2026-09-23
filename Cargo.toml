@@ -2,6 +2,9 @@
 name = "jmap2telegram"
 version = "0.5.2"
 edition = "2024"
+# "Cardinal Code Open1 Attribution License" — a custom text, so Cargo/
+# crates.io point at it via license-file rather than an SPDX license id
+# (license and license-file are mutually exclusive in Cargo.toml).
 license-file = "LICENSE"
 description = "A self-hosted Telegram bot that turns a JMAP mailbox into Telegram notifications"
 repository = "https://github.com/delta-whiplash/jmap2telegram"
