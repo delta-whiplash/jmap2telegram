@@ -28,15 +28,7 @@ fn truncate(input: &str, limit: usize) -> String {
 /// them apart; `None` renders exactly as before (the common single-mailbox
 /// case).
 pub fn notification_text(summary: &EmailSummary, tz: Tz, account_label: Option<&str>) -> String {
-    let from = match (&summary.from_name, &summary.from_addr) {
-        (Some(name), Some(addr)) if !name.is_empty() => format!(
-            "{} <{}>",
-            truncate(name, FIELD_LIMIT),
-            truncate(addr, FIELD_LIMIT)
-        ),
-        (_, Some(addr)) => truncate(addr, FIELD_LIMIT),
-        _ => "(expéditeur inconnu)".to_string(),
-    };
+    let from = from_field(summary.from_name.as_deref(), summary.from_addr.as_deref());
 
     let when = summary
         .received_at
@@ -49,7 +41,10 @@ pub fn notification_text(summary: &EmailSummary, tz: Tz, account_label: Option<&
         .unwrap_or_default();
 
     let subject = truncate(summary.subject.trim(), FIELD_LIMIT);
-    let preview = truncate(summary.preview.trim(), PREVIEW_LIMIT);
+    let preview = blockquote(&escape_markdown(&truncate(
+        summary.preview.trim(),
+        PREVIEW_LIMIT,
+    )));
 
     let mailbox_line = account_label
         .map(|label| {
@@ -62,11 +57,69 @@ pub fn notification_text(summary: &EmailSummary, tz: Tz, account_label: Option<&
 
     format!(
         "📧 *Nouveau message*\n\n{mailbox_line}*De :* {from}\n*Objet :* {subject}\n*Reçu :* {when}\n\n{preview}",
-        from = escape_markdown(&from),
         subject = escape_markdown(&subject),
         when = escape_markdown(&when),
-        preview = escape_markdown(&preview),
     )
+}
+
+/// Renders the sender as a `mailto:` link when an address is available, so
+/// tapping it opens the recipient's mail app — a small but genuinely useful
+/// bit of native richness GmailBot doesn't offer. Falls back to plain
+/// escaped text when there's nothing to link (no address, or an address
+/// that's entirely whitespace/control characters once sanitized).
+fn from_field(name: Option<&str>, addr: Option<&str>) -> String {
+    let addr = addr.map(|a| truncate(a, FIELD_LIMIT));
+    let display = match (name, &addr) {
+        (Some(name), Some(addr)) if !name.is_empty() => {
+            format!("{} <{}>", truncate(name, FIELD_LIMIT), addr)
+        }
+        (_, Some(addr)) => addr.clone(),
+        _ => return escape_markdown("(expéditeur inconnu)"),
+    };
+
+    match addr.as_deref().map(mailto_url).filter(|u| !u.is_empty()) {
+        Some(url) => format!(
+            "[{}](mailto:{})",
+            escape_markdown(&display),
+            escape_markdown_url(&url)
+        ),
+        None => escape_markdown(&display),
+    }
+}
+
+/// A `From` header is attacker-controlled and not guaranteed to be a
+/// well-formed address; a `mailto:` URL has to stay on one line, so strip
+/// whitespace/control characters rather than let them break it across the
+/// rendered message.
+fn mailto_url(addr: &str) -> String {
+    addr.chars()
+        .filter(|c| !c.is_whitespace() && !c.is_control())
+        .collect()
+}
+
+/// Escapes text for the `(...)` part of a MarkdownV2 inline link: per
+/// Telegram's spec, only `)` and `\` need escaping there (the general
+/// `escape_markdown` rules don't apply inside a URL).
+fn escape_markdown_url(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for c in input.chars() {
+        if c == ')' || c == '\\' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Renders already-escaped text as a native MarkdownV2 blockquote (each
+/// line prefixed with `>`), so the message preview reads as a visually
+/// distinct quoted block instead of running into the surrounding text.
+fn blockquote(escaped: &str) -> String {
+    escaped
+        .lines()
+        .map(|line| format!(">{line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Telegram rejects any inline button whose `callback_data` exceeds 64
@@ -90,34 +143,50 @@ fn action_callback_data(action: char, account_id: Option<&str>, email_id: &str) 
     }
 }
 
-pub fn notification_keyboard(email_id: &str, account_id: Option<&str>) -> InlineKeyboardMarkup {
+/// `already_read` swaps the "✅ Lu" action button for an inert "✔️ Lu"
+/// label (still a valid, tappable no-op button rather than a dead one) —
+/// used to edit a notification's keyboard in place right after marking it
+/// read, so the chat itself reflects that state instead of staying silent
+/// about it until the next glance at the mailbox.
+pub fn notification_keyboard(
+    email_id: &str,
+    account_id: Option<&str>,
+    already_read: bool,
+) -> InlineKeyboardMarkup {
     // All action letters are 1 byte, so any is representative for the
     // length check.
     if action_callback_data('d', account_id, email_id).len() > TELEGRAM_CALLBACK_DATA_MAX_LEN {
         return InlineKeyboardMarkup::new(Vec::<Vec<InlineKeyboardButton>>::new());
     }
 
-    InlineKeyboardMarkup::new([
-        [
+    let read_button = if already_read {
+        InlineKeyboardButton::callback("✔️ Lu", action_callback_data('n', account_id, email_id))
+    } else {
+        InlineKeyboardButton::callback("✅ Lu", action_callback_data('r', account_id, email_id))
+    };
+
+    InlineKeyboardMarkup::new(vec![
+        vec![
             InlineKeyboardButton::callback(
                 "📖 Lire tout",
                 action_callback_data('f', account_id, email_id),
             ),
-            InlineKeyboardButton::callback(
-                "✅ Lu",
-                action_callback_data('r', account_id, email_id),
-            ),
+            read_button,
         ],
-        [
+        vec![
             InlineKeyboardButton::callback(
                 "📥 Archiver",
                 action_callback_data('a', account_id, email_id),
             ),
             InlineKeyboardButton::callback(
-                "🗑 Supprimer",
-                action_callback_data('d', account_id, email_id),
+                "🚫 Spam",
+                action_callback_data('j', account_id, email_id),
             ),
         ],
+        vec![InlineKeyboardButton::callback(
+            "🗑 Supprimer",
+            action_callback_data('d', account_id, email_id),
+        )],
     ])
 }
 
@@ -342,9 +411,49 @@ mod tests {
 
     #[test]
     fn notification_keyboard_has_action_buttons_for_short_id() {
-        let kb = notification_keyboard("M123", None);
-        assert_eq!(kb.inline_keyboard.len(), 2);
+        let kb = notification_keyboard("M123", None, false);
+        assert_eq!(kb.inline_keyboard.len(), 3);
         assert_eq!(kb.inline_keyboard[0].len(), 2);
+        assert_eq!(kb.inline_keyboard[1].len(), 2);
+        assert_eq!(kb.inline_keyboard[2].len(), 1);
+    }
+
+    #[test]
+    fn notification_keyboard_spam_button_uses_junk_action() {
+        let kb = notification_keyboard("M123", None, false);
+        let InlineKeyboardButton {
+            kind: teloxide::types::InlineKeyboardButtonKind::CallbackData(data),
+            ..
+        } = &kb.inline_keyboard[1][1]
+        else {
+            panic!("expected a callback button");
+        };
+        assert_eq!(data, "j:M123");
+    }
+
+    #[test]
+    fn notification_keyboard_already_read_shows_inert_check() {
+        let unread = notification_keyboard("M123", None, false);
+        let read = notification_keyboard("M123", None, true);
+
+        let read_button_data = |kb: &InlineKeyboardMarkup| {
+            let InlineKeyboardButton {
+                text,
+                kind: teloxide::types::InlineKeyboardButtonKind::CallbackData(data),
+            } = &kb.inline_keyboard[0][1]
+            else {
+                panic!("expected a callback button");
+            };
+            (text.clone(), data.clone())
+        };
+
+        let (unread_text, unread_data) = read_button_data(&unread);
+        assert_eq!(unread_text, "✅ Lu");
+        assert_eq!(unread_data, "r:M123");
+
+        let (read_text, read_data) = read_button_data(&read);
+        assert_eq!(read_text, "✔️ Lu");
+        assert_eq!(read_data, "n:M123");
     }
 
     #[test]
@@ -352,8 +461,45 @@ mod tests {
         // Telegram's callback_data hard limit is 64 bytes; a pathological
         // JMAP id must not produce a button Telegram will silently reject.
         let long_id = "x".repeat(100);
-        let kb = notification_keyboard(&long_id, None);
+        let kb = notification_keyboard(&long_id, None, false);
         assert!(kb.inline_keyboard.is_empty());
+    }
+
+    #[test]
+    fn notification_text_renders_sender_as_a_mailto_link() {
+        let s = summary(
+            "Hello",
+            Some("Alice"),
+            Some("alice@example.org"),
+            "Hi there",
+        );
+        let text = notification_text(&s, Tz::UTC, None);
+        assert!(text.contains("(mailto:alice@example.org)"));
+    }
+
+    #[test]
+    fn notification_text_mailto_link_survives_a_hostile_address() {
+        // A From header is attacker-controlled; ')' and '\' in the address
+        // must not be able to break out of the MarkdownV2 link's URL part.
+        let hostile_addr = "a)\\evil@example.org";
+        let s = summary("Hello", None, Some(hostile_addr), "Hi");
+        let text = notification_text(&s, Tz::UTC, None);
+        assert!(text.contains(r"(mailto:a\)\\evil@example.org)"));
+    }
+
+    #[test]
+    fn notification_text_falls_back_to_plain_text_when_no_address() {
+        let s = summary("Hello", None, None, "Hi there");
+        let text = notification_text(&s, Tz::UTC, None);
+        assert!(!text.contains("mailto:"));
+    }
+
+    #[test]
+    fn notification_text_renders_preview_as_a_blockquote() {
+        let s = summary("Hello", None, Some("a@b.c"), "line one\nline two");
+        let text = notification_text(&s, Tz::UTC, None);
+        assert!(text.contains(">line one"));
+        assert!(text.contains(">line two"));
     }
 
     #[test]
@@ -371,7 +517,7 @@ mod tests {
         // Email ids are only unique within their JMAP account, so a shared
         // mailbox's action buttons must carry the account id, not just the
         // email id, or a tap would be routed to the wrong client.
-        let kb = notification_keyboard("M123", Some("acc7"));
+        let kb = notification_keyboard("M123", Some("acc7"), false);
         let InlineKeyboardButton {
             kind: teloxide::types::InlineKeyboardButtonKind::CallbackData(data),
             ..
@@ -385,7 +531,7 @@ mod tests {
     #[test]
     fn notification_keyboard_drops_buttons_when_account_and_id_together_too_long() {
         let long_account = "a".repeat(60);
-        let kb = notification_keyboard("M123", Some(&long_account));
+        let kb = notification_keyboard("M123", Some(&long_account), false);
         assert!(kb.inline_keyboard.is_empty());
     }
 

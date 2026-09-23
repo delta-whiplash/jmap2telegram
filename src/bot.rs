@@ -506,6 +506,13 @@ async fn callback_handler(bot: Bot, q: CallbackQuery, state: AppState) -> Handle
                 bot.answer_callback_query(q.id)
                     .text("✅ Marqué comme lu.")
                     .await?;
+                // Reflect the new state on the notification itself (the
+                // "Lu" button becomes an inert checkmark) instead of
+                // leaving the chat looking exactly as before the tap.
+                let _ = bot
+                    .edit_message_reply_markup(chat_id, message_id)
+                    .reply_markup(format::notification_keyboard(email_id, account_id, true))
+                    .await;
             }
             Err(e) => {
                 bot.answer_callback_query(q.id)
@@ -517,6 +524,23 @@ async fn callback_handler(bot: Bot, q: CallbackQuery, state: AppState) -> Handle
         "a" => match jmap::archive(&client, email_id).await {
             Ok(()) => {
                 bot.answer_callback_query(q.id).text("📥 Archivé.").await?;
+                let _ = bot
+                    .edit_message_reply_markup(chat_id, message_id)
+                    .reply_markup(InlineKeyboardMarkup::new(Vec::<Vec<_>>::new()))
+                    .await;
+            }
+            Err(e) => {
+                bot.answer_callback_query(q.id)
+                    .text(format!("❌ {e}"))
+                    .show_alert(true)
+                    .await?;
+            }
+        },
+        "j" => match jmap::junk(&client, email_id).await {
+            Ok(()) => {
+                bot.answer_callback_query(q.id)
+                    .text("🚫 Marqué comme spam.")
+                    .await?;
                 let _ = bot
                     .edit_message_reply_markup(chat_id, message_id)
                     .reply_markup(InlineKeyboardMarkup::new(Vec::<Vec<_>>::new()))
@@ -544,20 +568,31 @@ async fn callback_handler(bot: Bot, q: CallbackQuery, state: AppState) -> Handle
                     .await?;
             }
         },
-        "f" => match jmap::fetch_full_text(&client, email_id).await {
-            Ok(text) => {
-                bot.answer_callback_query(q.id).await?;
-                for chunk in chunk_text(&text, TELEGRAM_MAX_MESSAGE_LEN - 16) {
-                    bot.send_message(chat_id, chunk).await?;
+        "f" => {
+            let _ = bot
+                .send_chat_action(chat_id, teloxide::types::ChatAction::Typing)
+                .await;
+            match jmap::fetch_full_text(&client, email_id).await {
+                Ok(text) => {
+                    bot.answer_callback_query(q.id).await?;
+                    for chunk in chunk_text(&text, TELEGRAM_MAX_MESSAGE_LEN - 16) {
+                        bot.send_message(chat_id, chunk).await?;
+                    }
+                }
+                Err(e) => {
+                    bot.answer_callback_query(q.id)
+                        .text(format!("❌ {e}"))
+                        .show_alert(true)
+                        .await?;
                 }
             }
-            Err(e) => {
-                bot.answer_callback_query(q.id)
-                    .text(format!("❌ {e}"))
-                    .show_alert(true)
-                    .await?;
-            }
-        },
+        }
+        // "n" ("already read") is an intentionally inert label button —
+        // it still needs to answer the callback so Telegram stops showing
+        // a loading spinner on the tap, but there's nothing to do.
+        "n" => {
+            bot.answer_callback_query(q.id).text("Déjà lu.").await?;
+        }
         _ => {
             bot.answer_callback_query(q.id).await?;
         }

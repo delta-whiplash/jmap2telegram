@@ -299,6 +299,17 @@ pub async fn archive(client: &Client, id: &str) -> Result<()> {
     Ok(())
 }
 
+pub async fn junk(client: &Client, id: &str) -> Result<()> {
+    let Some(junk_id) = mailbox_with_role(client, Role::Junk).await? else {
+        bail!("ce compte n'a pas de dossier Spam/Junk JMAP");
+    };
+    client
+        .email_set_mailboxes(id, [junk_id])
+        .await
+        .context("échec du marquage comme spam")?;
+    Ok(())
+}
+
 pub async fn delete(client: &Client, id: &str) -> Result<()> {
     client
         .email_destroy(id)

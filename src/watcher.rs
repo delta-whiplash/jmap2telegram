@@ -254,7 +254,7 @@ async fn sync_and_notify(
 
     for summary in &summaries {
         let text = notification_text(summary, state.config.timezone, target.label());
-        let keyboard = notification_keyboard(&summary.id, target.account_id());
+        let keyboard = notification_keyboard(&summary.id, target.account_id(), false);
         if let Err(e) = bot
             .send_message(ChatId(chat_id), text)
             .parse_mode(ParseMode::MarkdownV2)

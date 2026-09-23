@@ -40,6 +40,17 @@ async fn main() -> anyhow::Result<()> {
 
     let bot = teloxide::Bot::new(&config.telegram_token).throttle(Limits::default());
 
+    // Registers the command list with Telegram itself, so the client's "/"
+    // menu autocompletes every command with its description instead of the
+    // user having to remember them or run /help. Best-effort: a failure
+    // here (e.g. a transient Telegram API hiccup) shouldn't block startup.
+    {
+        use teloxide::utils::command::BotCommands;
+        if let Err(e) = bot.set_my_commands(bot::Command::bot_commands()).await {
+            tracing::warn!(error = %e, "failed to register bot commands with Telegram");
+        }
+    }
+
     // Resume watching every account that survived a restart, without
     // re-notifying about anything already seen (last_state is resumed
     // from the encrypted store).
