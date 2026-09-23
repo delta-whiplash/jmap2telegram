@@ -122,8 +122,13 @@ autocompletes from the client's own "/" menu.
 
 Each new-mail notification comes with inline buttons: **Lire tout** (full
 body), **Lu** (mark read, shown in place afterward as a checkmark),
-**Archiver**, **Spam**, **Supprimer**. The sender is a tappable `mailto:`
-link and the preview renders as a native quoted block.
+**Archiver**, **Spam**, **Supprimer** (moves to Trash, not a permanent
+delete). The sender is a tappable `mailto:` link, the preview renders as
+a native quoted block, and any attachment is named with its size. Every
+triage action (Archiver/Spam/Supprimer) leaves a 30-second **↩️ Annuler**
+button that restores the message to exactly the mailboxes it was in
+before — an in-memory, non-persisted safety net for an accidental tap,
+not a second trash bin.
 
 ### Shared mailboxes
 
