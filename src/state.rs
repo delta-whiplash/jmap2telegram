@@ -13,6 +13,11 @@ use crate::store::Store;
 /// accounts, distinct from its own mailbox (which only needs the chat id).
 type SharedAccountKey = (i64, String);
 
+/// (chat id, our own generated slot id): identifies one of a chat's extra,
+/// fully independent JMAP accounts. A separate key space from
+/// `SharedAccountKey` on purpose — see `store::Account::extra_accounts`.
+type ExtraAccountKey = (i64, String);
+
 /// How long `/undo` (the "↩️ Annuler" button left after a triage action)
 /// stays valid. Deliberately short and in-memory only: this is a "catch an
 /// accidental tap" safety net, not a durable trash — a bot restart or the
@@ -57,6 +62,13 @@ pub struct AppState {
     /// default account out from under concurrent tasks would race.
     pub shared_clients: Arc<RwLock<HashMap<SharedAccountKey, Arc<JmapClient>>>>,
     pub shared_watchers: Arc<RwLock<HashMap<SharedAccountKey, JoinHandle<()>>>>,
+    /// Same idea again, for extra fully independent personal accounts
+    /// (their own server/token, added via `/comptes`) — kept in maps of
+    /// their own rather than reusing `shared_clients`/`shared_watchers` so
+    /// a shared-account JMAP id can never collide with a generated extra-
+    /// account slot id in the same cache.
+    pub extra_clients: Arc<RwLock<HashMap<ExtraAccountKey, Arc<JmapClient>>>>,
+    pub extra_watchers: Arc<RwLock<HashMap<ExtraAccountKey, JoinHandle<()>>>>,
     /// One pending `/undo` slot per chat. In-memory only, never persisted:
     /// this is a short-lived safety net for an accidental tap, not
     /// durable state anything depends on surviving a restart.
@@ -72,6 +84,8 @@ impl AppState {
             watchers: Arc::new(RwLock::new(HashMap::new())),
             shared_clients: Arc::new(RwLock::new(HashMap::new())),
             shared_watchers: Arc::new(RwLock::new(HashMap::new())),
+            extra_clients: Arc::new(RwLock::new(HashMap::new())),
+            extra_watchers: Arc::new(RwLock::new(HashMap::new())),
             pending_undo: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -139,10 +153,44 @@ impl AppState {
         Ok(Some(client))
     }
 
+    /// Same as `client_for_shared`, but for one of the chat's extra, fully
+    /// independent personal accounts (its own server/token). Returns
+    /// `None` both when the chat has no primary account and when this
+    /// slot id no longer names a connected extra account.
+    pub async fn client_for_extra(
+        &self,
+        chat_id: i64,
+        slot_id: &str,
+    ) -> anyhow::Result<Option<Arc<JmapClient>>> {
+        let key = (chat_id, slot_id.to_string());
+        if let Some(client) = self.extra_clients.read().await.get(&key) {
+            return Ok(Some(client.clone()));
+        }
+
+        let Some(account) = self.store.get(chat_id) else {
+            return Ok(None);
+        };
+        let Some(extra) = account.extra_accounts.get(slot_id) else {
+            return Ok(None);
+        };
+
+        let client = Arc::new(
+            crate::jmap::connect(
+                &extra.server_url,
+                &extra.token,
+                self.config.allow_private_jmap_hosts,
+            )
+            .await?,
+        );
+        self.extra_clients.write().await.insert(key, client.clone());
+        Ok(Some(client))
+    }
+
     /// Tears down everything for a chat: its own mailbox watcher/client and
-    /// every shared-account watcher/client. Used on /logout and before
-    /// re-establishing a fresh connection on /login, so a stale watcher
-    /// never keeps running under an id that's since been reused or removed.
+    /// every shared/extra-account watcher/client. Used on /logout and
+    /// before re-establishing a fresh connection on /login, so a stale
+    /// watcher never keeps running under an id that's since been reused or
+    /// removed.
     pub async fn forget(&self, chat_id: i64) {
         self.clients.write().await.remove(&chat_id);
         if let Some(handle) = self.watchers.write().await.remove(&chat_id) {
@@ -163,6 +211,20 @@ impl AppState {
                 true
             }
         });
+
+        let mut extra_clients = self.extra_clients.write().await;
+        extra_clients.retain(|(id, _), _| *id != chat_id);
+        drop(extra_clients);
+
+        let mut extra_watchers = self.extra_watchers.write().await;
+        extra_watchers.retain(|(id, _), handle| {
+            if *id == chat_id {
+                handle.abort();
+                false
+            } else {
+                true
+            }
+        });
     }
 
     /// Tears down just one shared account's watcher/client, leaving the
@@ -172,6 +234,16 @@ impl AppState {
         let key = (chat_id, account_id.to_string());
         self.shared_clients.write().await.remove(&key);
         if let Some(handle) = self.shared_watchers.write().await.remove(&key) {
+            handle.abort();
+        }
+    }
+
+    /// Tears down just one extra account's watcher/client. Used when it's
+    /// disconnected via /comptes.
+    pub async fn forget_extra(&self, chat_id: i64, slot_id: &str) {
+        let key = (chat_id, slot_id.to_string());
+        self.extra_clients.write().await.remove(&key);
+        if let Some(handle) = self.extra_watchers.write().await.remove(&key) {
             handle.abort();
         }
     }

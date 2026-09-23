@@ -32,6 +32,10 @@ pub enum Command {
     #[command(description = "gérer les notifications des boîtes JMAP partagées")]
     Partages,
     #[command(
+        description = "compte perso supplémentaire : /comptes <server_url> <token> pour en connecter un (sans argument : liste ceux déjà connectés)"
+    )]
+    Comptes { args: String },
+    #[command(
         description = "filtrer un expéditeur/mot-clé : /mute <terme> (sans argument : liste les filtres actifs)"
     )]
     Mute { term: String },
@@ -102,6 +106,21 @@ async fn message_handler(bot: Bot, msg: Message, me: Me, state: AppState) -> Han
         Ok(Command::Logout) => cmd_logout(&bot, &state, chat_id).await?,
         Ok(Command::Status) => cmd_status(&bot, &state, chat_id).await?,
         Ok(Command::Partages) => cmd_partages(&bot, &state, chat_id).await?,
+        Ok(Command::Comptes { args }) => {
+            // Same as /login: when this carries a token (i.e. it's not the
+            // bare "list what's connected" form), delete it from the chat
+            // history right after reading it.
+            if !args.trim().is_empty() && bot.delete_message(chat_id, msg.id).await.is_err() {
+                bot.send_message(
+                    chat_id,
+                    "⚠️ Je n'ai pas pu supprimer ton message /comptes. Le jeton reste visible \
+                     dans l'historique : supprime-le manuellement et envisage de le révoquer \
+                     et d'en générer un nouveau chez ton fournisseur JMAP.",
+                )
+                .await?;
+            }
+            cmd_comptes(&bot, &state, chat_id, args).await?
+        }
         Ok(Command::Mute { term }) => cmd_mute(&bot, &state, chat_id, term).await?,
         Ok(Command::Unmute { term }) => cmd_unmute(&bot, &state, chat_id, term).await?,
         Ok(Command::Rechercher { query }) => cmd_rechercher(&bot, &state, chat_id, query).await?,
@@ -173,6 +192,7 @@ async fn cmd_login(
         email: email.clone(),
         last_state: Some(initial_state),
         shared_accounts: std::collections::HashMap::new(),
+        extra_accounts: std::collections::HashMap::new(),
         muted: Vec::new(),
     };
 
@@ -250,20 +270,184 @@ async fn cmd_status(bot: &Bot, state: &AppState, chat_id: ChatId) -> HandlerResu
         "initialisation…"
     };
 
+    let mut text = format!(
+        "📬 Connecté en tant que {}\nSurveillance : {}\nÉtat : {}",
+        account.email,
+        if watching {
+            "active ✅"
+        } else {
+            "inactive ⚠️ (tape /login à nouveau)"
+        },
+        sync_state,
+    );
+    if !account.shared_accounts.is_empty() {
+        text.push_str(&format!(
+            "\nBoîtes partagées actives : {} (/partages)",
+            account.shared_accounts.len()
+        ));
+    }
+    if !account.extra_accounts.is_empty() {
+        text.push_str(&format!(
+            "\nComptes supplémentaires : {} (/comptes)",
+            account.extra_accounts.len()
+        ));
+    }
+    if !account.muted.is_empty() {
+        text.push_str(&format!(
+            "\nFiltres actifs : {} (/mute)",
+            account.muted.len()
+        ));
+    }
+
+    bot.send_message(chat_id, text).await?;
+    Ok(())
+}
+
+/// `/comptes` (no args) lists the chat's primary account plus every extra,
+/// fully independent personal account connected via `/comptes <url>
+/// <token>` — distinct from `/partages`' delegated/shared accounts, which
+/// live under the primary token rather than having their own credentials.
+async fn cmd_comptes(bot: &Bot, state: &AppState, chat_id: ChatId, args: String) -> HandlerResult {
+    let args = args.trim();
+    if args.is_empty() {
+        return list_extra_accounts(bot, state, chat_id).await;
+    }
+
+    let Some(account) = state.store.get(chat_id.0) else {
+        bot.send_message(
+            chat_id,
+            "Connecte d'abord ton compte principal avec /login avant d'en ajouter un second.",
+        )
+        .await?;
+        return Ok(());
+    };
+
+    let Some((server_url, token)) = args.split_once(char::is_whitespace) else {
+        bot.send_message(
+            chat_id,
+            "Usage : /comptes <server_url> <token> — comme /login, mais pour un compte \
+             supplémentaire plutôt que de remplacer le principal.",
+        )
+        .await?;
+        return Ok(());
+    };
+    let (server_url, token) = (server_url.trim().to_string(), token.trim().to_string());
+
+    let client =
+        match jmap::connect(&server_url, &token, state.config.allow_private_jmap_hosts).await {
+            Ok(c) => c,
+            Err(e) => {
+                bot.send_message(chat_id, format!("❌ Connexion impossible : {e}"))
+                    .await?;
+                return Ok(());
+            }
+        };
+
+    let email = jmap::account_email(&client);
+    if email == account.email
+        || account
+            .extra_accounts
+            .values()
+            .any(|extra| extra.email == email)
+    {
+        bot.send_message(chat_id, format!("{email} est déjà connecté à ce chat."))
+            .await?;
+        return Ok(());
+    }
+
+    let initial_state = match jmap::current_email_state(&client).await {
+        Ok(s) => s,
+        Err(e) => {
+            bot.send_message(chat_id, format!("❌ Erreur lors de l'initialisation : {e}"))
+                .await?;
+            return Ok(());
+        }
+    };
+
+    let slot_id = match state.store.add_extra_account(
+        chat_id.0,
+        crate::store::ExtraAccount {
+            server_url,
+            token,
+            email: email.clone(),
+            last_state: Some(initial_state),
+        },
+    ) {
+        Ok(Some(id)) => id,
+        Ok(None) => {
+            bot.send_message(
+                chat_id,
+                "Connecte d'abord ton compte principal avec /login avant d'en ajouter un second.",
+            )
+            .await?;
+            return Ok(());
+        }
+        Err(e) => {
+            bot.send_message(chat_id, format!("❌ Erreur de stockage : {e}"))
+                .await?;
+            return Ok(());
+        }
+    };
+
+    let client = Arc::new(client);
+    let key = (chat_id.0, slot_id.clone());
+    state
+        .extra_clients
+        .write()
+        .await
+        .insert(key.clone(), client.clone());
+    let handle = watcher::spawn(
+        bot.clone(),
+        state.clone(),
+        chat_id.0,
+        client,
+        WatchTarget::Extra {
+            slot_id,
+            label: email.clone(),
+        },
+    );
+    state.extra_watchers.write().await.insert(key, handle);
+
     bot.send_message(
         chat_id,
         format!(
-            "📬 Connecté en tant que {}\nSurveillance : {}\nÉtat : {}",
-            account.email,
-            if watching {
-                "active ✅"
-            } else {
-                "inactive ⚠️ (tape /login à nouveau)"
-            },
-            sync_state,
+            "✅ {email} connecté comme compte supplémentaire. Tape /comptes pour voir la liste."
         ),
     )
     .await?;
+    Ok(())
+}
+
+async fn list_extra_accounts(bot: &Bot, state: &AppState, chat_id: ChatId) -> HandlerResult {
+    let Some(account) = state.store.get(chat_id.0) else {
+        bot.send_message(
+            chat_id,
+            "Aucun compte connecté. Tape /login pour commencer.",
+        )
+        .await?;
+        return Ok(());
+    };
+
+    let mut lines = vec![format!("• {} (principal)", account.email)];
+    let mut buttons = Vec::new();
+    for (slot_id, extra) in &account.extra_accounts {
+        lines.push(format!("• {}", extra.email));
+        buttons.push(vec![teloxide::types::InlineKeyboardButton::callback(
+            format!("🗑 Déconnecter {}", extra.email),
+            format!("x:{slot_id}"),
+        )]);
+    }
+
+    let mut text = format!("📧 Comptes connectés :\n{}", lines.join("\n"));
+    if account.extra_accounts.is_empty() {
+        text.push_str("\n\nPour en ajouter un : /comptes <server_url> <token>");
+    }
+
+    let mut send = bot.send_message(chat_id, text);
+    if !buttons.is_empty() {
+        send = send.reply_markup(teloxide::types::InlineKeyboardMarkup::new(buttons));
+    }
+    send.await?;
     Ok(())
 }
 
@@ -352,6 +536,40 @@ async fn refresh_partages_keyboard(
         .edit_message_reply_markup(chat_id, message_id)
         .reply_markup(keyboard)
         .await;
+    Ok(())
+}
+
+/// Disconnects one extra personal account (the "🗑 Déconnecter" button on
+/// `/comptes`'s listing). Unlike `/partages`' shared-account toggle, this
+/// is one-directional — reconnecting means running `/comptes <url>
+/// <token>` again with its credentials, not a re-enable button, since we
+/// don't keep a disconnected extra account's token around to reuse.
+async fn disconnect_extra_account(
+    bot: &Bot,
+    state: &AppState,
+    chat_id: ChatId,
+    query_id: teloxide::types::CallbackQueryId,
+    slot_id: &str,
+) -> HandlerResult {
+    state.forget_extra(chat_id.0, slot_id).await;
+    match state.store.remove_extra_account(chat_id.0, slot_id) {
+        Ok(true) => {
+            bot.answer_callback_query(query_id)
+                .text("🗑 Compte déconnecté.")
+                .await?;
+        }
+        Ok(false) => {
+            bot.answer_callback_query(query_id)
+                .text("Déjà déconnecté.")
+                .await?;
+        }
+        Err(e) => {
+            bot.answer_callback_query(query_id)
+                .text(format!("❌ Erreur : {e}"))
+                .show_alert(true)
+                .await?;
+        }
+    }
     Ok(())
 }
 
@@ -731,21 +949,33 @@ async fn callback_handler(bot: Bot, q: CallbackQuery, state: AppState) -> Handle
     if action == "s" {
         return toggle_shared_account(&bot, &state, chat_id, message_id, q.id, second).await;
     }
+    if action == "x" {
+        return disconnect_extra_account(&bot, &state, chat_id, q.id, second).await;
+    }
 
     let (account_id, email_id): (Option<&str>, &str) = match third {
         Some(email_id) => (Some(second), email_id),
         None => (None, second),
     };
 
+    // account_id names either a shared JMAP account (under the primary
+    // token) or an extra, fully independent one — two separate key spaces
+    // (see store::Account::extra_accounts), so try shared first and only
+    // fall back to extra when it's a clean "not found there", not an
+    // actual connection error.
     let client_result = match account_id {
-        Some(acc) => state.client_for_shared(chat_id.0, acc).await,
+        Some(acc) => match state.client_for_shared(chat_id.0, acc).await {
+            Ok(Some(c)) => Ok(Some(c)),
+            Ok(None) => state.client_for_extra(chat_id.0, acc).await,
+            Err(e) => Err(e),
+        },
         None => state.client_for(chat_id.0).await,
     };
     let client = match client_result {
         Ok(Some(c)) => c,
         Ok(None) => {
             bot.answer_callback_query(q.id)
-                .text("Compte non connecté ou boîte partagée désactivée. Tape /login ou /partages.")
+                .text("Compte non connecté ou désactivé. Tape /login, /partages ou /comptes.")
                 .await?;
             return Ok(());
         }

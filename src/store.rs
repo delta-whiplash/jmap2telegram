@@ -8,7 +8,7 @@ use std::sync::{Mutex, RwLock};
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
 use anyhow::{Context, Result, bail};
-use rand::{Rng, rng};
+use rand::{Rng, RngExt, rng};
 use serde::{Deserialize, Serialize};
 
 const NONCE_LEN: usize = 12;
@@ -31,11 +31,21 @@ pub struct Account {
     /// written before this field existed.
     #[serde(default)]
     pub shared_accounts: HashMap<String, SharedAccount>,
+    /// Additional, fully independent personal JMAP accounts (their own
+    /// server_url + token, not delegated access under the primary
+    /// account's token) connected via `/comptes <url> <token>`, keyed by an
+    /// id we generate ourselves (`generate_slot_id`) rather than anything
+    /// the JMAP server issues — deliberately a different key space from
+    /// `shared_accounts` so the two can never collide, since two unrelated
+    /// JMAP servers could otherwise coincidentally assign the same account
+    /// id string.
+    #[serde(default)]
+    pub extra_accounts: HashMap<String, ExtraAccount>,
     /// Lowercased sender-address/keyword filters from `/mute`: a new
     /// message whose sender or subject contains any of these is not
     /// notified about (the JMAP sync cursor still advances past it — this
     /// is purely "don't tell me about this", not "don't sync it").
-    /// Applies across the chat's own mailbox and every shared account.
+    /// Applies across the chat's own mailbox and every shared/extra account.
     #[serde(default)]
     pub muted: Vec<String>,
 }
@@ -49,6 +59,30 @@ pub struct SharedAccount {
     /// address), shown in notifications and the toggle menu.
     pub name: String,
     pub last_state: Option<String>,
+}
+
+/// A second (or third, ...) fully independent JMAP account connected to
+/// the same chat via `/comptes <url> <token>` — its own server and token,
+/// not a delegated account under the primary login. Shape mirrors
+/// `Account` minus the nested shared/extra/muted fields, which only the
+/// primary slot carries.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ExtraAccount {
+    pub server_url: String,
+    pub token: String,
+    pub email: String,
+    pub last_state: Option<String>,
+}
+
+/// A short id we generate (never one a JMAP server issues) to key
+/// `Account::extra_accounts`, so it can never collide with a JMAP-issued
+/// account id from `shared_accounts`' entirely separate key space.
+pub fn generate_slot_id() -> String {
+    const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+    let mut rng = rng();
+    (0..8)
+        .map(|_| ALPHABET[rng.random_range(0..ALPHABET.len())] as char)
+        .collect()
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -190,6 +224,65 @@ impl Store {
                 .and_then(|acc| acc.shared_accounts.get_mut(account_id))
             {
                 Some(shared) => shared.last_state = Some(state),
+                None => return Ok(()),
+            }
+        }
+        self.persist()
+    }
+
+    /// Connects a second (or third, ...) fully independent JMAP account to
+    /// a chat, under a freshly generated slot id. No-ops (without error,
+    /// returning `None`) if the chat has no primary account yet — an extra
+    /// account only makes sense alongside one. Returns the generated slot
+    /// id on success, so the caller can spawn its watcher against it.
+    pub fn add_extra_account(&self, chat_id: i64, account: ExtraAccount) -> Result<Option<String>> {
+        let slot_id = generate_slot_id();
+        let added = {
+            let mut data = self.data.write().unwrap();
+            match data.accounts.get_mut(&chat_id) {
+                Some(acc) => {
+                    acc.extra_accounts.insert(slot_id.clone(), account);
+                    true
+                }
+                None => false,
+            }
+        };
+        if !added {
+            return Ok(None);
+        }
+        self.persist()?;
+        Ok(Some(slot_id))
+    }
+
+    /// Disconnects one extra account. Returns whether it existed.
+    pub fn remove_extra_account(&self, chat_id: i64, slot_id: &str) -> Result<bool> {
+        let removed = {
+            let mut data = self.data.write().unwrap();
+            match data.accounts.get_mut(&chat_id) {
+                Some(acc) => acc.extra_accounts.remove(slot_id).is_some(),
+                None => false,
+            }
+        };
+        if removed {
+            self.persist()?;
+        }
+        Ok(removed)
+    }
+
+    pub fn update_extra_account_state(
+        &self,
+        chat_id: i64,
+        slot_id: &str,
+        state: String,
+    ) -> Result<()> {
+        {
+            let mut data = self.data.write().unwrap();
+            match data
+                .accounts
+                .get_mut(&chat_id)
+                .and_then(|acc| acc.extra_accounts.get_mut(slot_id))
+            {
+                Some(extra) => extra.last_state = Some(state),
                 None => return Ok(()),
             }
         }
@@ -345,7 +438,17 @@ mod tests {
             email: email.to_string(),
             last_state: None,
             shared_accounts: HashMap::new(),
+            extra_accounts: HashMap::new(),
             muted: Vec::new(),
+        }
+    }
+
+    fn extra_account(email: &str) -> ExtraAccount {
+        ExtraAccount {
+            server_url: "https://jmap.other.example/session".to_string(),
+            token: "other-token".to_string(),
+            email: email.to_string(),
+            last_state: None,
         }
     }
 
@@ -506,6 +609,73 @@ mod tests {
         let acc: Account = serde_json::from_str(json).unwrap();
         assert!(acc.shared_accounts.is_empty());
         assert!(acc.muted.is_empty());
+        assert!(acc.extra_accounts.is_empty());
+    }
+
+    #[test]
+    fn add_extra_account_generates_a_slot_id_and_stores_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.set(1, account("a@b.c")).unwrap();
+
+        let slot_id = store
+            .add_extra_account(1, extra_account("second@other.example"))
+            .unwrap()
+            .expect("primary account exists, add must succeed");
+
+        let stored = &store.get(1).unwrap().extra_accounts[&slot_id];
+        assert_eq!(stored.email, "second@other.example");
+    }
+
+    #[test]
+    fn add_extra_account_is_a_noop_without_a_primary_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let result = store
+            .add_extra_account(999, extra_account("second@other.example"))
+            .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn generated_slot_ids_do_not_collide_with_shared_account_ids_in_practice() {
+        // Not a mathematical proof, just a sanity check that the id space
+        // is what we expect (8 lowercase alphanumeric chars) and doesn't
+        // trivially degenerate (e.g. always the same id).
+        let a = generate_slot_id();
+        let b = generate_slot_id();
+        assert_eq!(a.len(), 8);
+        assert!(
+            a.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        );
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn remove_extra_account_erases_entry_and_reports_whether_it_existed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.set(1, account("a@b.c")).unwrap();
+        let slot_id = store
+            .add_extra_account(1, extra_account("second@other.example"))
+            .unwrap()
+            .unwrap();
+
+        assert!(store.remove_extra_account(1, &slot_id).unwrap());
+        assert!(!store.get(1).unwrap().extra_accounts.contains_key(&slot_id));
+        assert!(!store.remove_extra_account(1, &slot_id).unwrap());
+    }
+
+    #[test]
+    fn update_extra_account_state_is_ignored_for_unknown_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.set(1, account("a@b.c")).unwrap();
+        store
+            .update_extra_account_state(1, "does-not-exist", "state-x".to_string())
+            .unwrap();
+        assert!(store.get(1).unwrap().extra_accounts.is_empty());
     }
 
     #[test]

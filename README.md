@@ -111,6 +111,7 @@ it, so the token doesn't linger in the chat history.
 | `/login`       | `/login <server_url> <token>` — connect a JMAP account                 |
 | `/status`      | Show the connected account and watcher health                          |
 | `/partages`    | Toggle notifications for shared/delegated JMAP accounts                |
+| `/comptes`     | `/comptes <server_url> <token>` — connect an extra, independent JMAP account; no argument lists connected accounts |
 | `/mute`        | `/mute <term>` — filter future notifications by sender/keyword; no argument lists active filters |
 | `/unmute`      | Remove a filter added with `/mute`                                     |
 | `/rechercher`  | `/rechercher <text>` — full-text search of the connected mailbox        |
@@ -143,6 +144,17 @@ one stops its watcher and forgets its sync cursor. This is unrelated to
 Telegram group chats — the bot still only ever talks in 1:1 DMs (see
 [`SECURITY.md`](SECURITY.md)) — it's purely about how many JMAP accounts a
 single connected chat follows.
+
+### Extra personal accounts
+
+Unlike `/partages` (delegated access under one token), `/comptes` connects
+a second, fully independent JMAP account — its own server and token,
+e.g. a work mailbox alongside a personal one. `/comptes <server_url>
+<token>` connects one (the message is deleted right after, same as
+`/login`); `/comptes` with no argument lists everything connected, with a
+disconnect button per extra account. Disconnecting one only forgets that
+account — reconnecting means running `/comptes` again with its
+credentials.
 
 ### Environment variables
 

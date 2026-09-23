@@ -45,6 +45,13 @@
   same minimal shape as the primary account (account id, display name,
   sync cursor; no content), and opting out or `/logout` erases it the
   same way.
+- **Extra personal accounts (`/comptes`).** A second (or third, ...)
+  fully independent JMAP account — its own server and token, not
+  delegated access — goes through the exact same `connect()` path as
+  `/login`, so it gets the same SSRF guard and TLS requirements below.
+  Its credentials are stored with the same shape and the same encrypted
+  file as the primary account; disconnecting it or `/logout` erases it
+  the same way.
 - **SSRF via `/login`.** `server_url` is attacker-controlled (it's
   whatever an authorized chat typed in), and `AUTHORIZED_CHAT_IDS` can
   list several mutually-untrusted chats. By default, any hostname that

@@ -24,15 +24,17 @@ const MAX_BACKOFF: Duration = Duration::from_secs(300);
 /// after roughly a minute of total inability to connect.
 const FAILURE_NOTIFY_THRESHOLD: u32 = 5;
 
-/// Which JMAP account a watcher is following: the chat's own mailbox, or
-/// one of its opted-in shared accounts. Threads through everything that
-/// needs to read/write the right cursor in the store, decide when to stop,
-/// and label/route notifications so an action button lands on a JMAP
-/// client connected to the right account.
+/// Which JMAP account a watcher is following: the chat's own mailbox, one
+/// of its opted-in shared/delegated accounts, or one of its extra, fully
+/// independent personal accounts (`/comptes`). Threads through everything
+/// that needs to read/write the right cursor in the store, decide when to
+/// stop, and label/route notifications so an action button lands on a
+/// JMAP client connected to the right account.
 #[derive(Clone)]
 pub enum WatchTarget {
     Primary,
     Shared { account_id: String, label: String },
+    Extra { slot_id: String, label: String },
 }
 
 impl WatchTarget {
@@ -43,18 +45,23 @@ impl WatchTarget {
                 .shared_accounts
                 .get(account_id)
                 .and_then(|s| s.last_state.clone()),
+            WatchTarget::Extra { slot_id, .. } => account
+                .extra_accounts
+                .get(slot_id)
+                .and_then(|e| e.last_state.clone()),
         }
     }
 
     /// Whether this target is still opted into, i.e. whether the watcher
-    /// should keep running. `false` means /logout or a /partages toggle-off
-    /// happened while we were waiting.
+    /// should keep running. `false` means /logout, a /partages toggle-off,
+    /// or a /comptes disconnect happened while we were waiting.
     fn still_active(&self, account: &crate::store::Account) -> bool {
         match self {
             WatchTarget::Primary => true,
             WatchTarget::Shared { account_id, .. } => {
                 account.shared_accounts.contains_key(account_id)
             }
+            WatchTarget::Extra { slot_id, .. } => account.extra_accounts.contains_key(slot_id),
         }
     }
 
@@ -63,6 +70,9 @@ impl WatchTarget {
             WatchTarget::Primary => store.update_state(chat_id, new_state),
             WatchTarget::Shared { account_id, .. } => {
                 store.update_shared_account_state(chat_id, account_id, new_state)
+            }
+            WatchTarget::Extra { slot_id, .. } => {
+                store.update_extra_account_state(chat_id, slot_id, new_state)
             }
         };
         if let Err(e) = result {
@@ -74,21 +84,23 @@ impl WatchTarget {
         match self {
             WatchTarget::Primary => None,
             WatchTarget::Shared { account_id, .. } => Some(account_id),
+            WatchTarget::Extra { slot_id, .. } => Some(slot_id),
         }
     }
 
     fn label(&self) -> Option<&str> {
         match self {
             WatchTarget::Primary => None,
-            WatchTarget::Shared { label, .. } => Some(label),
+            WatchTarget::Shared { label, .. } | WatchTarget::Extra { label, .. } => Some(label),
         }
     }
 
     /// How this target is referred to in a connection-health notification.
     fn scope_label(&self) -> String {
-        match self.label() {
-            Some(label) => format!("la boîte partagée « {label} »"),
-            None => "ta boîte JMAP".to_string(),
+        match self {
+            WatchTarget::Primary => "ta boîte JMAP".to_string(),
+            WatchTarget::Shared { label, .. } => format!("la boîte partagée « {label} »"),
+            WatchTarget::Extra { label, .. } => format!("le compte « {label} »"),
         }
     }
 }
@@ -322,6 +334,15 @@ mod tests {
                     last_state: Some("shared-state".to_string()),
                 },
             )]),
+            extra_accounts: HashMap::from([(
+                "slot1".to_string(),
+                crate::store::ExtraAccount {
+                    server_url: "https://jmap.other.example".to_string(),
+                    token: "other-tok".to_string(),
+                    email: "second@other.example".to_string(),
+                    last_state: Some("extra-state".to_string()),
+                },
+            )]),
             muted: Vec::new(),
         }
     }
@@ -367,6 +388,47 @@ mod tests {
     }
 
     #[test]
+    fn extra_target_reads_its_own_cursor_and_label() {
+        let target = WatchTarget::Extra {
+            slot_id: "slot1".to_string(),
+            label: "second@other.example".to_string(),
+        };
+        assert_eq!(
+            target.since_state(&account()),
+            Some("extra-state".to_string())
+        );
+        assert!(target.still_active(&account()));
+        assert_eq!(target.account_id(), Some("slot1"));
+        assert_eq!(target.label(), Some("second@other.example"));
+    }
+
+    #[test]
+    fn extra_target_stops_being_active_once_disconnected() {
+        // Simulates /comptes disconnecting this extra account: no longer
+        // in the store's extra_accounts map, so the watcher must exit.
+        let target = WatchTarget::Extra {
+            slot_id: "does-not-exist".to_string(),
+            label: "gone@other.example".to_string(),
+        };
+        assert!(!target.still_active(&account()));
+        assert_eq!(target.since_state(&account()), None);
+    }
+
+    #[test]
+    fn extra_and_shared_account_ids_never_share_a_key_space() {
+        // Sanity check for the design invariant the whole feature leans
+        // on: a shared account's routing key ("acc7") and an extra
+        // account's slot id ("slot1") live in genuinely separate store
+        // maps, so a since_state lookup for one never accidentally
+        // resolves against the other.
+        let acc = account();
+        assert!(acc.shared_accounts.contains_key("acc7"));
+        assert!(!acc.extra_accounts.contains_key("acc7"));
+        assert!(acc.extra_accounts.contains_key("slot1"));
+        assert!(!acc.shared_accounts.contains_key("slot1"));
+    }
+
+    #[test]
     fn connection_broken_text_names_the_primary_mailbox_and_the_error() {
         let err = anyhow::anyhow!("401 Unauthorized");
         let text = connection_broken_text(&WatchTarget::Primary, &err);
@@ -397,6 +459,12 @@ mod tests {
             label: "contact@delta-net.ovh".to_string(),
         });
         assert!(shared.contains("contact@delta-net.ovh"));
+
+        let extra = connection_recovered_text(&WatchTarget::Extra {
+            slot_id: "slot1".to_string(),
+            label: "second@other.example".to_string(),
+        });
+        assert!(extra.contains("second@other.example"));
     }
 
     fn summary(

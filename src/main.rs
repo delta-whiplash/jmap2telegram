@@ -115,6 +115,41 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
+
+        for (slot_id, extra) in &account.extra_accounts {
+            match jmap::connect(
+                &extra.server_url,
+                &extra.token,
+                config.allow_private_jmap_hosts,
+            )
+            .await
+            {
+                Ok(client) => {
+                    let client = Arc::new(client);
+                    let key = (chat_id, slot_id.clone());
+                    state
+                        .extra_clients
+                        .write()
+                        .await
+                        .insert(key.clone(), client.clone());
+                    let handle = watcher::spawn(
+                        bot.clone(),
+                        state.clone(),
+                        chat_id,
+                        client,
+                        watcher::WatchTarget::Extra {
+                            slot_id: slot_id.clone(),
+                            label: extra.email.clone(),
+                        },
+                    );
+                    state.extra_watchers.write().await.insert(key, handle);
+                    tracing::info!(chat_id, slot_id, email = %extra.email, "resumed extra-account JMAP watcher");
+                }
+                Err(e) => {
+                    tracing::warn!(chat_id, slot_id, error = %e, "failed to resume extra JMAP account");
+                }
+            }
+        }
     }
 
     tracing::info!("jmap2telegram starting");
