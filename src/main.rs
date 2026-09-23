@@ -1,3 +1,4 @@
+mod accounts;
 mod bot;
 mod config;
 mod format;
@@ -63,16 +64,7 @@ async fn main() -> anyhow::Result<()> {
         .await
         {
             Ok(client) => {
-                let client = Arc::new(client);
-                state.clients.write().await.insert(chat_id, client.clone());
-                let handle = watcher::spawn(
-                    bot.clone(),
-                    state.clone(),
-                    chat_id,
-                    client,
-                    watcher::WatchTarget::Primary,
-                );
-                state.watchers.write().await.insert(chat_id, handle);
+                accounts::adopt_primary(&bot, &state, chat_id, client).await;
                 tracing::info!(chat_id, email = %account.email, "resumed JMAP watcher");
             }
             Err(e) => {
@@ -90,24 +82,15 @@ async fn main() -> anyhow::Result<()> {
             .await
             {
                 Ok(client) => {
-                    let client = Arc::new(client);
-                    let key = (chat_id, account_id.clone());
-                    state
-                        .shared_clients
-                        .write()
-                        .await
-                        .insert(key.clone(), client.clone());
-                    let handle = watcher::spawn(
-                        bot.clone(),
-                        state.clone(),
+                    accounts::adopt_shared(
+                        &bot,
+                        &state,
                         chat_id,
+                        account_id.clone(),
+                        shared.name.clone(),
                         client,
-                        watcher::WatchTarget::Shared {
-                            account_id: account_id.clone(),
-                            label: shared.name.clone(),
-                        },
-                    );
-                    state.shared_watchers.write().await.insert(key, handle);
+                    )
+                    .await;
                     tracing::info!(chat_id, account_id, name = %shared.name, "resumed shared-account JMAP watcher");
                 }
                 Err(e) => {
@@ -125,24 +108,15 @@ async fn main() -> anyhow::Result<()> {
             .await
             {
                 Ok(client) => {
-                    let client = Arc::new(client);
-                    let key = (chat_id, slot_id.clone());
-                    state
-                        .extra_clients
-                        .write()
-                        .await
-                        .insert(key.clone(), client.clone());
-                    let handle = watcher::spawn(
-                        bot.clone(),
-                        state.clone(),
+                    accounts::adopt_extra(
+                        &bot,
+                        &state,
                         chat_id,
+                        slot_id.clone(),
+                        extra.email.clone(),
                         client,
-                        watcher::WatchTarget::Extra {
-                            slot_id: slot_id.clone(),
-                            label: extra.email.clone(),
-                        },
-                    );
-                    state.extra_watchers.write().await.insert(key, handle);
+                    )
+                    .await;
                     tracing::info!(chat_id, slot_id, email = %extra.email, "resumed extra-account JMAP watcher");
                 }
                 Err(e) => {

@@ -90,29 +90,49 @@ impl AppState {
         }
     }
 
+    /// Shared cache-lookup step for every `client_for*` method below: all
+    /// three follow the same "already cached? return it — otherwise the
+    /// caller resolves credentials and connects" shape, differing only in
+    /// which map and key type they use.
+    async fn cached<K: Eq + std::hash::Hash>(
+        cache: &RwLock<HashMap<K, Arc<JmapClient>>>,
+        key: &K,
+    ) -> Option<Arc<JmapClient>> {
+        cache.read().await.get(key).cloned()
+    }
+
+    /// Shared connect-and-cache tail: wraps a freshly connected `Client`,
+    /// stores it under `key` for next time, and returns it.
+    async fn cache_new<K: Eq + std::hash::Hash>(
+        cache: &RwLock<HashMap<K, Arc<JmapClient>>>,
+        key: K,
+        client: JmapClient,
+    ) -> Arc<JmapClient> {
+        let client = Arc::new(client);
+        cache.write().await.insert(key, client.clone());
+        client
+    }
+
     /// Returns a live client for this chat's own mailbox, reconnecting from
     /// the stored credentials if none is cached yet (e.g. after a fresh
     /// reconnect following a bot restart, before the watcher has
     /// re-established it).
     pub async fn client_for(&self, chat_id: i64) -> anyhow::Result<Option<Arc<JmapClient>>> {
-        if let Some(client) = self.clients.read().await.get(&chat_id) {
-            return Ok(Some(client.clone()));
+        if let Some(client) = Self::cached(&self.clients, &chat_id).await {
+            return Ok(Some(client));
         }
 
         let Some(account) = self.store.get(chat_id) else {
             return Ok(None);
         };
 
-        let client = Arc::new(
-            crate::jmap::connect(
-                &account.server_url,
-                &account.token,
-                self.config.allow_private_jmap_hosts,
-            )
-            .await?,
-        );
-        self.clients.write().await.insert(chat_id, client.clone());
-        Ok(Some(client))
+        let client = crate::jmap::connect(
+            &account.server_url,
+            &account.token,
+            self.config.allow_private_jmap_hosts,
+        )
+        .await?;
+        Ok(Some(Self::cache_new(&self.clients, chat_id, client).await))
     }
 
     /// Same as `client_for`, but for one of the chat's opted-in shared JMAP
@@ -126,8 +146,8 @@ impl AppState {
         account_id: &str,
     ) -> anyhow::Result<Option<Arc<JmapClient>>> {
         let key = (chat_id, account_id.to_string());
-        if let Some(client) = self.shared_clients.read().await.get(&key) {
-            return Ok(Some(client.clone()));
+        if let Some(client) = Self::cached(&self.shared_clients, &key).await {
+            return Ok(Some(client));
         }
 
         let Some(account) = self.store.get(chat_id) else {
@@ -137,20 +157,16 @@ impl AppState {
             return Ok(None);
         }
 
-        let client = Arc::new(
-            crate::jmap::connect_shared(
-                &account.server_url,
-                &account.token,
-                self.config.allow_private_jmap_hosts,
-                account_id,
-            )
-            .await?,
-        );
-        self.shared_clients
-            .write()
-            .await
-            .insert(key, client.clone());
-        Ok(Some(client))
+        let client = crate::jmap::connect_shared(
+            &account.server_url,
+            &account.token,
+            self.config.allow_private_jmap_hosts,
+            account_id,
+        )
+        .await?;
+        Ok(Some(
+            Self::cache_new(&self.shared_clients, key, client).await,
+        ))
     }
 
     /// Same as `client_for_shared`, but for one of the chat's extra, fully
@@ -163,8 +179,8 @@ impl AppState {
         slot_id: &str,
     ) -> anyhow::Result<Option<Arc<JmapClient>>> {
         let key = (chat_id, slot_id.to_string());
-        if let Some(client) = self.extra_clients.read().await.get(&key) {
-            return Ok(Some(client.clone()));
+        if let Some(client) = Self::cached(&self.extra_clients, &key).await {
+            return Ok(Some(client));
         }
 
         let Some(account) = self.store.get(chat_id) else {
@@ -174,16 +190,15 @@ impl AppState {
             return Ok(None);
         };
 
-        let client = Arc::new(
-            crate::jmap::connect(
-                &extra.server_url,
-                &extra.token,
-                self.config.allow_private_jmap_hosts,
-            )
-            .await?,
-        );
-        self.extra_clients.write().await.insert(key, client.clone());
-        Ok(Some(client))
+        let client = crate::jmap::connect(
+            &extra.server_url,
+            &extra.token,
+            self.config.allow_private_jmap_hosts,
+        )
+        .await?;
+        Ok(Some(
+            Self::cache_new(&self.extra_clients, key, client).await,
+        ))
     }
 
     /// Tears down everything for a chat: its own mailbox watcher/client and
@@ -198,26 +213,23 @@ impl AppState {
         }
         self.pending_undo.write().await.remove(&chat_id);
 
-        let mut shared_clients = self.shared_clients.write().await;
-        shared_clients.retain(|(id, _), _| *id != chat_id);
-        drop(shared_clients);
+        Self::forget_all_for_chat(&self.shared_clients, &self.shared_watchers, chat_id).await;
+        Self::forget_all_for_chat(&self.extra_clients, &self.extra_watchers, chat_id).await;
+    }
 
-        let mut shared_watchers = self.shared_watchers.write().await;
-        shared_watchers.retain(|(id, _), handle| {
-            if *id == chat_id {
-                handle.abort();
-                false
-            } else {
-                true
-            }
-        });
-
-        let mut extra_clients = self.extra_clients.write().await;
-        extra_clients.retain(|(id, _), _| *id != chat_id);
-        drop(extra_clients);
-
-        let mut extra_watchers = self.extra_watchers.write().await;
-        extra_watchers.retain(|(id, _), handle| {
+    /// Drops every cached client and aborts every watcher belonging to
+    /// `chat_id` from a (client-map, watcher-map) pair keyed by `(chat_id,
+    /// _)` — the shared bulk-teardown step `forget` needs once per account
+    /// kind (shared accounts, extra accounts).
+    async fn forget_all_for_chat<K>(
+        clients: &RwLock<HashMap<(i64, K), Arc<JmapClient>>>,
+        watchers: &RwLock<HashMap<(i64, K), JoinHandle<()>>>,
+        chat_id: i64,
+    ) where
+        K: Eq + std::hash::Hash,
+    {
+        clients.write().await.retain(|(id, _), _| *id != chat_id);
+        watchers.write().await.retain(|(id, _), handle| {
             if *id == chat_id {
                 handle.abort();
                 false

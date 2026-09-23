@@ -1,19 +1,26 @@
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 
 use teloxide::dispatching::UpdateHandler;
 use teloxide::prelude::*;
-use teloxide::types::{Me, MessageId};
+use teloxide::types::{
+    CallbackQueryId, ChatAction, InlineKeyboardButton, InlineKeyboardMarkup, Me, MessageId,
+    ParseMode,
+};
 use teloxide::utils::command::BotCommands;
 
 use crate::Bot;
+use crate::accounts;
 use crate::format::{self, TELEGRAM_MAX_MESSAGE_LEN, chunk_text};
 use crate::jmap;
-use crate::state::AppState;
-use crate::store::Account;
-use crate::watcher::{self, WatchTarget};
+use crate::state::{AppState, PendingUndo, UNDO_WINDOW};
+use crate::store::{Account, ExtraAccount};
 
 type HandlerResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+/// Repeated verbatim across every command that needs a primary account and
+/// doesn't have one — one string, so it can't drift between call sites.
+const NO_ACCOUNT_MSG: &str = "Aucun compte connecté. Tape /login pour commencer.";
 
 #[derive(BotCommands, Clone)]
 #[command(rename_rule = "lowercase")]
@@ -191,8 +198,8 @@ async fn cmd_login(
         token,
         email: email.clone(),
         last_state: Some(initial_state),
-        shared_accounts: std::collections::HashMap::new(),
-        extra_accounts: std::collections::HashMap::new(),
+        shared_accounts: HashMap::new(),
+        extra_accounts: HashMap::new(),
         muted: Vec::new(),
     };
 
@@ -214,21 +221,7 @@ async fn cmd_login(
     // `.distribution_function(...)` on the dispatcher, so don't add one
     // without re-checking this invariant.
     state.forget(chat_id.0).await;
-
-    let client = Arc::new(client);
-    state
-        .clients
-        .write()
-        .await
-        .insert(chat_id.0, client.clone());
-    let handle = watcher::spawn(
-        bot.clone(),
-        state.clone(),
-        chat_id.0,
-        client,
-        WatchTarget::Primary,
-    );
-    state.watchers.write().await.insert(chat_id.0, handle);
+    accounts::adopt_primary(bot, state, chat_id.0, client).await;
 
     bot.send_message(
         chat_id,
@@ -255,11 +248,7 @@ async fn cmd_logout(bot: &Bot, state: &AppState, chat_id: ChatId) -> HandlerResu
 
 async fn cmd_status(bot: &Bot, state: &AppState, chat_id: ChatId) -> HandlerResult {
     let Some(account) = state.store.get(chat_id.0) else {
-        bot.send_message(
-            chat_id,
-            "Aucun compte connecté. Tape /login pour commencer.",
-        )
-        .await?;
+        bot.send_message(chat_id, NO_ACCOUNT_MSG).await?;
         return Ok(());
     };
 
@@ -366,7 +355,7 @@ async fn cmd_comptes(bot: &Bot, state: &AppState, chat_id: ChatId, args: String)
 
     let slot_id = match state.store.add_extra_account(
         chat_id.0,
-        crate::store::ExtraAccount {
+        ExtraAccount {
             server_url,
             token,
             email: email.clone(),
@@ -389,24 +378,7 @@ async fn cmd_comptes(bot: &Bot, state: &AppState, chat_id: ChatId, args: String)
         }
     };
 
-    let client = Arc::new(client);
-    let key = (chat_id.0, slot_id.clone());
-    state
-        .extra_clients
-        .write()
-        .await
-        .insert(key.clone(), client.clone());
-    let handle = watcher::spawn(
-        bot.clone(),
-        state.clone(),
-        chat_id.0,
-        client,
-        WatchTarget::Extra {
-            slot_id,
-            label: email.clone(),
-        },
-    );
-    state.extra_watchers.write().await.insert(key, handle);
+    accounts::adopt_extra(bot, state, chat_id.0, slot_id, email.clone(), client).await;
 
     bot.send_message(
         chat_id,
@@ -420,11 +392,7 @@ async fn cmd_comptes(bot: &Bot, state: &AppState, chat_id: ChatId, args: String)
 
 async fn list_extra_accounts(bot: &Bot, state: &AppState, chat_id: ChatId) -> HandlerResult {
     let Some(account) = state.store.get(chat_id.0) else {
-        bot.send_message(
-            chat_id,
-            "Aucun compte connecté. Tape /login pour commencer.",
-        )
-        .await?;
+        bot.send_message(chat_id, NO_ACCOUNT_MSG).await?;
         return Ok(());
     };
 
@@ -432,7 +400,7 @@ async fn list_extra_accounts(bot: &Bot, state: &AppState, chat_id: ChatId) -> Ha
     let mut buttons = Vec::new();
     for (slot_id, extra) in &account.extra_accounts {
         lines.push(format!("• {}", extra.email));
-        buttons.push(vec![teloxide::types::InlineKeyboardButton::callback(
+        buttons.push(vec![InlineKeyboardButton::callback(
             format!("🗑 Déconnecter {}", extra.email),
             format!("x:{slot_id}"),
         )]);
@@ -445,7 +413,7 @@ async fn list_extra_accounts(bot: &Bot, state: &AppState, chat_id: ChatId) -> Ha
 
     let mut send = bot.send_message(chat_id, text);
     if !buttons.is_empty() {
-        send = send.reply_markup(teloxide::types::InlineKeyboardMarkup::new(buttons));
+        send = send.reply_markup(InlineKeyboardMarkup::new(buttons));
     }
     send.await?;
     Ok(())
@@ -459,11 +427,7 @@ async fn list_extra_accounts(bot: &Bot, state: &AppState, chat_id: ChatId) -> Ha
 /// fresh /login.
 async fn cmd_partages(bot: &Bot, state: &AppState, chat_id: ChatId) -> HandlerResult {
     let Some(account) = state.store.get(chat_id.0) else {
-        bot.send_message(
-            chat_id,
-            "Aucun compte connecté. Tape /login pour commencer.",
-        )
-        .await?;
+        bot.send_message(chat_id, NO_ACCOUNT_MSG).await?;
         return Ok(());
     };
 
@@ -548,7 +512,7 @@ async fn disconnect_extra_account(
     bot: &Bot,
     state: &AppState,
     chat_id: ChatId,
-    query_id: teloxide::types::CallbackQueryId,
+    query_id: CallbackQueryId,
     slot_id: &str,
 ) -> HandlerResult {
     state.forget_extra(chat_id.0, slot_id).await;
@@ -578,7 +542,7 @@ async fn toggle_shared_account(
     state: &AppState,
     chat_id: ChatId,
     message_id: MessageId,
-    query_id: teloxide::types::CallbackQueryId,
+    query_id: CallbackQueryId,
     account_id: &str,
 ) -> HandlerResult {
     let Some(account) = state.store.get(chat_id.0) else {
@@ -643,24 +607,15 @@ async fn toggle_shared_account(
             return Ok(());
         }
 
-        let client = Arc::new(client);
-        let key = (chat_id.0, account_id.to_string());
-        state
-            .shared_clients
-            .write()
-            .await
-            .insert(key.clone(), client.clone());
-        let handle = watcher::spawn(
-            bot.clone(),
-            state.clone(),
+        accounts::adopt_shared(
+            bot,
+            state,
             chat_id.0,
+            account_id.to_string(),
+            display_name,
             client,
-            WatchTarget::Shared {
-                account_id: account_id.to_string(),
-                label: display_name,
-            },
-        );
-        state.shared_watchers.write().await.insert(key, handle);
+        )
+        .await;
 
         bot.answer_callback_query(query_id)
             .text("🔔 Notifications activées.")
@@ -678,11 +633,7 @@ async fn cmd_mute(bot: &Bot, state: &AppState, chat_id: ChatId, term: String) ->
     let term = term.trim();
     if term.is_empty() {
         let Some(account) = state.store.get(chat_id.0) else {
-            bot.send_message(
-                chat_id,
-                "Aucun compte connecté. Tape /login pour commencer.",
-            )
-            .await?;
+            bot.send_message(chat_id, NO_ACCOUNT_MSG).await?;
             return Ok(());
         };
         let text = if account.muted.is_empty() {
@@ -711,11 +662,7 @@ async fn cmd_mute(bot: &Bot, state: &AppState, chat_id: ChatId, term: String) ->
             .await?;
         }
         Ok(false) if state.store.get(chat_id.0).is_none() => {
-            bot.send_message(
-                chat_id,
-                "Aucun compte connecté. Tape /login pour commencer.",
-            )
-            .await?;
+            bot.send_message(chat_id, NO_ACCOUNT_MSG).await?;
         }
         Ok(false) => {
             bot.send_message(chat_id, format!("« {term} » est déjà filtré."))
@@ -778,11 +725,7 @@ async fn cmd_rechercher(
     let client = match state.client_for(chat_id.0).await {
         Ok(Some(c)) => c,
         Ok(None) => {
-            bot.send_message(
-                chat_id,
-                "Aucun compte connecté. Tape /login pour commencer.",
-            )
-            .await?;
+            bot.send_message(chat_id, NO_ACCOUNT_MSG).await?;
             return Ok(());
         }
         Err(e) => {
@@ -792,9 +735,7 @@ async fn cmd_rechercher(
         }
     };
 
-    let _ = bot
-        .send_chat_action(chat_id, teloxide::types::ChatAction::Typing)
-        .await;
+    let _ = bot.send_chat_action(chat_id, ChatAction::Typing).await;
 
     let results = match jmap::search(&client, query).await {
         Ok(r) => r,
@@ -819,7 +760,7 @@ async fn cmd_rechercher(
         let text = format::notification_text(summary, state.config.timezone, None);
         let keyboard = format::notification_keyboard(&summary.id, None, false);
         bot.send_message(chat_id, text)
-            .parse_mode(teloxide::types::ParseMode::MarkdownV2)
+            .parse_mode(ParseMode::MarkdownV2)
             .reply_markup(keyboard)
             .await?;
     }
@@ -837,7 +778,7 @@ enum TriageAction {
 struct CallbackCtx {
     chat_id: ChatId,
     message_id: MessageId,
-    query_id: teloxide::types::CallbackQueryId,
+    query_id: CallbackQueryId,
 }
 
 /// Which email an action applies to, and in which JMAP account.
@@ -894,11 +835,11 @@ async fn perform_triage_action(
             bot.answer_callback_query(query_id).text(toast).await?;
             state.pending_undo.write().await.insert(
                 chat_id.0,
-                crate::state::PendingUndo {
+                PendingUndo {
                     account_id: account_id.map(str::to_string),
                     email_id: email_id.to_string(),
                     restore_mailbox_ids,
-                    expires_at: std::time::Instant::now() + crate::state::UNDO_WINDOW,
+                    expires_at: Instant::now() + UNDO_WINDOW,
                 },
             );
             let _ = bot
@@ -1098,9 +1039,7 @@ async fn callback_handler(bot: Bot, q: CallbackQuery, state: AppState) -> Handle
             }
         }
         "f" => {
-            let _ = bot
-                .send_chat_action(chat_id, teloxide::types::ChatAction::Typing)
-                .await;
+            let _ = bot.send_chat_action(chat_id, ChatAction::Typing).await;
             match jmap::fetch_full_text(&client, email_id).await {
                 Ok(text) => {
                     bot.answer_callback_query(q.id).await?;
