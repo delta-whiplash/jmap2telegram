@@ -411,6 +411,7 @@ mod tests {
             from_addr: from_addr.map(str::to_string),
             preview: String::new(),
             received_at: None,
+            attachments: Vec::new(),
         }
     }
 

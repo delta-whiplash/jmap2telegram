@@ -20,6 +20,19 @@ pub struct EmailSummary {
     pub from_addr: Option<String>,
     pub preview: String,
     pub received_at: Option<i64>,
+    /// Attachment (name, size in bytes) pairs. Never downloaded or held in
+    /// memory — this is metadata only, so the notification can at least
+    /// say "there's a 4 MB file here" without silently hiding it.
+    pub attachments: Vec<(String, usize)>,
+}
+
+fn attachments_of(email: &jmap_client::email::Email) -> Vec<(String, usize)> {
+    email
+        .attachments()
+        .unwrap_or_default()
+        .iter()
+        .map(|a| (a.name().unwrap_or("(sans nom)").to_string(), a.size()))
+        .collect()
 }
 
 /// Connects to a JMAP server using a bearer token, the way most JMAP
@@ -214,6 +227,7 @@ pub async fn fetch_changed_emails(
                     Property::Preview,
                     Property::From,
                     Property::ReceivedAt,
+                    Property::Attachments,
                 ]),
             )
             .await
@@ -232,6 +246,7 @@ pub async fn fetch_changed_emails(
                 from_addr,
                 preview: email.preview().unwrap_or_default().to_string(),
                 received_at: email.received_at(),
+                attachments: attachments_of(&email),
             });
         }
     }
@@ -267,6 +282,7 @@ pub async fn search(client: &Client, query: &str) -> Result<Vec<EmailSummary>> {
         Property::Preview,
         Property::From,
         Property::ReceivedAt,
+        Property::Attachments,
     ]);
     let mut response = request
         .send_get_email()
@@ -283,12 +299,14 @@ pub async fn search(client: &Client, query: &str) -> Result<Vec<EmailSummary>> {
                 .and_then(|addrs| addrs.first())
                 .map(|a| (a.name().map(str::to_string), Some(a.email().to_string())))
                 .unwrap_or((None, None));
+            let attachments = attachments_of(&email);
             Some(EmailSummary {
                 id,
                 subject: email.subject().unwrap_or("(sans objet)").to_string(),
                 from_name,
                 from_addr,
                 preview: email.preview().unwrap_or_default().to_string(),
+                attachments,
                 received_at: email.received_at(),
             })
         })

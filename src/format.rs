@@ -55,11 +55,68 @@ pub fn notification_text(summary: &EmailSummary, tz: Tz, account_label: Option<&
         })
         .unwrap_or_default();
 
+    let attachments_line = attachments_field(&summary.attachments);
+
     format!(
-        "📧 *Nouveau message*\n\n{mailbox_line}*De :* {from}\n*Objet :* {subject}\n*Reçu :* {when}\n\n{preview}",
+        "📧 *Nouveau message*\n\n{mailbox_line}*De :* {from}\n*Objet :* {subject}\n*Reçu :* {when}\n{attachments_line}\n{preview}",
         subject = escape_markdown(&subject),
         when = escape_markdown(&when),
     )
+}
+
+/// Attachments are never downloaded (this bot fetches message bodies on
+/// demand only, never files), but naming them means "there's a 4 MB PDF
+/// here" isn't silently invisible — just capped at a handful of names so a
+/// message with hundreds of parts can't blow out the notification.
+fn attachments_field(attachments: &[(String, usize)]) -> String {
+    if attachments.is_empty() {
+        return String::new();
+    }
+    const MAX_SHOWN: usize = 5;
+
+    let shown = attachments
+        .iter()
+        .take(MAX_SHOWN)
+        .map(|(name, size)| {
+            // The parens here are literal text, not link syntax, so they
+            // need the same MarkdownV2 escaping as any other reserved
+            // character — an unescaped '(' or ')' would otherwise make
+            // Telegram reject the whole message with a 400.
+            format!(
+                "{} \\({}\\)",
+                escape_markdown(&truncate(name, FIELD_LIMIT)),
+                // human_size can render a decimal point ("1.4 Mo"), itself
+                // a reserved MarkdownV2 character.
+                escape_markdown(&human_size(*size))
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let extra = attachments.len().saturating_sub(MAX_SHOWN);
+    let suffix = if extra > 0 {
+        // '+', '(' and ')' are all MarkdownV2-reserved even as plain,
+        // bot-generated text — same class of bug as the per-attachment
+        // parens above.
+        format!(" \\(\\+{extra} autres\\)")
+    } else {
+        String::new()
+    };
+
+    format!("📎 *Pièces jointes :* {shown}{suffix}\n")
+}
+
+fn human_size(bytes: usize) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    let bytes = bytes as f64;
+    if bytes >= MB {
+        format!("{:.1} Mo", bytes / MB)
+    } else if bytes >= KB {
+        format!("{:.0} Ko", bytes / KB)
+    } else {
+        format!("{} o", bytes as u64)
+    }
 }
 
 /// Renders the sender as a `mailto:` link when an address is available, so
@@ -316,6 +373,7 @@ mod tests {
             from_addr: from_addr.map(str::to_string),
             preview: preview.to_string(),
             received_at: Some(1_700_000_000),
+            attachments: Vec::new(),
         }
     }
 
@@ -513,6 +571,39 @@ mod tests {
         let text = notification_text(&s, Tz::UTC, None);
         assert!(text.contains(">line one"));
         assert!(text.contains(">line two"));
+    }
+
+    #[test]
+    fn notification_text_lists_attachment_names_and_human_readable_sizes() {
+        let mut s = summary("Hello", None, Some("a@b.c"), "Hi");
+        s.attachments = vec![
+            ("rapport.pdf".to_string(), 250_000),
+            ("photo.jpg".to_string(), 1_500_000),
+        ];
+        let text = notification_text(&s, Tz::UTC, None);
+        assert!(text.contains("📎"));
+        // '.' and the parens are all MarkdownV2-reserved, so they're
+        // expected escaped in the rendered text.
+        assert!(text.contains(r"rapport\.pdf \(244 Ko\)"));
+        assert!(text.contains(r"photo\.jpg \(1\.4 Mo\)"));
+    }
+
+    #[test]
+    fn notification_text_omits_attachments_line_when_none() {
+        let s = summary("Hello", None, Some("a@b.c"), "Hi");
+        let text = notification_text(&s, Tz::UTC, None);
+        assert!(!text.contains("📎"));
+    }
+
+    #[test]
+    fn notification_text_caps_attachment_list_and_escapes_hostile_names() {
+        let mut s = summary("Hello", None, Some("a@b.c"), "Hi");
+        s.attachments = (0..8).map(|i| (format!("*evil{i}*.txt"), 100)).collect();
+        let text = notification_text(&s, Tz::UTC, None);
+        // Only the first 5 are listed, with the rest summarized.
+        assert!(text.contains(r"\(\+3 autres\)"));
+        // A malicious attachment name must not inject Markdown formatting.
+        assert!(text.contains(r"\*evil0\*\.txt"));
     }
 
     #[test]
