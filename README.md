@@ -105,17 +105,25 @@ it, so the token doesn't linger in the chat history.
 
 ### Commands
 
-| Command     | Effect                                                            |
-|-------------|--------------------------------------------------------------------|
-| `/start`    | Onboarding, or current status if already connected                |
-| `/login`    | `/login <server_url> <token>` — connect a JMAP account             |
-| `/status`   | Show the connected account and watcher health                     |
-| `/partages` | Toggle notifications for shared/delegated JMAP accounts            |
-| `/logout`   | Erase stored credentials immediately (GDPR right to erasure)      |
-| `/help`     | List commands                                                     |
+| Command        | Effect                                                                 |
+|----------------|--------------------------------------------------------------------------|
+| `/start`       | Onboarding, or current status if already connected                     |
+| `/login`       | `/login <server_url> <token>` — connect a JMAP account                 |
+| `/status`      | Show the connected account and watcher health                          |
+| `/partages`    | Toggle notifications for shared/delegated JMAP accounts                |
+| `/mute`        | `/mute <term>` — filter future notifications by sender/keyword; no argument lists active filters |
+| `/unmute`      | Remove a filter added with `/mute`                                     |
+| `/rechercher`  | `/rechercher <text>` — full-text search of the connected mailbox        |
+| `/logout`      | Erase stored credentials immediately (GDPR right to erasure)           |
+| `/help`        | List commands                                                          |
+
+The command list is also registered with Telegram itself, so it
+autocompletes from the client's own "/" menu.
 
 Each new-mail notification comes with inline buttons: **Lire tout** (full
-body), **Lu** (mark read), **Archiver**, **Supprimer**.
+body), **Lu** (mark read, shown in place afterward as a checkmark),
+**Archiver**, **Spam**, **Supprimer**. The sender is a tappable `mailto:`
+link and the preview renders as a native quoted block.
 
 ### Shared mailboxes
 
