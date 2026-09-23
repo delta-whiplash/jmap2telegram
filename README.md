@@ -3,7 +3,7 @@
 [![CI](https://github.com/delta-whiplash/jmap2telegram/actions/workflows/ci.yml/badge.svg)](https://github.com/delta-whiplash/jmap2telegram/actions/workflows/ci.yml)
 [![Security audit](https://github.com/delta-whiplash/jmap2telegram/actions/workflows/security-audit.yml/badge.svg)](https://github.com/delta-whiplash/jmap2telegram/actions/workflows/security-audit.yml)
 [![Release](https://img.shields.io/github/v/release/delta-whiplash/jmap2telegram?label=release)](https://github.com/delta-whiplash/jmap2telegram/releases/latest)
-[![License: MIT](https://img.shields.io/github/license/delta-whiplash/jmap2telegram)](LICENSE)
+[![License: Attribution](https://img.shields.io/badge/license-Attribution-blueviolet)](LICENSE)
 [![Docker image](https://img.shields.io/badge/ghcr.io-jmap2telegram-blue?logo=docker&logoColor=white)](https://github.com/delta-whiplash/jmap2telegram/pkgs/container/jmap2telegram)
 [![Helm chart](https://img.shields.io/badge/oci-charts%2Fjmap2telegram-0F1689?logo=helm&logoColor=white)](https://github.com/delta-whiplash/jmap2telegram/pkgs/container/charts%2Fjmap2telegram)
 
@@ -49,6 +49,7 @@ flowchart LR
 - [Building from source](#building-from-source)
 - [Releases](#releases)
 - [Limitations (v1 scope)](#limitations-v1-scope)
+- [License](#license)
 
 ## Why JMAP instead of Gmail
 
@@ -288,3 +289,13 @@ fix (flagged automatically, fixed by hand when it needs more than a
   Telegram yet (mirrors GmailBot's core loop, not its full feature set).
 - One JMAP account per authorized Telegram chat (multi-tenant); there's no
   shared-mailbox-to-many-viewers mode.
+
+## License
+
+[`LICENSE`](LICENSE) — free to use, modify, and redistribute, for any
+purpose including commercial, with one condition: any copy or derivative
+work must keep visible credit to **delta-whiplash** as the original
+author and **jmap2telegram** as the original project, even if you rename
+or repackage it. Not a standard SPDX license id, so tooling that expects
+one (e.g. `cargo package`) is pointed at the file directly via
+`license-file` in [`Cargo.toml`](Cargo.toml).

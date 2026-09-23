@@ -2,7 +2,7 @@
 name = "jmap2telegram"
 version = "0.5.1"
 edition = "2024"
-license = "MIT"
+license-file = "LICENSE"
 description = "A self-hosted Telegram bot that turns a JMAP mailbox into Telegram notifications"
 repository = "https://github.com/delta-whiplash/jmap2telegram"
 
