@@ -62,7 +62,7 @@ jobs:
       # buildkit-cache-dance extracts/injects them through actions/cache
       # instead, so a Cargo.lock bump only recompiles what changed rather
       # than the whole dependency tree.
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         id: cache
         with:
           path: cache-mount
