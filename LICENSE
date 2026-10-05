@@ -1,0 +1,68 @@
+Cardinal Code Open1 Attribution License
+(based on the BSD 2-Clause License, extended with attribution, naming,
+and non-endorsement conditions)
+
+Copyright (c) 2025 delta-whiplash
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, for any purpose, commercial or non-commercial, and
+to permit persons to whom the Software is furnished to do so, subject to
+the conditions below.
+
+## 1. Notice
+
+Redistributions of the Software, in source or binary form, and any
+derivative or modified work based on the Software, must retain the above
+copyright notice, this list of conditions, and the disclaimer at the end
+of this license.
+
+## 2. Attribution
+
+Any distribution of the Software, or of a derivative or modified work
+based on it — whether unmodified, modified, or incorporated into a larger
+work — must include the following notice, verbatim or in substantively
+equivalent wording, somewhere a user of that distribution would
+reasonably see it (a README, an "About"/credits page or command, release
+notes, or comparable documentation):
+
+    Powered by jmap2telegram (https://github.com/delta-whiplash/jmap2telegram),
+    created by delta-whiplash.
+
+This notice may not be removed, obscured, or omitted, even when the
+Software has been modified, renamed, or repackaged under a different name.
+
+## 3. Naming
+
+You may distribute a modified or derivative version of the Software
+under a name of your choosing, and Section 2 requires you to credit
+"jmap2telegram" as the project it originates from. You may not, however,
+name your own distribution, fork, product, or service "jmap2telegram" (or
+a name confusingly similar to it) in a way that could reasonably be
+mistaken for the original project maintained by delta-whiplash.
+
+## 4. No endorsement or affiliation
+
+Except as required by Section 2, the names "delta-whiplash" and
+"jmap2telegram" may not be used to state or imply that a modified or
+derivative work is endorsed by, sponsored by, or officially affiliated
+with delta-whiplash, without prior written permission.
+
+## 5. Termination
+
+This license terminates automatically for anyone who fails to comply
+with Sections 1 through 4. Rights under this license are reinstated
+automatically if the violation is cured within 30 days of the violator
+becoming aware of it, unless delta-whiplash has already terminated the
+license explicitly in writing.
+
+## Disclaimer
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHOR OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

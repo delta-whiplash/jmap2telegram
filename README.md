@@ -1,5 +1,12 @@
 # jmap2telegram
 
+[![CI](https://github.com/delta-whiplash/jmap2telegram/actions/workflows/ci.yml/badge.svg)](https://github.com/delta-whiplash/jmap2telegram/actions/workflows/ci.yml)
+[![Security audit](https://github.com/delta-whiplash/jmap2telegram/actions/workflows/security-audit.yml/badge.svg)](https://github.com/delta-whiplash/jmap2telegram/actions/workflows/security-audit.yml)
+[![Release](https://img.shields.io/github/v/release/delta-whiplash/jmap2telegram?label=release)](https://github.com/delta-whiplash/jmap2telegram/releases/latest)
+[![License: Cardinal Code Open1 Attribution](https://img.shields.io/badge/license-Cardinal%20Code%20Open1%20Attribution-blueviolet)](LICENSE)
+[![Docker image](https://img.shields.io/badge/ghcr.io-jmap2telegram-blue?logo=docker&logoColor=white)](https://github.com/delta-whiplash/jmap2telegram/pkgs/container/jmap2telegram)
+[![Helm chart](https://img.shields.io/badge/oci-charts%2Fjmap2telegram-0F1689?logo=helm&logoColor=white)](https://github.com/delta-whiplash/jmap2telegram/pkgs/container/charts%2Fjmap2telegram)
+
 A self-hosted Telegram bot that turns a [JMAP](https://jmap.io/) mailbox
 (Fastmail, Stalwart Mail Server, and any other JMAP-compliant provider)
 into Telegram notifications — read, mark read, archive, and delete your
@@ -12,6 +19,37 @@ JMAP providers authenticate with a bearer token rather than a redirect
 flow, the bot needs no public callback URL, no webhook, and no inbound
 network exposure at all — it only makes outbound connections to Telegram
 and to your JMAP server.
+
+```mermaid
+flowchart LR
+    subgraph Server["Wherever you run it"]
+        Bot["jmap2telegram\n(single static binary)"]
+        Store[("Encrypted\ncredential store")]
+        Bot --- Store
+    end
+    You(("You, in a\nprivate chat"))
+    JMAP[["Your JMAP server\n(Fastmail, Stalwart, ...)"]]
+
+    You -- "/login, /mute, taps ✓/🗑️" --> Bot
+    Bot -- notifications, inline buttons --> You
+    Bot -- "outbound only: HTTPS + EventSource" --> JMAP
+    JMAP -. "no inbound port, no webhook" .-x Bot
+```
+
+## Contents
+
+- [Why JMAP instead of Gmail](#why-jmap-instead-of-gmail)
+- [Security & privacy by design](#security--privacy-by-design)
+- [Quickstart (Docker)](#quickstart-docker)
+- [Commands](#commands)
+- [Shared mailboxes](#shared-mailboxes)
+- [Extra personal accounts](#extra-personal-accounts)
+- [Environment variables](#environment-variables)
+- [Kubernetes (Helm, OCI)](#kubernetes-helm-oci)
+- [Building from source](#building-from-source)
+- [Releases](#releases)
+- [Limitations (v1 scope)](#limitations-v1-scope)
+- [License](#license)
 
 ## Why JMAP instead of Gmail
 
@@ -87,7 +125,9 @@ cp .env.example .env   # fill in TELEGRAM_BOT_TOKEN and AUTHORIZED_CHAT_IDS
 docker compose up -d
 ```
 
-Then, in Telegram, from one of the authorized chats:
+Then, in Telegram, from one of the authorized chats. Don't know your chat
+id yet? Jump to [Finding your Telegram chat id](#finding-your-telegram-chat-id)
+below before continuing:
 
 ```
 /start
@@ -102,6 +142,36 @@ Then, in Telegram, from one of the authorized chats:
 
 The `/login` message is deleted automatically right after the bot reads
 it, so the token doesn't linger in the chat history.
+
+### Finding your Telegram chat id
+
+`AUTHORIZED_CHAT_IDS` is the bot's hard allowlist, and a fresh deployment
+starts with a chicken-and-egg problem: you need your numeric Telegram
+chat id to configure the allowlist, but Telegram's UI never shows that id
+anywhere — it is not your @username — and the bot can't tell you either,
+because until the id is in the allowlist it refuses to talk to you. Two
+ways out:
+
+1. **Let the bot tell you (no third party).** Start it with a placeholder
+   in the allowlist — `AUTHORIZED_CHAT_IDS=0` is enough, the variable
+   just must not be empty or the bot refuses to boot — open a private
+   chat with your bot, and send anything (`/start` works). The bot will
+   answer with an "access denied" message, but it also logs the refused
+   chat id at `WARN` level, visible with the default `LOG_LEVEL=info`:
+
+   ```
+   2026-10-05T14:23:45.123+02:00  WARN jmap2telegram::bot: unauthorized access attempt chat_id=111111111
+   ```
+
+   Read it with `docker logs -f jmap2telegram` (under the Helm chart:
+   `kubectl logs -f <pod>`), put that number in `AUTHORIZED_CHAT_IDS`,
+   and restart the bot. Your id never leaves your machine and Telegram's.
+
+2. **Ask @userinfobot.** Message
+   [@userinfobot](https://t.me/userinfobot) in Telegram and it replies
+   with your numeric chat id, among other details. Convenient, but it's
+   an unrelated third-party bot — use method 1 if you'd rather not send
+   it anything at all.
 
 ### Commands
 
@@ -215,16 +285,36 @@ Tagging `vX.Y.Z` and pushing it triggers
 1. re-runs the full CI suite (fmt, clippy, tests, `cargo audit`, Docker
    build, Helm lint);
 2. builds and pushes a multi-arch (`amd64`/`arm64`) Docker image to
-   `ghcr.io/delta-whiplash/jmap2telegram`, tagged `X.Y.Z`, `X.Y`, `X`, and
-   `latest`;
+   `ghcr.io/delta-whiplash/jmap2telegram`, tagged `vX.Y.Z` (the exact
+   release), `X.Y`, `X`, and `latest` — the bare `X.Y.Z` form is **not**
+   published, so pin pull commands to the `v`-prefixed tag;
 3. packages and pushes the Helm chart as an OCI artifact to
    `oci://ghcr.io/delta-whiplash/charts/jmap2telegram`, versioned from the
    same tag;
 4. cuts a GitHub Release with autogenerated notes.
 
-Dependency updates (Cargo, Docker base images, GitHub Actions) are kept
-current by Dependabot (`.github/dependabot.yml`), opening weekly PRs that
-go through the same CI gate.
+### Staying current with no one at the wheel
+
+The repo is meant to look after itself between feature work:
+
+- **Dependency updates.** [Dependabot](.github/dependabot.yml) opens
+  weekly PRs for Cargo, Docker base image, and GitHub Actions updates,
+  grouped and gated by the same CI suite as any other PR.
+- **Auto-merge for routine bumps.**
+  [`dependabot-auto-merge.yml`](.github/workflows/dependabot-auto-merge.yml)
+  approves and merges patch/minor Dependabot PRs itself once CI is green;
+  major bumps are always left for manual review.
+- **Standing security watch.**
+  [`security-audit.yml`](.github/workflows/security-audit.yml) re-runs
+  `cargo audit` every week regardless of whether anything was pushed, so
+  a RUSTSEC advisory published against an already-shipped dependency
+  still surfaces as a tracking issue instead of going unnoticed until the
+  next unrelated change.
+
+In steady state, that means most future updates are exactly two kinds:
+routine version bumps (merged automatically) and the occasional security
+fix (flagged automatically, fixed by hand when it needs more than a
+`cargo update`).
 
 ## Limitations (v1 scope)
 
@@ -232,3 +322,25 @@ go through the same CI gate.
   Telegram yet (mirrors GmailBot's core loop, not its full feature set).
 - One JMAP account per authorized Telegram chat (multi-tenant); there's no
   shared-mailbox-to-many-viewers mode.
+
+## License
+
+[`LICENSE`](LICENSE) — the **Cardinal Code Open1 Attribution License**.
+Free to use, modify, sell, and redistribute for any purpose, commercial
+or not, subject to a few conditions:
+
+- **Attribution.** Keep a visible credit to **delta-whiplash** as the
+  original author and **jmap2telegram** as the original project,
+  wherever a user of your distribution would reasonably see it — even if
+  you rename or repackage it. The license spells out the exact wording.
+- **Naming.** You can fork and rename your own version freely, but you
+  can't call your fork "jmap2telegram" in a way that could be mistaken
+  for the original project.
+- **No implied endorsement.** Crediting the origin doesn't mean claiming
+  delta-whiplash endorses or is affiliated with your fork.
+- **Automatic termination.** Breaking any of the above ends your license
+  automatically (with a 30-day cure window).
+
+Not a standard SPDX license id, so tooling that expects one (e.g. `cargo
+package`) is pointed at the file directly via `license-file` in
+[`Cargo.toml`](Cargo.toml).

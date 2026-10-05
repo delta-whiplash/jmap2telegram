@@ -1,0 +1,66 @@
+{
+  // Renovate — jmap2telegram (instance DW, self-hosted dans le cluster
+  // pemberton : projects/system/renovate-dw). Remplace Dependabot +
+  // dependabot-auto-merge.yml (supprimés) : un seul bot, automerge natif,
+  // lockFileMaintenance — ce que Dependabot ne couvrait pas.
+  $schema: "https://docs.renovatebot.com/renovate-schema.json",
+  extends: [
+    "config:recommended",
+    ":semanticCommits",
+    "docker:pinDigests", // Dockerfile : FROM rust:1-slim-bookworm → digest
+    "helpers:pinGitHubActionDigests",
+  ],
+  timezone: "Europe/Paris",
+  schedule: ["after 6am", "before 10pm"],
+  labels: ["renovate", "dependencies"],
+  dependencyDashboard: true,
+  rebaseWhen: "behind-base-branch",
+  prConcurrentLimit: 10,
+  platformAutomerge: false,
+
+  // Cargo : clippy -D warnings + tests doivent rester verts pour merger.
+  // Patch/minor auto-mergés quand CI est vert ; major en revue manuelle
+  // (breaking API non détectable par la suite de tests).
+  packageRules: [
+    {
+      description: "Cargo minor+patch groupés, automerge derrière CI verte",
+      matchManagers: ["cargo"],
+      matchUpdateTypes: ["patch", "minor"],
+      groupName: "cargo minor+patch",
+      automerge: true,
+      automergeType: "pr",
+    },
+    {
+      description: "Cargo major : revue manuelle",
+      matchManagers: ["cargo"],
+      matchUpdateTypes: ["major"],
+      automerge: false,
+    },
+    {
+      description: "GitHub Actions : minor+patch digest-pinnés, automerge",
+      matchManagers: ["github-actions"],
+      matchUpdateTypes: ["patch", "minor"],
+      groupName: "github-actions minor+patch",
+      automerge: true,
+      automergeType: "pr",
+    },
+    {
+      description: "Docker (image builder rust) : revue, rare et cassable",
+      matchManagers: ["dockerfile"],
+      automerge: false,
+    },
+  ],
+
+  // Refresh Cargo.lock sans bump de version (CVE transitives) — hebdo.
+  lockFileMaintenance: {
+    enabled: true,
+    schedule: ["before 5am on monday"],
+    automerge: true,
+    automergeType: "pr",
+  },
+
+  vulnerabilityAlerts: {
+    enabled: true,
+    labels: ["security-alert", "priority-critical"],
+  },
+}

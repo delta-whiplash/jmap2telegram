@@ -1,0 +1,72 @@
+name: Security audit
+
+# ci.yml's own `cargo audit` job only ever runs against a push/PR, so a
+# RUSTSEC advisory published against a dependency version we already
+# shipped (no code change of ours involved) would otherwise go unnoticed
+# until someone happens to touch Cargo.toml again. This runs the same
+# check weekly regardless, and opens (or updates) a single tracking
+# issue when it finds something, so a new advisory turns into a visible
+# to-do even on a repo that's otherwise idle.
+on:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cargo-audit
+
+      - name: Run cargo audit
+        id: audit
+        run: |
+          set -euo pipefail
+          if ! output=$(cargo audit 2>&1); then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            {
+              echo "output<<AUDIT_EOF"
+              echo "$output"
+              echo "AUDIT_EOF"
+            } >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: File or update the tracking issue
+        if: steps.audit.outputs.found == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AUDIT_OUTPUT: ${{ steps.audit.outputs.output }}
+        run: |
+          set -euo pipefail
+          gh label create security-audit --color B60205 \
+            --description "Opened by the scheduled cargo audit workflow" 2>/dev/null || true
+
+          existing=$(gh issue list --label security-audit --state open --json number --jq '.[0].number // empty')
+          body=$(printf 'The weekly scheduled `cargo audit` run found an advisory affecting a currently pinned dependency.\n\n```\n%s\n```\n\nUpdate the affected crate (`cargo update -p <crate>`, or a version bump if the fix needs a semver-incompatible upgrade) and re-run `cargo audit` to confirm before closing this issue.' "$AUDIT_OUTPUT")
+
+          if [ -z "$existing" ]; then
+            gh issue create --title "cargo audit: new advisory affecting a dependency" \
+              --label security-audit --body "$body"
+          else
+            gh issue comment "$existing" --body "$body"
+          fi
+
+      - name: Close the tracking issue once clean
+        if: steps.audit.outputs.found == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          existing=$(gh issue list --label security-audit --state open --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "cargo audit is clean again as of this scheduled run."
+            gh issue close "$existing"
+          fi
