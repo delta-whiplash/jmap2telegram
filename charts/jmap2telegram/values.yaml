@@ -42,12 +42,6 @@ persistence:
   accessMode: ReadWriteOnce
   size: 64Mi
 
-# This app is a single stateful long-poller against the Telegram Bot API
-# with a local encrypted file store: it must run as exactly one replica.
-# Do not scale this up — multiple replicas would double-notify and race
-# on the same volume.
-replicaCount: 1
-
 resources:
   requests:
     cpu: 10m
