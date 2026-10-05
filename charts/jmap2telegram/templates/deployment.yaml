@@ -26,6 +26,9 @@ spec:
         {{- toYaml . | nindent 8 }}
         {{- end }}
     spec:
+      # The bot never talks to the Kubernetes API (it only long-polls the
+      # Telegram Bot API outbound), so it gets no mounted token at all.
+      automountServiceAccountToken: false
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
