@@ -157,12 +157,22 @@ pub(crate) fn extra_health_key(chat_id: i64, slot_id: &str) -> String {
     .health_key(chat_id)
 }
 
-fn connection_broken_text(target: &WatchTarget, last_error: &anyhow::Error) -> String {
+/// Connection-broken health notice. Deliberately interpolates *no*
+/// runtime error at all: the last connect/stream error used to be
+/// rendered here verbatim, and against a server hostname an attacker can
+/// influence (see the residual DNS-rebinding TOCTOU in SECURITY.md,
+/// "SSRF via /login") that verbatim transport error — jmap-client's
+/// Display for it is "Transport error: <full URL + OS-level TCP cause>"
+/// — is an internal-port-reachability oracle landing directly in the
+/// attacker's chat. Every failure is already traced server-side by the
+/// reconnect loop below, so the notice points at the logs instead of
+/// quoting the error. Keep it that way: no `{}` of an error, ever.
+fn connection_broken_text(target: &WatchTarget) -> String {
     format!(
         "⚠️ La connexion à {scope} échoue depuis plusieurs tentatives : le jeton a peut-être \
          été révoqué, ou le serveur est injoignable. Les notifications sont en pause pour ce \
          compte jusqu'à ce que la connexion reprenne d'elle-même.\n\n\
-         Dernière erreur : {last_error}\n\n\
+         Le détail technique de chaque échec est consigné dans les logs serveur.\n\n\
          Si le jeton a été révoqué, reconnecte-toi avec /login (ou /partages pour une boîte \
          partagée).",
         scope = target.scope_label(),
@@ -233,8 +243,12 @@ pub fn spawn(
                             && !notified_broken
                         {
                             notified_broken = true;
-                            notify(&bot, &state, chat_id, connection_broken_text(&target, &e))
-                                .await;
+                            // No error object crosses into the notice:
+                            // the reconnect loop's warn! above already
+                            // traced it server-side (see
+                            // connection_broken_text for why the chat
+                            // must never see it).
+                            notify(&bot, &state, chat_id, connection_broken_text(&target)).await;
                         }
                     }
                 }
@@ -557,24 +571,53 @@ mod tests {
     }
 
     #[test]
-    fn connection_broken_text_names_the_primary_mailbox_and_the_error() {
-        let err = anyhow::anyhow!("401 Unauthorized");
-        let text = connection_broken_text(&WatchTarget::Primary, &err);
+    fn connection_broken_text_names_the_primary_mailbox_and_points_at_the_logs() {
+        let text = connection_broken_text(&WatchTarget::Primary);
         assert!(text.contains("ta boîte JMAP"));
-        assert!(text.contains("401 Unauthorized"));
+        assert!(text.contains("logs serveur"));
         assert!(text.contains("/login"));
     }
 
     #[test]
     fn connection_broken_text_names_the_shared_mailbox() {
-        let err = anyhow::anyhow!("connection refused");
         let target = WatchTarget::Shared {
             account_id: "acc7".to_string(),
             label: "contact@delta-net.ovh".to_string(),
         };
-        let text = connection_broken_text(&target, &err);
+        let text = connection_broken_text(&target);
         assert!(text.contains("contact@delta-net.ovh"));
-        assert!(text.contains("connection refused"));
+        assert!(text.contains("logs serveur"));
+    }
+
+    /// Regression test for the SSRF error oracle: the "connection broken"
+    /// notice used to interpolate the last runtime error verbatim, and
+    /// that error is the raw jmap-client transport error (its Display is
+    /// "Transport error: <full URL + OS-level TCP cause>"), which —
+    /// especially after the DNS-rebinding TOCTOU documented in
+    /// SECURITY.md — reads back as a port-state fingerprint of whatever
+    /// the watched account's hostname currently resolves to. The notice
+    /// must interpolate no error at all; the details live in the
+    /// server-side tracing::warn of the reconnect loop.
+    #[test]
+    fn connection_broken_text_never_interpolates_the_transport_error() {
+        let text = connection_broken_text(&WatchTarget::Primary);
+        // Fragments of a plausible raw transport error, exactly what the
+        // notice used to quote, plus the old quoting line itself.
+        for fragment in [
+            "Dernière erreur",
+            "Connection refused",
+            "Transport error",
+            "error sending request",
+            "os error",
+            "timed out",
+            "401",
+            "internal-host",
+        ] {
+            assert!(
+                !text.contains(fragment),
+                "error-oracle leak via {fragment:?}: {text}"
+            );
+        }
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use std::net::{IpAddr, Ipv4Addr};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use jmap_client::DataType;
 use jmap_client::client::{Client, Credentials};
 use jmap_client::core::response::EmailGetResponse;
@@ -12,6 +12,20 @@ use jmap_client::mailbox::{self, Role};
 /// single common word) can't pull an unbounded number of full Email/get
 /// lookups and produce an unusably long Telegram reply.
 const SEARCH_RESULT_LIMIT: usize = 10;
+
+/// The single fixed message the chat gets for *any* network-level JMAP
+/// failure (DNS resolution, TCP/TLS connect, autodiscovery, session
+/// negotiation, authentication). The raw transport error, by contrast,
+/// fingerprints exactly one port state ("connection refused" vs "timed
+/// out" vs a TLS/HTTP error, each rendered by reqwest with the full URL
+/// and OS-level TCP cause), so echoing it back to the chat would turn
+/// `/login` against an attacker-chosen hostname — or a watcher reconnect
+/// after a DNS-rebounding TOCTOU — into an internal-port-reachability
+/// oracle (see SECURITY.md). The real cause is logged server-side instead;
+/// callers must never attach it back to the error they return, or the
+/// chain becomes one `{:?}` format away from the same leak.
+const UNREACHABLE_SERVER_MSG: &str =
+    "serveur JMAP injoignable ou invalide (détail dans les logs serveur)";
 
 pub struct EmailSummary {
     pub id: String,
@@ -52,6 +66,14 @@ fn attachments_of(email: &jmap_client::email::Email) -> Vec<(String, usize)> {
 /// refused before we ever send it the bearer token — otherwise this
 /// would be a ready-made SSRF primitive against the deployment's internal
 /// network (cluster services, cloud metadata endpoints, ...).
+///
+/// Error-wise, only the purely local checks (the `https://` scheme, URL
+/// parsing, a missing host) and the SSRF guard's own refusal stay
+/// detailed: they describe the input the user themselves supplied, not
+/// the behavior of anything on the network. Every network-level failure
+/// past them is deliberately collapsed into the single fixed
+/// [`UNREACHABLE_SERVER_MSG`] above, with the cause logged server-side —
+/// see that constant for why.
 pub async fn connect(server_url: &str, token: &str, allow_private_hosts: bool) -> Result<Client> {
     if !server_url.starts_with("https://") {
         bail!("l'URL du serveur JMAP doit commencer par https://");
@@ -76,10 +98,27 @@ pub async fn connect(server_url: &str, token: &str, allow_private_hosts: bool) -
     // widening the SSRF surface checked above.
     let client = Client::new()
         .credentials(Credentials::bearer(token))
-        .follow_redirects([host])
+        .follow_redirects([host.clone()])
         .connect(server_url)
         .await
-        .context("connexion/authentification JMAP échouée")?;
+        .map_err(|e| {
+            // Error-oracle neutralization: this handshake is the first
+            // attacker-triggered request to a possibly attacker-chosen
+            // server, and its raw transport error (which jmap-client
+            // renders as "Transport error: <full URL + OS-level TCP
+            // cause>") would read back as a port-state fingerprint of
+            // whatever the hostname resolves to by the time *this*
+            // request re-resolves it (see the residual TOCTOU in
+            // SECURITY.md). Log the cause server-side and return a bare
+            // generic error — bare, so the dropped cause can't be
+            // resurrected from the error chain either.
+            tracing::warn!(
+                host = %host,
+                error = %e,
+                "JMAP session negotiation failed (details kept out of the chat)"
+            );
+            anyhow!(UNREACHABLE_SERVER_MSG)
+        })?;
 
     Ok(client)
 }
@@ -127,14 +166,33 @@ async fn assert_public_host(host: &str, server_url: &str) -> Result<()> {
     let parsed = url::Url::parse(server_url).context("URL de serveur JMAP invalide")?;
     let port = parsed.port_or_known_default().unwrap_or(443);
 
-    let addrs = tokio::net::lookup_host((host, port))
-        .await
-        .with_context(|| format!("résolution DNS impossible pour {host}"))?;
+    // Same error-oracle neutralization as the session handshake in
+    // `connect`: *how* a name fails to resolve (NXDOMAIN vs resolver
+    // timeout vs empty answer) distinguishes internal DNS states, and the
+    // distinction used to travel to the chat. Only the fixed generic
+    // message goes back now; the cause goes server-side.
+    let addrs = match tokio::net::lookup_host((host, port)).await {
+        Ok(addrs) => addrs,
+        Err(e) => {
+            tracing::warn!(
+                host = %host,
+                error = %e,
+                "DNS resolution of the JMAP server failed (details kept out of the chat)"
+            );
+            bail!(UNREACHABLE_SERVER_MSG);
+        }
+    };
 
     let mut resolved_any = false;
     for addr in addrs {
         resolved_any = true;
         if is_disallowed_host(addr.ip()) {
+            // A deliberate policy refusal, not a network probe result:
+            // it explains a decision about a name the user themselves
+            // supplied (and how to opt in), and reveals nothing about
+            // whether anything is listening anywhere — which is why,
+            // unlike every transport error above and below, it stays
+            // detailed enough to be actionable in the chat.
             bail!(
                 "le serveur JMAP '{host}' se résout vers une adresse non publique ({}) : \
                  refusé pour éviter une attaque SSRF contre le réseau interne du déploiement. \
@@ -145,7 +203,11 @@ async fn assert_public_host(host: &str, server_url: &str) -> Result<()> {
         }
     }
     if !resolved_any {
-        bail!("la résolution DNS de '{host}' n'a retourné aucune adresse");
+        tracing::warn!(
+            host = %host,
+            "DNS resolution of the JMAP server returned no addresses (details kept out of the chat)"
+        );
+        bail!(UNREACHABLE_SERVER_MSG);
     }
     Ok(())
 }
@@ -491,6 +553,55 @@ mod tests {
             .err()
             .expect("nothing listens on port 1, connection should still fail");
         assert!(!err.to_string().contains("non publique"));
+    }
+
+    /// The chat-facing error for a network-level connect failure must be
+    /// a single fixed generic message. reqwest's raw transport error —
+    /// which jmap-client renders verbatim as "Transport error: …" —
+    /// names the full URL and the OS-level TCP cause (e.g. "Connection
+    /// refused (os error 111)" vs "timed out"), and that combination
+    /// fingerprints exactly one port state on whatever the hostname
+    /// resolved to for *this* request. Returning it to the chat would
+    /// turn `/login` into an internal-port-reachability oracle (see
+    /// SECURITY.md, "SSRF via /login"); the cause goes to the server-side
+    /// log instead.
+    #[tokio::test]
+    async fn connect_failure_error_message_carries_no_transport_detail() {
+        // Loopback opted into so the SSRF guard itself is out of the way
+        // (its refusal is a deliberate policy notice, covered by its own
+        // tests above) and the failure is pure transport: nothing listens
+        // on port 1, so the TCP connect fails with ECONNREFUSED.
+        let err = connect("https://127.0.0.1:1", "tok", true)
+            .await
+            .err()
+            .expect("nothing listens on port 1, connect must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("injoignable") && msg.contains("logs serveur"),
+            "expected the fixed generic message, got: {msg}"
+        );
+        // Nothing that could fingerprint the host, port, URL or
+        // transport-layer cause — including the whole error chain, not
+        // just the outermost message: the cause is dropped, not attached.
+        for fragment in [
+            "127.0.0.1",
+            "/.well-known/jmap",
+            "error sending request",
+            "Connection refused",
+            "tcp connect",
+            "os error",
+            "Transport error",
+            "https://127.0.0.1",
+        ] {
+            assert!(!msg.contains(fragment), "error-oracle leak in: {msg}");
+        }
+        let chain: Vec<String> = err.chain().map(|e| e.to_string()).collect();
+        for fragment in ["Connection refused", "Transport error", "os error"] {
+            assert!(
+                !chain.iter().any(|c| c.contains(fragment)),
+                "error-oracle leak via cause chain: {chain:?}"
+            );
+        }
     }
 
     #[test]
