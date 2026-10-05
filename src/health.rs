@@ -47,10 +47,25 @@
 //!   fallback poll), so an age above `FALLBACK_POLL` + margin means that
 //!   watcher is neither receiving events nor completing fallback syncs —
 //!   alert material, not restart material.
+//!
+//! Two hardening rules apply to the wire path itself:
+//!
+//! - **Request reads are deadline-bounded** (see [`REQUEST_DEADLINE`]). A
+//!   connection that opens and then never sends a byte — a port scanner, a
+//!   wedged scraper — is closed when the deadline expires, instead of
+//!   pinning the accept-spawned task and its socket forever.
+//!
+//! - **Watcher keys are escaped before they reach a probe response.** Part
+//!   of a key is the JMAP account id, chosen by the *server* (see
+//!   `watcher::shared_health_key`), so it is not trusted to be
+//!   format-safe: [`escape_prometheus_label`] keeps a key containing `\`,
+//!   `"` or a newline from breaking the scrape or injecting fake metric
+//!   lines.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -168,15 +183,34 @@ pub async fn bind() -> std::io::Result<TcpListener> {
     Ok(listener)
 }
 
+/// How long a probe connection may take to deliver its request line before
+/// the responder gives up on it. Five seconds is deliberately generous
+/// (kubelet and vmagent send their fixed, tiny request line immediately);
+/// anything slower is a broken or deliberately silent peer, and the
+/// deadline's job is to make sure it costs nothing more than a closed
+/// socket, never a pinned task.
+const REQUEST_DEADLINE: Duration = Duration::from_secs(5);
+
 /// Serves probe and metrics requests until the process exits. Never
 /// returns on its own; run it in a spawned task.
 pub async fn serve(listener: TcpListener, health: Arc<Health>) {
+    serve_with_request_deadline(listener, health, REQUEST_DEADLINE).await
+}
+
+/// Same as [`serve`], with the per-connection request deadline injectable
+/// so tests can exercise the silent-connection path without waiting out
+/// the full five seconds of [`REQUEST_DEADLINE`].
+async fn serve_with_request_deadline(
+    listener: TcpListener,
+    health: Arc<Health>,
+    request_deadline: Duration,
+) {
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
                 let health = health.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = respond(stream, &health).await {
+                    if let Err(e) = respond(stream, &health, request_deadline).await {
                         // A client hanging up mid-request lands here; not
                         // worth more than a trace line.
                         tracing::trace!(error = %e, "health connection error");
@@ -193,13 +227,24 @@ pub async fn serve(listener: TcpListener, health: Arc<Health>) {
     }
 }
 
-async fn respond(mut stream: TcpStream, health: &Health) -> std::io::Result<()> {
+async fn respond(
+    mut stream: TcpStream,
+    health: &Health,
+    request_deadline: Duration,
+) -> std::io::Result<()> {
     // Probes and scrapers send a fixed, tiny request line + headers; one
     // read of a small buffer is enough (kubelet never sends bodies here).
     // Reading exactly once and replying immediately keeps this
-    // allocation-free.
+    // allocation-free. The read itself is deadline-bounded: a peer that
+    // opens the socket and then goes silent must not pin this task and
+    // the socket for the life of the process. On expiry the plainest
+    // thing is also the right one — drop the stream (which closes the
+    // socket) without any response.
     let mut buf = [0u8; 512];
-    let n = stream.read(&mut buf).await?;
+    let n = match tokio::time::timeout(request_deadline, stream.read(&mut buf)).await {
+        Ok(read) => read?,
+        Err(_elapsed) => return Ok(()),
+    };
     let request = String::from_utf8_lossy(&buf[..n]);
     let path = request.split_whitespace().nth(1).unwrap_or_default();
 
@@ -207,9 +252,20 @@ async fn respond(mut stream: TcpStream, health: &Health) -> std::io::Result<()> 
         "/healthz" => ("200 OK", "ok\n".to_string()),
         "/readyz" => match health.readiness() {
             Ok(()) => ("200 OK", "ok\n".to_string()),
+            // The keys are escaped with the same rules as the /metrics
+            // label: one key can smuggle in a newline via a server-chosen
+            // account id, and a raw newline here would turn one 503 line
+            // into response-line confusion for whatever parses the body.
             Err(disconnected) => (
                 "503 Service Unavailable",
-                format!("watchers disconnected: {}\n", disconnected.join(", ")),
+                format!(
+                    "watchers disconnected: {}\n",
+                    disconnected
+                        .iter()
+                        .map(|key| escape_prometheus_label(key).into_owned())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
             ),
         },
         "/metrics" => ("200 OK", render_metrics(health)),
@@ -246,18 +302,49 @@ fn render_metrics(health: &Health) -> String {
     );
     for (key, status) in &snapshot {
         // Watcher keys embed the Telegram chat id and the account slot —
-        // internal identifiers, never credentials. +Inf until the first
-        // sync so a fresh watcher doesn't masquerade as a fresh stream.
-        // Spelled "+Inf" (not Rust's "inf") per the Prometheus text format.
+        // internal identifiers, never credentials. The JMAP account id
+        // part is *not* internal though (the server picks it), so the key
+        // is escaped into the label value per the text format rather than
+        // interpolated raw; see escape_prometheus_label. +Inf until the
+        // first sync so a fresh watcher doesn't masquerade as a fresh
+        // stream. Spelled "+Inf" (not Rust's "inf") per the text format.
         let age = match status.last_activity {
             Some(t) => t.elapsed().as_secs_f64().to_string(),
             None => "+Inf".to_string(),
         };
         out.push_str(&format!(
-            "jmap2telegram_last_activity_age_seconds{{watcher=\"{key}\"}} {age}\n"
+            "jmap2telegram_last_activity_age_seconds{{watcher=\"{}\"}} {age}\n",
+            escape_prometheus_label(key)
         ));
     }
     out
+}
+
+/// Escapes a string for inclusion in a Prometheus label value — and, for
+/// consistency, in the /readyz 503 body naming the same watcher keys.
+///
+/// The text format mandates label values be quoted with `\` (`\\`), `"`
+/// (`\"`) and newline (`\n`) escaped inside the quotes. Watcher keys embed
+/// a JMAP account id that the *server* chooses (see
+/// `watcher::shared_health_key`), not us: an account id containing any of
+/// those characters would, unescaped, terminate the label early and break
+/// the scrape — or, with a newline, inject whole fake metric lines into
+/// the stream vmagent ingests.
+///
+/// Real keys are almost always plain ASCII, so the common case borrows
+/// instead of allocating.
+fn escape_prometheus_label(value: &str) -> Cow<'_, str> {
+    if !value.contains(['\\', '"', '\n']) {
+        return Cow::Borrowed(value);
+    }
+    // Backslash must be escaped first, or the backslashes this chain just
+    // inserted for `"` and `\n` would get doubled again.
+    Cow::Owned(
+        value
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n"),
+    )
 }
 
 #[cfg(test)]
@@ -444,5 +531,97 @@ mod tests {
         for _ in 0..20 {
             assert_eq!(get(addr, "/healthz").await.0, 200);
         }
+    }
+
+    #[test]
+    fn escape_prometheus_label_escapes_backslash_quote_and_newline() {
+        // Plain keys — the overwhelming majority — come back untouched.
+        assert_eq!(escape_prometheus_label("42/shared-acc7"), "42/shared-acc7");
+        // Each character the text format forbids raw inside a label value.
+        assert_eq!(escape_prometheus_label(r"a\b"), r"a\\b");
+        assert_eq!(escape_prometheus_label(r#"a"b"#), r#"a\"b"#);
+        assert_eq!(escape_prometheus_label("a\nb"), r"a\nb");
+        // All three at once: backslash doubling must not re-escape the
+        // backslashes inserted for the quote and the newline.
+        assert_eq!(escape_prometheus_label("\\\"\n"), r#"\\\"\n"#);
+        // A key that arrives *already* escaped has its backslashes doubled
+        // (a label value never has an odd number of them).
+        assert_eq!(escape_prometheus_label(r"a\nb"), r"a\\nb");
+    }
+
+    #[tokio::test]
+    async fn metrics_escape_watcher_keys_containing_quote_backslash_and_newline() {
+        // A JMAP account id is chosen by the server (see
+        // watcher::shared_health_key); one containing a quote, a backslash
+        // or even a newline must not terminate the label value or the
+        // metric line.
+        let health = Arc::new(Health::default());
+        let key = String::from(r#"42/shared-a"b\c"#) + "\n" + "d";
+        health.register(&key);
+        let addr = spawn_ephemeral(health).await;
+        let (status, body) = get(addr, "/metrics").await;
+        assert_eq!(status, 200);
+        let line = body
+            .lines()
+            .find(|l| l.contains("42/shared-a"))
+            .expect("per-watcher metric line present");
+        // One line, label value escaped per the text format: an unescaped
+        // newline would have split it, an unescaped quote closed the label
+        // early — either way this exact line would not exist.
+        assert_eq!(
+            line,
+            r#"jmap2telegram_last_activity_age_seconds{watcher="42/shared-a\"b\\c\nd"} +Inf"#
+        );
+        // The sibling aggregate lines still parse as usual.
+        assert!(
+            body.contains("jmap2telegram_watchers_registered 1"),
+            "body: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn readyz_503_body_escapes_watcher_keys() {
+        let health = Arc::new(Health::default());
+        let key = String::from(r#"42/shared-a"b\c"#) + "\n" + "d";
+        health.register(&key);
+        let addr = spawn_ephemeral(health).await;
+        let (status, body) = get(addr, "/readyz").await;
+        assert_eq!(status, 503);
+        // The raw newline inside the key must not leak into the body — it
+        // stays one line.
+        assert_eq!(body.lines().count(), 1, "body: {body}");
+        assert_eq!(
+            body.trim_end(),
+            r#"watchers disconnected: 42/shared-a\"b\\c\nd"#,
+            "body: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn silent_connection_is_closed_at_the_read_deadline() {
+        // A peer that connects and then never sends a byte must not pin
+        // the accept-spawned task and its socket for the life of the
+        // process: the deadline-bounded read gives up and dropping the
+        // stream closes the socket. Production gives probes the full
+        // REQUEST_DEADLINE (5s); the test injects a short deadline through
+        // serve_with_request_deadline so it observes the close in
+        // milliseconds instead of waiting out five seconds.
+        let health = Arc::new(Health::default());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve_with_request_deadline(
+            listener,
+            health,
+            Duration::from_millis(150),
+        ));
+        let mut silent = TcpStream::connect(addr).await.unwrap();
+        let mut buf = Vec::new();
+        // EOF (read_to_end returning) is the observable close; the outer
+        // timeout fails the test if the deadline path ever regresses.
+        tokio::time::timeout(Duration::from_secs(2), silent.read_to_end(&mut buf))
+            .await
+            .expect("silent connection closed before the test timeout")
+            .unwrap();
+        assert!(buf.is_empty());
     }
 }
