@@ -125,7 +125,9 @@ cp .env.example .env   # fill in TELEGRAM_BOT_TOKEN and AUTHORIZED_CHAT_IDS
 docker compose up -d
 ```
 
-Then, in Telegram, from one of the authorized chats:
+Then, in Telegram, from one of the authorized chats. Don't know your chat
+id yet? Jump to [Finding your Telegram chat id](#finding-your-telegram-chat-id)
+below before continuing:
 
 ```
 /start
@@ -140,6 +142,36 @@ Then, in Telegram, from one of the authorized chats:
 
 The `/login` message is deleted automatically right after the bot reads
 it, so the token doesn't linger in the chat history.
+
+### Finding your Telegram chat id
+
+`AUTHORIZED_CHAT_IDS` is the bot's hard allowlist, and a fresh deployment
+starts with a chicken-and-egg problem: you need your numeric Telegram
+chat id to configure the allowlist, but Telegram's UI never shows that id
+anywhere — it is not your @username — and the bot can't tell you either,
+because until the id is in the allowlist it refuses to talk to you. Two
+ways out:
+
+1. **Let the bot tell you (no third party).** Start it with a placeholder
+   in the allowlist — `AUTHORIZED_CHAT_IDS=0` is enough, the variable
+   just must not be empty or the bot refuses to boot — open a private
+   chat with your bot, and send anything (`/start` works). The bot will
+   answer with an "access denied" message, but it also logs the refused
+   chat id at `WARN` level, visible with the default `LOG_LEVEL=info`:
+
+   ```
+   2026-10-05T14:23:45.123+02:00  WARN jmap2telegram::bot: unauthorized access attempt chat_id=111111111
+   ```
+
+   Read it with `docker logs -f jmap2telegram` (under the Helm chart:
+   `kubectl logs -f <pod>`), put that number in `AUTHORIZED_CHAT_IDS`,
+   and restart the bot. Your id never leaves your machine and Telegram's.
+
+2. **Ask @userinfobot.** Message
+   [@userinfobot](https://t.me/userinfobot) in Telegram and it replies
+   with your numeric chat id, among other details. Convenient, but it's
+   an unrelated third-party bot — use method 1 if you'd rather not send
+   it anything at all.
 
 ### Commands
 

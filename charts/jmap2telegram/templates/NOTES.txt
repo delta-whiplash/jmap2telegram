@@ -31,6 +31,18 @@ Check it came up:
 Then open Telegram, start a chat with your bot, and send /start from one of
 the chat ids listed in telegram.authorizedChatIds.
 
+Don't know your chat id yet? Telegram never shows the numeric id the bot
+needs anywhere in its UI, and the bot can't tell you either — it refuses
+to talk to anyone not in the allowlist. Send it anything (/start works)
+anyway: the bot logs the refused chat id at WARN level, so you can read
+it with:
+
+  kubectl logs -l app.kubernetes.io/instance={{ .Release.Name }} -n {{ .Release.Namespace }} | grep "unauthorized access attempt"
+
+(or just ask @userinfobot in Telegram for your id). Put the number in
+telegram.authorizedChatIds and redeploy — the full walkthrough lives in
+the "Finding your Telegram chat id" section of the project README.
+
 {{- if not .Values.persistence.enabled }}
 
 ⚠️  persistence.enabled=false: connected JMAP accounts will be lost on every
