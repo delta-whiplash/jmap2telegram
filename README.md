@@ -7,18 +7,14 @@
 [![Docker image](https://img.shields.io/badge/ghcr.io-jmap2telegram-blue?logo=docker&logoColor=white)](https://github.com/delta-whiplash/jmap2telegram/pkgs/container/jmap2telegram)
 [![Helm chart](https://img.shields.io/badge/oci-charts%2Fjmap2telegram-0F1689?logo=helm&logoColor=white)](https://github.com/delta-whiplash/jmap2telegram/pkgs/container/charts%2Fjmap2telegram)
 
-A self-hosted Telegram bot that turns a [JMAP](https://jmap.io/) mailbox
-(Fastmail, Stalwart Mail Server, and any other JMAP-compliant provider)
-into Telegram notifications — read, mark read, archive, and delete your
-mail without leaving the chat.
+**Self-hosted [GmailBot](https://t.me/GmailBot) alternative for Telegram: your [JMAP](https://jmap.io/) mailbox — [Stalwart Mail Server](https://stalw.art), Fastmail, or any RFC 8620 provider — as native Telegram notifications.** Read, mark read, archive, and delete your mail without leaving the chat.
 
-This is the JMAP equivalent of Telegram's own GmailBot: instead of Google
-OAuth, you connect your mailbox by sending your provider's server URL and
-an API (Bearer) token directly to the bot in a private message. Because
-JMAP providers authenticate with a bearer token rather than a redirect
-flow, the bot needs no public callback URL, no webhook, and no inbound
-network exposure at all — it only makes outbound connections to Telegram
-and to your JMAP server.
+Because JMAP providers authenticate with a bearer token rather than an
+OAuth redirect flow, the bot needs no public callback URL, no webhook, and
+no inbound network exposure at all — it only makes outbound connections to
+Telegram and to your own JMAP server. Your mail credentials never transit
+a third party: the bot runs wherever you run it, next to (or on) your own
+mail server.
 
 ```mermaid
 flowchart LR
@@ -28,7 +24,7 @@ flowchart LR
         Bot --- Store
     end
     You(("You, in a\nprivate chat"))
-    JMAP[["Your JMAP server\n(Fastmail, Stalwart, ...)"]]
+    JMAP[["Your JMAP server\n(Stalwart, Fastmail, ...)"]]
 
     You -- "/login, /mute, taps ✓/🗑️" --> Bot
     Bot -- notifications, inline buttons --> You
@@ -36,9 +32,33 @@ flowchart LR
     JMAP -. "no inbound port, no webhook" .-x Bot
 ```
 
+## Why I built this
+
+I love GmailBot's concept: mail triage happens where I already live — a
+Telegram chat — with one-tap archive/delete and instant previews. What I
+don't love is what it implies: handing a third-party bot read access to my
+entire mailbox, through someone else's infrastructure, under someone
+else's data policy.
+
+I self-host my mail on a [Stalwart Mail Server](https://stalw.art), and
+Stalwart speaks [JMAP](https://jmap.io) natively — JMAP is the protocol
+Stalwart was designed around, not an add-on. So instead of choosing
+between "the bot I like" and "the privacy I want", I built the bot I
+wanted: one binary, my server, my data, the same GmailBot-style chat
+experience. Stalwart users get the deepest integration — delegated/shared
+mailboxes (`/partages`), instant push via JMAP `EventSource`, and
+autodiscovery with zero manual endpoints — see
+[Running with Stalwart](#running-with-stalwart).
+
+If you run Fastmail or any other JMAP-compliant provider, everything
+works the same way; the privacy pitch just changes from *your* server to
+*your provider's* server — either way, no bot vendor in the middle.
+
 ## Contents
 
+- [Why I built this](#why-i-built-this)
 - [Why JMAP instead of Gmail](#why-jmap-instead-of-gmail)
+- [Running with Stalwart](#running-with-stalwart)
 - [Security & privacy by design](#security--privacy-by-design)
 - [Quickstart (Docker)](#quickstart-docker)
 - [Commands](#commands)
@@ -68,6 +88,41 @@ flowchart LR
   unreachable server doesn't just fail silently in a log somewhere: after
   about a minute of being unable to reconnect, the bot sends a message
   telling you which account and why, and another once it's back.
+
+## Running with Stalwart
+
+Stalwart is the deployment this bot was designed around. No special
+configuration is needed on either side:
+
+1. **Create an API token.** In the Stalwart web admin, open your personal
+   settings and create an API token with JMAP access. This token is what
+   you'll paste into `/login` — not your account password.
+2. **Point the bot at your server.** In Telegram:
+
+   ```
+   /login https://mail.example.org <your-token>
+   ```
+
+   The bot discovers the session endpoint itself via
+   `/.well-known/jmap` (RFC 8620 autodiscovery), which Stalwart serves
+   out of the box — no manual endpoint to configure.
+
+3. **Self-hosting Stalwart on a private/LAN address?** The bot's SSRF
+   guard refuses private/loopback addresses by default. Since it's your
+   own server, opt in explicitly with `ALLOW_PRIVATE_JMAP_HOSTS=1` —
+   see [Environment variables](#environment-variables).
+
+What you get on Stalwart specifically:
+
+- **Instant push.** New mail arrives via JMAP `EventSource` (RFC 8620
+  §7.3) — no polling delay, exactly the immediacy GmailBot users expect.
+- **Delegated/shared mailboxes.** Stalwart can grant a token access to
+  other mailboxes (team inboxes, shared addresses). `/partages` lists
+  them live and toggles notifications per mailbox — see
+  [Shared mailboxes](#shared-mailboxes).
+- **Same server, same data.** Run the bot next to Stalwart (Docker
+  Compose or the Helm chart) and your mail content never leaves the
+  machine it's already on.
 
 ## Security & privacy by design
 
@@ -297,13 +352,16 @@ Tagging `vX.Y.Z` and pushing it triggers
 
 The repo is meant to look after itself between feature work:
 
-- **Dependency updates.** [Dependabot](.github/dependabot.yml) opens
-  weekly PRs for Cargo, Docker base image, and GitHub Actions updates,
-  grouped and gated by the same CI suite as any other PR.
-- **Auto-merge for routine bumps.**
-  [`dependabot-auto-merge.yml`](.github/workflows/dependabot-auto-merge.yml)
-  approves and merges patch/minor Dependabot PRs itself once CI is green;
-  major bumps are always left for manual review.
+- **Dependency updates.** [Renovate](renovate.json5) runs from a
+  dedicated self-hosted instance and opens PRs for Cargo, the Docker base
+  image (digest-pinned), and GitHub Actions — grouped, and gated by the
+  same CI suite as any other PR.
+- **Auto-merge for routine bumps.** Patch/minor updates merge themselves
+  once CI is green (Renovate automerge rules); major bumps are always
+  left for manual review.
+- **Weekly lockfile maintenance.** `Cargo.lock` is refreshed weekly so
+  transitive dependency fixes (e.g. RUSTSEC advisables in dependencies of
+  dependencies) land without waiting for an upstream release.
 - **Standing security watch.**
   [`security-audit.yml`](.github/workflows/security-audit.yml) re-runs
   `cargo audit` every week regardless of whether anything was pushed, so
