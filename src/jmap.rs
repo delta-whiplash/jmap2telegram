@@ -19,8 +19,8 @@ const SEARCH_RESULT_LIMIT: usize = 10;
 /// fingerprints exactly one port state ("connection refused" vs "timed
 /// out" vs a TLS/HTTP error, each rendered by reqwest with the full URL
 /// and OS-level TCP cause), so echoing it back to the chat would turn
-/// `/login` against an attacker-chosen hostname — or a watcher reconnect
-/// after a DNS-rebounding TOCTOU — into an internal-port-reachability
+/// `/login` against an attacker-chosen hostname - or a watcher reconnect
+/// after a DNS-rebounding TOCTOU - into an internal-port-reachability
 /// oracle (see SECURITY.md). The real cause is logged server-side instead;
 /// callers must never attach it back to the error they return, or the
 /// chain becomes one `{:?}` format away from the same leak.
@@ -35,7 +35,7 @@ pub struct EmailSummary {
     pub preview: String,
     pub received_at: Option<i64>,
     /// Attachment (name, size in bytes) pairs. Never downloaded or held in
-    /// memory — this is metadata only, so the notification can at least
+    /// memory - this is metadata only, so the notification can at least
     /// say "there's a 4 MB file here" without silently hiding it.
     pub attachments: Vec<(String, usize)>,
 }
@@ -63,7 +63,7 @@ fn attachments_of(email: &jmap_client::email::Email) -> Vec<(String, usize)> {
 /// typed into `/login`, and `AUTHORIZED_CHAT_IDS` can list several
 /// mutually-untrusted chats. Unless `allow_private_hosts` is set, any
 /// hostname that resolves to a private/loopback/link-local address is
-/// refused before we ever send it the bearer token — otherwise this
+/// refused before we ever send it the bearer token - otherwise this
 /// would be a ready-made SSRF primitive against the deployment's internal
 /// network (cluster services, cloud metadata endpoints, ...).
 ///
@@ -72,7 +72,7 @@ fn attachments_of(email: &jmap_client::email::Email) -> Vec<(String, usize)> {
 /// detailed: they describe the input the user themselves supplied, not
 /// the behavior of anything on the network. Every network-level failure
 /// past them is deliberately collapsed into the single fixed
-/// [`UNREACHABLE_SERVER_MSG`] above, with the cause logged server-side —
+/// [`UNREACHABLE_SERVER_MSG`] above, with the cause logged server-side -
 /// see that constant for why.
 pub async fn connect(server_url: &str, token: &str, allow_private_hosts: bool) -> Result<Client> {
     if !server_url.starts_with("https://") {
@@ -110,7 +110,7 @@ pub async fn connect(server_url: &str, token: &str, allow_private_hosts: bool) -
             // whatever the hostname resolves to by the time *this*
             // request re-resolves it (see the residual TOCTOU in
             // SECURITY.md). Log the cause server-side and return a bare
-            // generic error — bare, so the dropped cause can't be
+            // generic error - bare, so the dropped cause can't be
             // resurrected from the error chain either.
             tracing::warn!(
                 host = %host,
@@ -128,7 +128,7 @@ pub async fn connect(server_url: &str, token: &str, allow_private_hosts: bool) -
 /// instead of the token's personal account. `jmap-client` only tracks one
 /// default account per `Client` and every request method reads it, so a
 /// shared account needs its own dedicated `Client` rather than reusing the
-/// primary one with a mutated account id — the primary client is shared
+/// primary one with a mutated account id - the primary client is shared
 /// (`Arc`) across concurrent tasks and mutating it out from under them
 /// would race.
 pub async fn connect_shared(
@@ -144,7 +144,7 @@ pub async fn connect_shared(
 
 /// Lists every non-personal (shared/delegated) account visible in the
 /// current session, as `(account_id, display_name)` pairs. Reflects
-/// whatever the token is granted access to *right now* — the caller should
+/// whatever the token is granted access to *right now* - the caller should
 /// reconnect first if it wants a fresh view rather than a cached session
 /// from an earlier connect.
 pub fn list_shared_accounts(client: &Client) -> Vec<(String, String)> {
@@ -190,7 +190,7 @@ async fn assert_public_host(host: &str, server_url: &str) -> Result<()> {
             // A deliberate policy refusal, not a network probe result:
             // it explains a decision about a name the user themselves
             // supplied (and how to opt in), and reveals nothing about
-            // whether anything is listening anywhere — which is why,
+            // whether anything is listening anywhere - which is why,
             // unlike every transport error above and below, it stays
             // detailed enough to be actionable in the chat.
             bail!(
@@ -318,7 +318,7 @@ pub async fn fetch_changed_emails(
 
 /// Full-text search across the account (`Email/query` with a `text`
 /// filter, matching subject/body/from/to per RFC 8620 §5.5), newest first,
-/// capped at `SEARCH_RESULT_LIMIT` results. Read-only — unlike every other
+/// capped at `SEARCH_RESULT_LIMIT` results. Read-only - unlike every other
 /// action in this module, it never advances the sync cursor or changes
 /// anything server-side, so it carries none of the risk a write action
 /// would.
@@ -431,7 +431,7 @@ pub async fn mark_read(client: &Client, id: &str) -> Result<()> {
 }
 
 /// The mailbox ids a message currently sits in, taken right before a
-/// triage action moves it elsewhere — the snapshot `/undo` restores.
+/// triage action moves it elsewhere - the snapshot `/undo` restores.
 pub async fn mailbox_ids_of(client: &Client, id: &str) -> Result<Vec<String>> {
     let email = client
         .email_get(id, Some([Property::MailboxIds]))
@@ -445,7 +445,7 @@ pub async fn mailbox_ids_of(client: &Client, id: &str) -> Result<Vec<String>> {
         .collect())
 }
 
-/// Puts a message back in a specific set of mailboxes — the undo half of
+/// Puts a message back in a specific set of mailboxes - the undo half of
 /// archive/junk/delete, restoring whatever `mailbox_ids_of` snapshotted
 /// beforehand rather than assuming "back to Inbox" (a message filed into
 /// more than one mailbox should come back exactly as it was).
@@ -556,8 +556,8 @@ mod tests {
     }
 
     /// The chat-facing error for a network-level connect failure must be
-    /// a single fixed generic message. reqwest's raw transport error —
-    /// which jmap-client renders verbatim as "Transport error: …" —
+    /// a single fixed generic message. reqwest's raw transport error -
+    /// which jmap-client renders verbatim as "Transport error: …" -
     /// names the full URL and the OS-level TCP cause (e.g. "Connection
     /// refused (os error 111)" vs "timed out"), and that combination
     /// fingerprints exactly one port state on whatever the hostname
@@ -581,7 +581,7 @@ mod tests {
             "expected the fixed generic message, got: {msg}"
         );
         // Nothing that could fingerprint the host, port, URL or
-        // transport-layer cause — including the whole error chain, not
+        // transport-layer cause - including the whole error chain, not
         // just the outermost message: the cause is dropped, not attached.
         for fragment in [
             "127.0.0.1",
@@ -617,7 +617,7 @@ mod tests {
         assert!(is_disallowed_host("fe80::1".parse().unwrap()));
         // IPv4-mapped IPv6 must not bypass the IPv4 checks.
         assert!(is_disallowed_host("::ffff:127.0.0.1".parse().unwrap()));
-        // RFC 6598 CGNAT/shared address space (100.64.0.0/10) — not covered
+        // RFC 6598 CGNAT/shared address space (100.64.0.0/10) - not covered
         // by is_private(), used as internal-network space by some
         // deployments (e.g. Tailscale's default overlay range).
         assert!(is_disallowed_host("100.64.0.1".parse().unwrap()));
@@ -727,7 +727,7 @@ mod tests {
     /// redirects `/.well-known/jmap` to a same-host session path (e.g.
     /// `/jmap/session`) instead of serving the session object directly.
     /// jmap-client's `connect()` only follows a redirect to a host in its
-    /// explicit `follow_redirects` allowlist, aborting anything else — our
+    /// explicit `follow_redirects` allowlist, aborting anything else - our
     /// `connect()` wrapper must populate that allowlist with the server's
     /// own host, or every provider that redirects like this fails to log
     /// in. Caught live against a real Stalwart deployment before this test

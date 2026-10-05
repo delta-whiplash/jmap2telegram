@@ -3,7 +3,7 @@
 //! The bot has no server of its own (it's a Telegram long-poller plus JMAP
 //! EventSource watchers), so this module provides the smallest possible
 //! surface kubelet and vmagent can talk to: a hand-rolled HTTP/1.1
-//! responder on a dedicated listener — no HTTP framework dependency, no
+//! responder on a dedicated listener - no HTTP framework dependency, no
 //! shared state that can deadlock the request path.
 //!
 //! Contract, deliberately split by what each signal is *for*:
@@ -11,19 +11,19 @@
 //! - **`/healthz` (liveness) stays conservative on purpose.** It answers
 //!   200 as long as the tokio runtime is scheduling the accept loop. A
 //!   false-positive liveness kill is the worst outcome for a single-replica
-//!   stateful bot — it interrupts the Telegram poll loop and drops undo
-//!   state — so liveness deliberately does NOT encode watcher health. A
+//!   stateful bot - it interrupts the Telegram poll loop and drops undo
+//!   state - so liveness deliberately does NOT encode watcher health. A
 //!   wedged runtime (deadlocked scheduler, exhausted memory) stops the
 //!   accept loop and the kubelet timeout restarts the pod.
 //!
 //! - **`/readyz` (readiness) reflects the watchers.** 200 when every
 //!   registered watcher currently holds an open EventSource connection (or
-//!   when none are registered yet — boot, or a bot with no `/login` at
+//!   when none are registered yet - boot, or a bot with no `/login` at
 //!   all). A watcher stuck in reconnect backoff makes the pod NotReady.
 //!   There is no Service in front of this bot, so NotReady doesn't shed
 //!   traffic; what it does is surface a *silently broken* bot (revoked
-//!   token, unreachable JMAP server) in `kubectl` and — via the pod Ready
-//!   condition — in ArgoCD application health and the cluster's
+//!   token, unreachable JMAP server) in `kubectl` and - via the pod Ready
+//!   condition - in ArgoCD application health and the cluster's
 //!   ArgoCDAppDegraded alert, without restarting anything that a backoff
 //!   loop can heal on its own.
 //!
@@ -32,8 +32,8 @@
 //!   before its task starts, and boot resume (see `accounts.rs`) registers
 //!   every persisted account up-front, then retries the connect with the
 //!   watcher's own backoff. An account whose server never comes back is
-//!   therefore a *permanent* registered-but-disconnected entry — /readyz
-//!   503 naming it — and never a green pod that quietly watches nothing.
+//!   therefore a *permanent* registered-but-disconnected entry - /readyz
+//!   503 naming it - and never a green pod that quietly watches nothing.
 //!   The flip side is the pairing obligation: a registration must be
 //!   dropped on every teardown path (`Health::deregister` /
 //!   `deregister_chat`), including `handle.abort()`, since an aborted task
@@ -45,14 +45,14 @@
 //!   `jmap2telegram_last_activity_age_seconds`. `last_activity` advances
 //!   on a successful JMAP sync (EventSource wake-up or the 5-minute
 //!   fallback poll), so an age above `FALLBACK_POLL` + margin means that
-//!   watcher is neither receiving events nor completing fallback syncs —
+//!   watcher is neither receiving events nor completing fallback syncs -
 //!   alert material, not restart material.
 //!
 //! Two hardening rules apply to the wire path itself:
 //!
 //! - **Request reads are deadline-bounded** (see [`REQUEST_DEADLINE`]). A
-//!   connection that opens and then never sends a byte — a port scanner, a
-//!   wedged scraper — is closed when the deadline expires, instead of
+//!   connection that opens and then never sends a byte - a port scanner, a
+//!   wedged scraper - is closed when the deadline expires, instead of
 //!   pinning the accept-spawned task and its socket forever.
 //!
 //! - **Watcher keys are escaped before they reach a probe response.** Part
@@ -120,8 +120,8 @@ impl Health {
         self.watchers.lock().unwrap().remove(key);
     }
 
-    /// Drops every registry entry belonging to `chat_id` — primary,
-    /// shared and extra slots alike — in one sweep. The full-chat teardown
+    /// Drops every registry entry belonging to `chat_id` - primary,
+    /// shared and extra slots alike - in one sweep. The full-chat teardown
     /// in `state.rs` (`forget`, on /logout and /login) needs this because
     /// it must also clear entries for targets that have no live watcher
     /// handle to iterate over, such as a boot-resume still waiting out
@@ -238,7 +238,7 @@ async fn respond(
     // allocation-free. The read itself is deadline-bounded: a peer that
     // opens the socket and then goes silent must not pin this task and
     // the socket for the life of the process. On expiry the plainest
-    // thing is also the right one — drop the stream (which closes the
+    // thing is also the right one - drop the stream (which closes the
     // socket) without any response.
     let mut buf = [0u8; 512];
     let n = match tokio::time::timeout(request_deadline, stream.read(&mut buf)).await {
@@ -301,7 +301,7 @@ fn render_metrics(health: &Health) -> String {
          # TYPE jmap2telegram_last_activity_age_seconds gauge\n",
     );
     for (key, status) in &snapshot {
-        // Watcher keys embed the Telegram chat id and the account slot —
+        // Watcher keys embed the Telegram chat id and the account slot -
         // internal identifiers, never credentials. The JMAP account id
         // part is *not* internal though (the server picks it), so the key
         // is escaped into the label value per the text format rather than
@@ -320,7 +320,7 @@ fn render_metrics(health: &Health) -> String {
     out
 }
 
-/// Escapes a string for inclusion in a Prometheus label value — and, for
+/// Escapes a string for inclusion in a Prometheus label value - and, for
 /// consistency, in the /readyz 503 body naming the same watcher keys.
 ///
 /// The text format mandates label values be quoted with `\` (`\\`), `"`
@@ -328,7 +328,7 @@ fn render_metrics(health: &Health) -> String {
 /// a JMAP account id that the *server* chooses (see
 /// `watcher::shared_health_key`), not us: an account id containing any of
 /// those characters would, unescaped, terminate the label early and break
-/// the scrape — or, with a newline, inject whole fake metric lines into
+/// the scrape - or, with a newline, inject whole fake metric lines into
 /// the stream vmagent ingests.
 ///
 /// Real keys are almost always plain ASCII, so the common case borrows
@@ -535,7 +535,7 @@ mod tests {
 
     #[test]
     fn escape_prometheus_label_escapes_backslash_quote_and_newline() {
-        // Plain keys — the overwhelming majority — come back untouched.
+        // Plain keys - the overwhelming majority - come back untouched.
         assert_eq!(escape_prometheus_label("42/shared-acc7"), "42/shared-acc7");
         // Each character the text format forbids raw inside a label value.
         assert_eq!(escape_prometheus_label(r"a\b"), r"a\\b");
@@ -567,7 +567,7 @@ mod tests {
             .expect("per-watcher metric line present");
         // One line, label value escaped per the text format: an unescaped
         // newline would have split it, an unescaped quote closed the label
-        // early — either way this exact line would not exist.
+        // early - either way this exact line would not exist.
         assert_eq!(
             line,
             r#"jmap2telegram_last_activity_age_seconds{watcher="42/shared-a\"b\\c\nd"} +Inf"#
@@ -587,7 +587,7 @@ mod tests {
         let addr = spawn_ephemeral(health).await;
         let (status, body) = get(addr, "/readyz").await;
         assert_eq!(status, 503);
-        // The raw newline inside the key must not leak into the body — it
+        // The raw newline inside the key must not leak into the body - it
         // stays one line.
         assert_eq!(body.lines().count(), 1, "body: {body}");
         assert_eq!(

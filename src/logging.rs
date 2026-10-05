@@ -27,7 +27,7 @@ impl FormatTime for TzTimer {
 /// `tracing::*!` call.
 ///
 /// `RUST_LOG` (tracing's `EnvFilter` syntax, e.g. `jmap2telegram=debug`)
-/// always wins when set — it's the power-user escape hatch. `LOG_LEVEL`
+/// always wins when set - it's the power-user escape hatch. `LOG_LEVEL`
 /// is the simpler, documented knob for everyone else (`trace`, `debug`,
 /// `info`, `warn`, `error`); it's what shows up in a container's `docker
 /// logs`, so container orchestrators/operators don't need to know

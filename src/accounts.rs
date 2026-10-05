@@ -1,5 +1,5 @@
 //! Wraps an already-connected JMAP `Client` into the shared cache and
-//! spawns its watcher — the common tail of every "a chat just connected
+//! spawns its watcher - the common tail of every "a chat just connected
 //! (or resumed) an account" path: `/login`, `/comptes`, `/partages`'
 //! enable toggle and boot resume all end here. Kept out of
 //! `state::AppState` itself so that module stays a plain cache/lookup
@@ -8,7 +8,7 @@
 //! Boot resume is the newest tenant: [`spawn_boot_resume`] registers every
 //! persisted target in the health registry *before* any connect attempt,
 //! then retries each target's connect in its own background task on the
-//! watcher's backoff schedule (see [`crate::watcher::INITIAL_BACKOFF`]) —
+//! watcher's backoff schedule (see [`crate::watcher::INITIAL_BACKOFF`]) -
 //! so a bot restarting against a JMAP server that is still down stays
 //! /readyz-honest (the accounts show up as disconnected) while the
 //! Telegram dispatcher is already live.
@@ -28,9 +28,9 @@ use crate::watcher::{self, INITIAL_BACKOFF, WatchTarget, next_backoff};
 ///
 /// Idempotent per chat: returns `false` (dropping the fresh client)
 /// rather than spawning a second watcher when this slot already holds
-/// one. The callers that need this are the concurrency-introduced ones —
+/// one. The callers that need this are the concurrency-introduced ones -
 /// a boot-resume retry can land right after a `/login` adopted the same
-/// chat — but every caller benefits (a double-tapped inline button can't
+/// chat - but every caller benefits (a double-tapped inline button can't
 /// double-watch either).
 pub async fn adopt_primary(bot: &Bot, state: &AppState, chat_id: i64, client: JmapClient) -> bool {
     // Holding the watcher-map write lock across check-and-insert is what
@@ -58,7 +58,7 @@ pub async fn adopt_primary(bot: &Bot, state: &AppState, chat_id: i64, client: Jm
 }
 
 /// Adopts a freshly connected client for one of a chat's shared/delegated
-/// JMAP accounts. Idempotent per (chat, account) — see
+/// JMAP accounts. Idempotent per (chat, account) - see
 /// [`adopt_primary`].
 pub async fn adopt_shared(
     bot: &Bot,
@@ -91,7 +91,7 @@ pub async fn adopt_shared(
 }
 
 /// Adopts a freshly connected client for one of a chat's extra, fully
-/// independent personal accounts. Idempotent per (chat, slot) — see
+/// independent personal accounts. Idempotent per (chat, slot) - see
 /// [`adopt_primary`].
 pub async fn adopt_extra(
     bot: &Bot,
@@ -190,7 +190,7 @@ fn register_persisted_targets(state: &AppState, chat_id: i64, targets: &[ResumeT
 /// [`register_persisted_targets`]) and spawns one background resume task
 /// per target. Called from `main` for each account that survived a
 /// restart, and deliberately synchronous: the dispatcher starts right
-/// after, so boot resume never blocks the Telegram poll loop — with N
+/// after, so boot resume never blocks the Telegram poll loop - with N
 /// accounts each facing a ~10s connect timeout, the previous sequential
 /// resume delayed command handling by up to N × 10s on every boot.
 pub fn spawn_boot_resume(bot: &Bot, state: &AppState, chat_id: i64, account: &Account) {
@@ -204,18 +204,18 @@ pub fn spawn_boot_resume(bot: &Bot, state: &AppState, chat_id: i64, account: &Ac
 }
 
 /// Brings one persisted target back online after a restart: retry the
-/// JMAP connect on the watcher's backoff schedule (2s doubling to 300s —
+/// JMAP connect on the watcher's backoff schedule (2s doubling to 300s -
 /// the same policy `watcher::spawn` uses to heal a dropped stream, via
 /// the shared [`crate::watcher::INITIAL_BACKOFF`]/[`next_backoff`])
 /// until it succeeds, then hand the client over to the watcher via the
 /// `adopt_*` tail.
 ///
 /// The loop gives up only when the target stopped being worth resuming:
-/// the account was removed from the store (/logout raced the retry — the
+/// the account was removed from the store (/logout raced the retry - the
 /// matching `forget*` already deregistered the health entry) or a newer
 /// watcher already adopted the slot (a `/login` while we were still
 /// retrying pre-restart credentials, a `/partages` re-enable). Anything
-/// else — server down, token being rotated, network flapping — is just
+/// else - server down, token being rotated, network flapping - is just
 /// another round of backoff, which is what makes a persisted account no
 /// longer silently dead at boot: either its watcher comes up, or /readyz
 /// keeps saying so.
@@ -250,7 +250,7 @@ async fn resume_target_with(
         if slot_adopted(&state, chat_id, &target.target).await {
             // Someone else owns this slot now. Their watcher re-registered
             // the health entry under the same key, so the registry stays
-            // exact — we just stop instead of pointlessly retrying
+            // exact - we just stop instead of pointlessly retrying
             // credentials that were never going to be adopted anyway.
             tracing::info!(
                 chat_id,
@@ -266,7 +266,7 @@ async fn resume_target_with(
                 // connecting (the check above can't cover the connect
                 // itself): adopt_*'s idempotency guard is the
                 // linearization point, and their watcher now owns the
-                // health entry — bowing out without touching it keeps the
+                // health entry - bowing out without touching it keeps the
                 // registry exact.
                 if adopt_target(&bot, &state, chat_id, &target.target, client).await {
                     tracing::info!(chat_id, health_key = %health_key, "resumed JMAP watcher");
@@ -359,7 +359,7 @@ async fn connect_target(config: &Config, target: &ResumeTarget) -> anyhow::Resul
     }
 }
 
-/// How a resume attempt turns credentials into a live `Client` — a trait
+/// How a resume attempt turns credentials into a live `Client` - a trait
 /// (rather than a direct call) so the retry loop can be exercised in
 /// tests with canned failures and successes without standing up a real
 /// TLS JMAP server. The production impl is just [`connect_target`]; same
@@ -471,7 +471,7 @@ mod tests {
         }
     }
 
-    /// A mock JMAP session endpoint, as jmap.rs's tests build one — enough
+    /// A mock JMAP session endpoint, as jmap.rs's tests build one - enough
     /// for `Client::connect` to negotiate a session and hand back a Client
     /// whose watcher will then (harmlessly) fail its EventSource against
     /// the unmocked eventSourceUrl and keep retrying.
@@ -557,7 +557,7 @@ mod tests {
         // Regression test for the silent-green-boot bug: a dead JMAP server
         // at boot used to mean the account was never registered at all, so
         // /readyz answered 200 for a bot that was silently watching
-        // nothing. Registration must happen before any connect attempt —
+        // nothing. Registration must happen before any connect attempt -
         // verified here with zero connects having run at all.
         let (state, _dir) = state_with_account(unreachable_account()).await;
         let targets = persisted_targets(&state.store.get(42).unwrap());
@@ -593,7 +593,7 @@ mod tests {
     #[tokio::test]
     async fn a_failing_connect_keeps_the_target_registered_and_not_ready() {
         // The connect step here is the very `jmap::connect` boot resume
-        // uses, against the account's real (unreachable) server URL — the
+        // uses, against the account's real (unreachable) server URL - the
         // failure must leave the registration intact, not silently drop
         // the account back out of the registry.
         let (state, _dir) = state_with_account(unreachable_account()).await;
@@ -606,7 +606,7 @@ mod tests {
             .expect("nothing listens on port 9, connect must fail");
         // Loopback is opted into via the test config's
         // allow_private_jmap_hosts, so the failure is the transport, not
-        // the SSRF guard — matching a "server down" boot, which is what
+        // the SSRF guard - matching a "server down" boot, which is what
         // the retry loop must survive.
         assert!(!err.to_string().contains("non publique"), "{err}");
 
@@ -644,7 +644,7 @@ mod tests {
     async fn boot_resume_keeps_retrying_without_deregistering_while_the_server_is_down() {
         // Two attempts means at least one full failure → sleep → retry
         // cycle happened: the first failure must neither give up (the old
-        // behavior — "it will need /login again") nor drop the health
+        // behavior - "it will need /login again") nor drop the health
         // entry (the silent-green-boot bug).
         let (state, _dir) = state_with_account(unreachable_account()).await;
         let targets = persisted_targets(&state.store.get(42).unwrap());
@@ -679,7 +679,7 @@ mod tests {
         let snapshot = state.health.snapshot();
         assert!(snapshot.contains_key("42/primary"), "{snapshot:?}");
         assert!(!snapshot["42/primary"].connected, "{snapshot:?}");
-        // No adoption happened — the client map stays empty while the
+        // No adoption happened - the client map stays empty while the
         // server is down.
         assert!(state.clients.read().await.is_empty());
         // And /readyz keeps naming every dead account (all three targets
@@ -704,7 +704,7 @@ mod tests {
     #[tokio::test]
     async fn boot_resume_adopts_the_account_when_the_server_comes_back() {
         // One canned failure, then a working mock session: the loop must
-        // ride out the failure on backoff and finally adopt — registering
+        // ride out the failure on backoff and finally adopt - registering
         // the watcher, caching the client, and handing the health entry to
         // the watcher under the same key boot used.
         let (state, _dir) = state_with_account(unreachable_account()).await;
@@ -739,7 +739,7 @@ mod tests {
         // The watcher owns the entry from here; connected reflects its own
         // EventSource, not the connect we just did.
 
-        // And the full-chat teardown still cleans it all up — the
+        // And the full-chat teardown still cleans it all up - the
         // watchpoint this whole branch is about.
         state.forget(42).await;
         assert!(!state.health.snapshot().contains_key("42/primary"));
@@ -791,7 +791,7 @@ mod tests {
     #[tokio::test]
     async fn adopt_is_idempotent_for_every_slot_kind() {
         // Two concurrent adoptions of the same slot must not spawn two
-        // watchers — this is the guard that lets boot-resume retry
+        // watchers - this is the guard that lets boot-resume retry
         // concurrently with /partages and /login without double-watching
         // (and double-notifying) an account.
         let (state, _dir) = state_with_account(unreachable_account()).await;

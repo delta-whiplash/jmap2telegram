@@ -5,7 +5,7 @@ metadata:
   labels:
     {{- include "jmap2telegram.labels" . | nindent 4 }}
 spec:
-  # Invariant of the app, not a tunable: exactly one replica — a single
+  # Invariant of the app, not a tunable: exactly one replica - a single
   # stateful long-poller against the Telegram Bot API with one local
   # encrypted file store. Two replicas would double-notify every chat and
   # race on the same volume, so this is hardcoded and there is deliberately

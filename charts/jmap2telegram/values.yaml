@@ -4,7 +4,7 @@ image:
   repository: ghcr.io/delta-whiplash/jmap2telegram
   # Empty by default: the chart then falls back to .Chart.AppVersion, which
   # the release pipeline pins to the exact released version. A public chart
-  # must never default to a mutable tag ("latest") — installs would be
+  # must never default to a mutable tag ("latest") - installs would be
   # non-reproducible and rollbacks would silently pull different code.
   # Set explicitly only to override (e.g. testing a branch build).
   tag: ""
@@ -70,7 +70,7 @@ tolerations: []
 affinity: {}
 
 # Annotations for the pod template. Notably how the pod opts into
-# annotation-based Prometheus/vmagent discovery — the chart deliberately
+# annotation-based Prometheus/vmagent discovery - the chart deliberately
 # never injects scrape annotations itself (discovery is the scraper's
 # business, not the workload's). When metrics.service.enabled=true, wire
 # them like:

@@ -6,7 +6,7 @@
 fullname is deliberately the bare release name, not the conventional
 name+release concatenation. Do not "fix" this in passing: existing installs
 already own Secret <fullname> and PVC <fullname>-data under this scheme,
-and changing the convention would rename those resources on upgrade — Helm
+and changing the convention would rename those resources on upgrade - Helm
 would provision fresh ones instead of adopting the existing ones, orphaning
 the bot's encrypted credential store (and the token secret) behind.
 */ -}}

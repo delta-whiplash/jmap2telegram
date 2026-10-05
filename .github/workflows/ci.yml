@@ -96,7 +96,7 @@ jobs:
   gitleaks:
     # Full git history, not just the diff: a secret introduced then deleted
     # stays detectable. History is clean today (verified 2026-10-05), so no
-    # baseline file is needed — a finding should fail the build.
+    # baseline file is needed - a finding should fail the build.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7

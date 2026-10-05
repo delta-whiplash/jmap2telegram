@@ -33,7 +33,7 @@ jobs:
         env:
           # Anything typed into the dispatch form (or sneaked into a ref
           # name) must reach the shell through env, never through `run:`
-          # interpolation — bash would expand it before any validation
+          # interpolation - bash would expand it before any validation
           # below gets a chance to look at it.
           EVENT_NAME: ${{ github.event_name }}
           REF_NAME: ${{ github.ref_name }}
@@ -45,8 +45,8 @@ jobs:
           else
             version="${REF_NAME#v}"
           fi
-          # Whatever produced it — a typed dispatch input or the pushed
-          # tag's ref name — the version is only trusted once this
+          # Whatever produced it - a typed dispatch input or the pushed
+          # tag's ref name - the version is only trusted once this
           # whole-string check has passed; `[[ =~ ]]` anchors against the
           # entire variable, unlike grep, which anchors per line and so
           # would wave through a multi-line value whose second line is a
@@ -67,7 +67,7 @@ jobs:
         run: |
           set -euo pipefail
           # A manual dispatch always means "release what's at this ref
-          # right now" — so an existing tag for this version gets moved
+          # right now" - so an existing tag for this version gets moved
           # to the dispatched commit rather than silently reused, or a
           # rebuild from an unrelated later commit would build the wrong
           # code while the tag/release still pointed at the old one.
@@ -163,7 +163,7 @@ jobs:
           sed -i "s/^version:.*/version: ${VERSION}/" charts/jmap2telegram/Chart.yaml
           # appVersion keeps the leading v: docker/metadata-action publishes
           # only vX.Y.Z / X.Y / X / latest, and the chart resolves an empty
-          # image.tag to appVersion — a bare version there was an
+          # image.tag to appVersion - a bare version there was an
           # ImagePullBackOff waiting for default-value installs (the bug
           # behind v0.1.1's chart). Chart *version* itself stays bare, per
           # helm convention.

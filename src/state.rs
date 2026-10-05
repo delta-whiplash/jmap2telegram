@@ -15,18 +15,18 @@ type SharedAccountKey = (i64, String);
 
 /// (chat id, our own generated slot id): identifies one of a chat's extra,
 /// fully independent JMAP accounts. A separate key space from
-/// `SharedAccountKey` on purpose — see `store::Account::extra_accounts`.
+/// `SharedAccountKey` on purpose - see `store::Account::extra_accounts`.
 type ExtraAccountKey = (i64, String);
 
 /// How long `/undo` (the "↩️ Annuler" button left after a triage action)
 /// stays valid. Deliberately short and in-memory only: this is a "catch an
-/// accidental tap" safety net, not a durable trash — a bot restart or the
+/// accidental tap" safety net, not a durable trash - a bot restart or the
 /// window elapsing just means the action stands, same as if undo never
 /// existed.
 pub const UNDO_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// A pending undo for the last triage action (archive/spam/delete) taken
-/// on a chat's notification, keyed by chat id — one slot per chat, so a
+/// on a chat's notification, keyed by chat id - one slot per chat, so a
 /// second action before the first is undone simply replaces it, matching
 /// "undo the last thing" rather than a full history.
 #[derive(Clone)]
@@ -65,7 +65,7 @@ pub struct AppState {
     pub shared_clients: Arc<RwLock<HashMap<SharedAccountKey, Arc<JmapClient>>>>,
     pub shared_watchers: Arc<RwLock<HashMap<SharedAccountKey, JoinHandle<()>>>>,
     /// Same idea again, for extra fully independent personal accounts
-    /// (their own server/token, added via `/comptes`) — kept in maps of
+    /// (their own server/token, added via `/comptes`) - kept in maps of
     /// their own rather than reusing `shared_clients`/`shared_watchers` so
     /// a shared-account JMAP id can never collide with a generated extra-
     /// account slot id in the same cache.
@@ -94,7 +94,7 @@ impl AppState {
     }
 
     /// Shared cache-lookup step for every `client_for*` method below: all
-    /// three follow the same "already cached? return it — otherwise the
+    /// three follow the same "already cached? return it - otherwise the
     /// caller resolves credentials and connects" shape, differing only in
     /// which map and key type they use.
     async fn cached<K: Eq + std::hash::Hash>(
@@ -223,7 +223,7 @@ impl AppState {
         // pin /readyz at 503 for an account nobody is watching anymore.
         // One prefix sweep covers the primary mailbox, every shared and
         // every extra slot, *and* targets that hold a registry entry but
-        // no live handle to iterate over here — e.g. a boot-resume still
+        // no live handle to iterate over here - e.g. a boot-resume still
         // waiting out its retry backoff (see accounts.rs).
         self.health.deregister_chat(chat_id);
 
@@ -233,7 +233,7 @@ impl AppState {
 
     /// Drops every cached client and aborts every watcher belonging to
     /// `chat_id` from a (client-map, watcher-map) pair keyed by `(chat_id,
-    /// _)` — the shared bulk-teardown step `forget` needs once per account
+    /// _)` - the shared bulk-teardown step `forget` needs once per account
     /// kind (shared accounts, extra accounts).
     async fn forget_all_for_chat<K>(
         clients: &RwLock<HashMap<(i64, K), Arc<JmapClient>>>,
@@ -257,8 +257,8 @@ impl AppState {
     /// chat's own mailbox and its other shared accounts untouched. Used
     /// when a single shared account is toggled off via /partages.
     pub async fn forget_shared(&self, chat_id: i64, account_id: &str) {
-        // Same deregister obligation as `forget` above — an aborted
-        // watcher task can't clean up after itself — keyed exactly like
+        // Same deregister obligation as `forget` above - an aborted
+        // watcher task can't clean up after itself - keyed exactly like
         // `watcher::spawn` keys it, and unconditional on purpose: the
         // entry exists (registered by the watcher, or at boot before its
         // first connect attempt) even when no handle sits in the map
@@ -296,7 +296,7 @@ mod tests {
 
     /// An `AppState` pair around a throwaway encrypted store. The Config
     /// here is never exercised for anything the tests below touch (no JMAP
-    /// connects, no Telegram requests) — it just has to exist.
+    /// connects, no Telegram requests) - it just has to exist.
     async fn test_state() -> (AppState, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let config = Arc::new(Config {
@@ -316,7 +316,7 @@ mod tests {
         tokio::spawn(std::future::pending::<()>())
     }
 
-    /// Registers — and marks connected — the health entries a fully online
+    /// Registers - and marks connected - the health entries a fully online
     /// chat 42 would hold: its primary mailbox plus one shared and one
     /// extra account, keyed exactly as `watcher::spawn` derives them.
     fn register_chat_42_targets(state: &AppState) {
@@ -386,8 +386,8 @@ mod tests {
 
     #[tokio::test]
     async fn forget_clears_entries_of_targets_without_a_running_watcher() {
-        // Boot-resume shape (see accounts.rs): the registry entry exists —
-        // registered *before* the first connect attempt — but no handle
+        // Boot-resume shape (see accounts.rs): the registry entry exists -
+        // registered *before* the first connect attempt - but no handle
         // sits in the watcher maps yet. A /logout racing that retry must
         // still clear the entry, or /readyz would never recover.
         let (state, _dir) = test_state().await;

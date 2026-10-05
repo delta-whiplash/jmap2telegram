@@ -2,7 +2,7 @@
 name = "jmap2telegram"
 version = "0.5.2"
 edition = "2024"
-# "Cardinal Code Open1 Attribution License" — a custom text, so Cargo/
+# "Cardinal Code Open1 Attribution License" - a custom text, so Cargo/
 # crates.io point at it via license-file rather than an SPDX license id
 # (license and license-file are mutually exclusive in Cargo.toml).
 license-file = "LICENSE"
@@ -17,7 +17,7 @@ chrono-tz = "0.10.4"
 futures-util = "0.3.34"
 # default-features = false matters here: jmap-client's defaults are
 # [async, websockets, aws_lc_rs] and we only need `async` (plain
-# HTTP + EventSource, not JMAP-over-WebSocket) — this drops the unused
+# HTTP + EventSource, not JMAP-over-WebSocket) - this drops the unused
 # tokio-tungstenite/tungstenite stack entirely. It does NOT drop
 # aws-lc-sys (still the single biggest compile-time cost in this
 # project, ~75s of C/assembly): jmap-client's [dependencies.reqwest]
@@ -25,7 +25,7 @@ futures-util = "0.3.34"
 # any of its own optional flags), and on reqwest 0.13.x that feature
 # name resolves to the aws-lc-rs backend. teloxide-core still pins the
 # older reqwest 0.12.x, whose equivalently-named "rustls-tls" feature
-# resolves to `ring` instead — two incompatible reqwest majors that
+# resolves to `ring` instead - two incompatible reqwest majors that
 # Cargo can't merge, so both TLS backends get compiled. Not fixable from
 # here without patching one of the two upstream crates; see README.
 jmap-client = { version = "0.4.2", default-features = false, features = ["async"] }

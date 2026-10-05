@@ -35,7 +35,7 @@ pub struct Account {
     /// server_url + token, not delegated access under the primary
     /// account's token) connected via `/comptes <url> <token>`, keyed by an
     /// id we generate ourselves (`generate_slot_id`) rather than anything
-    /// the JMAP server issues — deliberately a different key space from
+    /// the JMAP server issues - deliberately a different key space from
     /// `shared_accounts` so the two can never collide, since two unrelated
     /// JMAP servers could otherwise coincidentally assign the same account
     /// id string.
@@ -43,7 +43,7 @@ pub struct Account {
     pub extra_accounts: HashMap<String, ExtraAccount>,
     /// Lowercased sender-address/keyword filters from `/mute`: a new
     /// message whose sender or subject contains any of these is not
-    /// notified about (the JMAP sync cursor still advances past it — this
+    /// notified about (the JMAP sync cursor still advances past it - this
     /// is purely "don't tell me about this", not "don't sync it").
     /// Applies across the chat's own mailbox and every shared/extra account.
     #[serde(default)]
@@ -62,7 +62,7 @@ pub struct SharedAccount {
 }
 
 /// A second (or third, ...) fully independent JMAP account connected to
-/// the same chat via `/comptes <url> <token>` — its own server and token,
+/// the same chat via `/comptes <url> <token>` - its own server and token,
 /// not a delegated account under the primary login. Shape mirrors
 /// `Account` minus the nested shared/extra/muted fields, which only the
 /// primary slot carries.
@@ -232,7 +232,7 @@ impl Store {
 
     /// Connects a second (or third, ...) fully independent JMAP account to
     /// a chat, under a freshly generated slot id. No-ops (without error,
-    /// returning `None`) if the chat has no primary account yet — an extra
+    /// returning `None`) if the chat has no primary account yet - an extra
     /// account only makes sense alongside one. Returns the generated slot
     /// id on success, so the caller can spawn its watcher against it.
     pub fn add_extra_account(&self, chat_id: i64, account: ExtraAccount) -> Result<Option<String>> {
@@ -378,7 +378,7 @@ impl Store {
         // data durable. Best-effort on purpose: some filesystems (network
         // volumes, older FUSE mounts) refuse directory fsync outright, and
         // failing persist() for that would make the bot unusable for no
-        // benefit — the file content itself is already synced, so the
+        // benefit - the file content itself is already synced, so the
         // worst case is that the previous consistent state survives.
         if let Some(parent) = self.state_path.parent()
             && let Err(e) = fs::File::open(parent).and_then(|dir| dir.sync_all())
@@ -397,7 +397,7 @@ fn load_or_create_key(key_path: &Path) -> Result<[u8; KEY_LEN]> {
         // create_new() + mode(0600) makes the file appear on disk already
         // owner-only: the mode is part of the open(2) that creates the
         // inode, so there is no instant at which the key is readable by
-        // group/others — unlike the previous write-then-chmod, which left
+        // group/others - unlike the previous write-then-chmod, which left
         // a crash window (and a 0644 key on disk) whenever the process
         // died between fs::write and set_permissions. The mode is still
         // subject to umask, but a umask can only clear permission bits,
@@ -414,7 +414,7 @@ fn load_or_create_key(key_path: &Path) -> Result<[u8; KEY_LEN]> {
                 f.write_all(&key).context("writing master key")?;
                 // sync_all() before returning: a crash right after this
                 // must never leave a zero-length or partially-written key
-                // behind — every subsequent boot would then refuse to
+                // behind - every subsequent boot would then refuse to
                 // start ("unexpected length") while the state file stays
                 // undecryptable forever.
                 f.sync_all()
@@ -434,9 +434,9 @@ fn load_or_create_key(key_path: &Path) -> Result<[u8; KEY_LEN]> {
 
     // The key file existed on entry (or another process just created it):
     // verify it is still 0600 before trusting it. Anything could have
-    // widened the mode after creation — an operator restoring from a
+    // widened the mode after creation - an operator restoring from a
     // backup that dropped permissions, a `cp` that recreated the file,
-    // a container image rebuild — and this key decrypts the whole state
+    // a container image rebuild - and this key decrypts the whole state
     // file, so quietly tighten it back instead of trusting the mode to
     // have survived. Only *widenings* are fixed: a stricter mode (e.g.
     // 0400) is left alone, since resetting it to 0600 would grant the
@@ -587,7 +587,7 @@ mod tests {
 
     /// `load_or_create_key` creates the key with `create_new()` + mode
     /// 0600, so the file is born owner-only even under the most permissive
-    /// umask — unlike the previous `fs::write` + chmod, which first created
+    /// umask - unlike the previous `fs::write` + chmod, which first created
     /// it 0644 and only then tightened it. umask(2) is process-global and
     /// all tests share one process, so setting it in-process would leak
     /// into concurrently running tests; instead re-exec this same test
@@ -613,7 +613,7 @@ mod tests {
     }
 
     /// Child half of the permissive-umask test above: only ever run by it,
-    /// via `sh` with `umask 0000` (hence #[ignore] — a plain `cargo test`
+    /// via `sh` with `umask 0000` (hence #[ignore] - a plain `cargo test`
     /// must not pick it up, the parent passes `--ignored` explicitly).
     #[test]
     #[ignore = "in-process child; driven by master_key_is_created_0600_even_under_a_permissive_umask"]

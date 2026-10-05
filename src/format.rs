@@ -5,14 +5,14 @@ use crate::jmap::EmailSummary;
 
 /// Telegram's hard limit for a single message's text, counted in UTF-16
 /// code units (the Bot API's unit for message length), not in Rust chars
-/// — see `chunk_text` for why the distinction matters.
+/// - see `chunk_text` for why the distinction matters.
 pub const TELEGRAM_MAX_MESSAGE_LEN: usize = 4096;
 
 /// Every field below (subject, sender name, preview) comes straight from
 /// whatever mail showed up in the mailbox, so all of them are bounded
 /// before being sent: an unbounded field could push the rendered message
 /// past Telegram's 4096-char limit, and `send_message` would then fail
-/// for that notification alone — silently and permanently losing it,
+/// for that notification alone - silently and permanently losing it,
 /// since the JMAP sync cursor still advances past it.
 const FIELD_LIMIT: usize = 300;
 const PREVIEW_LIMIT: usize = 400;
@@ -68,7 +68,7 @@ pub fn notification_text(summary: &EmailSummary, tz: Tz, account_label: Option<&
 
 /// Attachments are never downloaded (this bot fetches message bodies on
 /// demand only, never files), but naming them means "there's a 4 MB PDF
-/// here" isn't silently invisible — just capped at a handful of names so a
+/// here" isn't silently invisible - just capped at a handful of names so a
 /// message with hundreds of parts can't blow out the notification.
 fn attachments_field(attachments: &[(String, usize)]) -> String {
     if attachments.is_empty() {
@@ -82,7 +82,7 @@ fn attachments_field(attachments: &[(String, usize)]) -> String {
         .map(|(name, size)| {
             // The parens here are literal text, not link syntax, so they
             // need the same MarkdownV2 escaping as any other reserved
-            // character — an unescaped '(' or ')' would otherwise make
+            // character - an unescaped '(' or ')' would otherwise make
             // Telegram reject the whole message with a 400.
             format!(
                 "{} \\({}\\)",
@@ -98,7 +98,7 @@ fn attachments_field(attachments: &[(String, usize)]) -> String {
     let extra = attachments.len().saturating_sub(MAX_SHOWN);
     let suffix = if extra > 0 {
         // '+', '(' and ')' are all MarkdownV2-reserved even as plain,
-        // bot-generated text — same class of bug as the per-attachment
+        // bot-generated text - same class of bug as the per-attachment
         // parens above.
         format!(" \\(\\+{extra} autres\\)")
     } else {
@@ -122,7 +122,7 @@ fn human_size(bytes: usize) -> String {
 }
 
 /// Renders the sender as a `mailto:` link when an address is available, so
-/// tapping it opens the recipient's mail app — a small but genuinely useful
+/// tapping it opens the recipient's mail app - a small but genuinely useful
 /// bit of native richness GmailBot doesn't offer. Falls back to plain
 /// escaped text when there's nothing to link (no address, or an address
 /// that's entirely whitespace/control characters once sanitized).
@@ -203,7 +203,7 @@ fn action_callback_data(action: char, account_id: Option<&str>, email_id: &str) 
 }
 
 /// `already_read` swaps the "✅ Lu" action button for an inert "✔️ Lu"
-/// label (still a valid, tappable no-op button rather than a dead one) —
+/// label (still a valid, tappable no-op button rather than a dead one) -
 /// used to edit a notification's keyboard in place right after marking it
 /// read, so the chat itself reflects that state instead of staying silent
 /// about it until the next glance at the mailbox.
@@ -324,8 +324,8 @@ fn escape_markdown(input: &str) -> String {
 /// message size limit, breaking on line boundaries where possible.
 ///
 /// Telegram measures message length in UTF-16 code units, not in Rust
-/// chars (Unicode scalar values): an emoji outside the BMP — 😀, U+1F600
-/// — costs one `char` but two UTF-16 units, so budgeting in `chars()`
+/// chars (Unicode scalar values): an emoji outside the BMP (😀, U+1F600)
+/// costs one `char` but two UTF-16 units, so budgeting in `chars()`
 /// would let an emoji-heavy body produce chunks Telegram rejects as
 /// "message is too long" despite the char count saying they fit. Every
 /// budget below is therefore maintained in the same unit Telegram
@@ -348,7 +348,7 @@ pub fn chunk_text(text: &str, max_len: usize) -> Vec<String> {
         }
         if line_len > max_len {
             // A single line longer than a whole message: split it at
-            // char boundaries, never mid-surrogate-pair — accumulating
+            // char boundaries, never mid-surrogate-pair - accumulating
             // one char at a time guarantees that, and a lone half-pair
             // would render as U+FFFD even if Telegram accepted it.
             for c in line.chars() {
@@ -473,7 +473,7 @@ mod tests {
 
     #[test]
     fn notification_text_truncates_malicious_long_sender_address() {
-        // The sender name isn't the only unbounded field JMAP hands us —
+        // The sender name isn't the only unbounded field JMAP hands us -
         // a crafted long From address must be capped too, whether or not
         // a display name is also present.
         let long_addr = format!("{}@example.org", "a".repeat(5000));
@@ -735,7 +735,7 @@ mod tests {
     #[test]
     fn chunk_text_budgets_in_utf16_units_for_astral_emoji() {
         // Telegram measures message length in UTF-16 code units, where
-        // an astral emoji costs two — a body that fits "4096 chars" can
+        // an astral emoji costs two - a body that fits "4096 chars" can
         // still be twice the real budget. This one is 10 000 chars but
         // 20 000 UTF-16 units, so under the old char-based chunker it
         // would have produced five "fits in 4096" chunks that Telegram

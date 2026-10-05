@@ -1,8 +1,8 @@
 {
-  // Renovate — jmap2telegram (instance DW, self-hosted dans le cluster
+  // Renovate - jmap2telegram (instance DW, self-hosted dans le cluster
   // pemberton : projects/system/renovate-dw). Remplace Dependabot +
   // dependabot-auto-merge.yml (supprimés) : un seul bot, automerge natif,
-  // lockFileMaintenance — ce que Dependabot ne couvrait pas.
+  // lockFileMaintenance - ce que Dependabot ne couvrait pas.
   $schema: "https://docs.renovatebot.com/renovate-schema.json",
   extends: [
     "config:recommended",
@@ -51,7 +51,7 @@
     },
   ],
 
-  // Refresh Cargo.lock sans bump de version (CVE transitives) — hebdo.
+  // Refresh Cargo.lock sans bump de version (CVE transitives) - hebdo.
   lockFileMaintenance: {
     enabled: true,
     schedule: ["before 5am on monday"],

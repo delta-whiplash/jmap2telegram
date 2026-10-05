@@ -34,7 +34,7 @@ pub(crate) fn next_backoff(current: Duration) -> Duration {
 /// How many *consecutive* failures to even open the EventSource connection
 /// (not counting a later drop of an already-working stream, which the
 /// backoff/retry loop already handles fine) before we tell the user
-/// something is actually wrong — e.g. a revoked token, not just a blip.
+/// something is actually wrong - e.g. a revoked token, not just a blip.
 /// With the doubling backoff below (2s, 4s, 8s, 16s, 32s, ...) this fires
 /// after roughly a minute of total inability to connect.
 const FAILURE_NOTIFY_THRESHOLD: u32 = 5;
@@ -113,7 +113,7 @@ impl WatchTarget {
 
     /// Registry key for the health endpoint: stable, unique per watched
     /// account within a chat, and readable in `kubectl` output and metric
-    /// labels. Embeds the chat id and the account slot — internal
+    /// labels. Embeds the chat id and the account slot - internal
     /// identifiers only, never credentials.
     pub(crate) fn health_key(&self, chat_id: i64) -> String {
         match self {
@@ -135,7 +135,7 @@ impl WatchTarget {
 
 /// Health-registry key for one shared account's watcher, for teardown
 /// sites (`state.rs`'s `forget_shared`) that only know the slot
-/// identifiers, never the display label — which plays no part in
+/// identifiers, never the display label - which plays no part in
 /// [`WatchTarget::health_key`] anyway. Building the minimal target and
 /// reusing the same key builder the watcher itself uses keeps the key
 /// format defined in exactly one place.
@@ -161,9 +161,9 @@ pub(crate) fn extra_health_key(chat_id: i64, slot_id: &str) -> String {
 /// runtime error at all: the last connect/stream error used to be
 /// rendered here verbatim, and against a server hostname an attacker can
 /// influence (see the residual DNS-rebinding TOCTOU in SECURITY.md,
-/// "SSRF via /login") that verbatim transport error — jmap-client's
-/// Display for it is "Transport error: <full URL + OS-level TCP cause>"
-/// — is an internal-port-reachability oracle landing directly in the
+/// "SSRF via /login") that verbatim transport error - jmap-client's
+/// Display for it is "Transport error: <full URL + OS-level TCP cause>",
+/// which is an internal-port-reachability oracle landing directly in the
 /// attacker's chat. Every failure is already traced server-side by the
 /// reconnect loop below, so the notice points at the logs instead of
 /// quoting the error. Keep it that way: no `{}` of an error, ever.
@@ -226,7 +226,7 @@ pub fn spawn(
                     tracing::warn!(chat_id, error = %e, "watcher JMAP EventSource error, reconnecting");
                     // Le stream vient de tomber (ou n'a jamais ouvert) : le
                     // registre health doit le refléter dès maintenant, sinon
-                    // /readyz reste 200 pendant tout le backoff — exactement
+                    // /readyz reste 200 pendant tout le backoff - exactement
                     // la panne silencieuse qu'il est censé signaler.
                     state.health.set_connected(&health_key, false);
 
@@ -373,7 +373,7 @@ async fn sync_and_notify(
 /// subject or sender (name or address). Matching is deliberately broad
 /// (substring, case-insensitive) rather than exact-address matching, so
 /// `/mute newsletter` also catches `newsletter@example.org` and a subject
-/// containing "Newsletter" — the same trade-off GmailBot's own Blacklist
+/// containing "Newsletter" - the same trade-off GmailBot's own Blacklist
 /// makes. The JMAP sync cursor still advances past a muted message; this
 /// only decides whether to notify, not whether to see it as unread later.
 fn is_muted(summary: &jmap::EmailSummary, muted: &[String]) -> bool {
@@ -521,7 +521,7 @@ mod tests {
         assert_eq!(shared_health_key(42, "acc7"), "42/shared-acc7");
         assert_eq!(extra_health_key(42, "slot1"), "42/extra-slot1");
         // The teardown helpers must derive exactly the key a real watcher
-        // registers, including when the label differs — the label never
+        // registers, including when the label differs - the label never
         // participates in the key.
         assert_eq!(
             shared_health_key(42, "acc7"),
@@ -592,9 +592,9 @@ mod tests {
     /// Regression test for the SSRF error oracle: the "connection broken"
     /// notice used to interpolate the last runtime error verbatim, and
     /// that error is the raw jmap-client transport error (its Display is
-    /// "Transport error: <full URL + OS-level TCP cause>"), which —
+    /// "Transport error: <full URL + OS-level TCP cause>"), which -
     /// especially after the DNS-rebinding TOCTOU documented in
-    /// SECURITY.md — reads back as a port-state fingerprint of whatever
+    /// SECURITY.md - reads back as a port-state fingerprint of whatever
     /// the watched account's hostname currently resolves to. The notice
     /// must interpolate no error at all; the details live in the
     /// server-side tracing::warn of the reconnect loop.

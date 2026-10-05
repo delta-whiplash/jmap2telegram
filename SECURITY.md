@@ -14,7 +14,7 @@
   ciphertext files are created with `0600` permissions.
 - **Credential exposure in transit.** All outbound connections (Telegram
   Bot API, JMAP server) use TLS (`rustls`, no OpenSSL/native-tls in the
-  dependency tree at all — see `Cargo.toml`).
+  dependency tree at all - see `Cargo.toml`).
 - **Credential exposure in the chat itself.** The `/login` message
   containing the bearer token is deleted from the chat immediately after
   the bot reads it (Telegram allows bots to delete incoming messages in
@@ -33,21 +33,21 @@
   push a notification past Telegram's 4096-char message limit and get it
   silently dropped (the JMAP sync cursor still advances either way).
 - **Data retention.** No email content (subject, body, sender) is ever
-  persisted to disk — only an opaque JMAP sync cursor (`state`) is stored,
+  persisted to disk - only an opaque JMAP sync cursor (`state`) is stored,
   which identifies a point in the server's change log, not any message
   content. `/logout` deletes the stored account synchronously and
   durably; nothing is soft-deleted or retained.
 - **Shared JMAP accounts (`/partages`).** A shared/delegated mailbox is
   only ever offered for opt-in if the connected token is already granted
   access to it by the JMAP server itself (`/partages` lists exactly what
-  `session.accounts()` returns for that token) — the bot cannot expand
+  `session.accounts()` returns for that token) - the bot cannot expand
   access beyond what the server already granted. Opting in stores the
   same minimal shape as the primary account (account id, display name,
   sync cursor; no content), and opting out or `/logout` erases it the
   same way.
 - **Extra personal accounts (`/comptes`).** A second (or third, ...)
-  fully independent JMAP account — its own server and token, not
-  delegated access — goes through the exact same `connect()` path as
+  fully independent JMAP account - its own server and token, not
+  delegated access - goes through the exact same `connect()` path as
   `/login`, so it gets the same SSRF guard and TLS requirements below.
   Its credentials are stored with the same shape and the same encrypted
   file as the primary account; disconnecting it or `/logout` erases it
@@ -58,13 +58,13 @@
   mutually-untrusted chats. By default, any hostname that resolves to a
   private/loopback/link-local/multicast address (including the
   `169.254.169.254` cloud metadata endpoint) is refused before the
-  bearer token is ever sent to it — otherwise `/login` would be a
+  bearer token is ever sent to it - otherwise `/login` would be a
   ready-made SSRF probe of the deployment's internal network. The
   guard's own refusal stays detailed (it explains a policy decision
   about a name the user themselves supplied, not a probe result);
-  every *network-level* failure past it — DNS resolution, TCP/TLS
+  every *network-level* failure past it - DNS resolution, TCP/TLS
   connect, autodiscovery, session negotiation, authentication, and the
-  watcher's EventSource reconnects — is by contrast collapsed into a
+  watcher's EventSource reconnects - is by contrast collapsed into a
   single fixed generic chat message, with the real cause logged
   server-side only. That is error-oracle neutralization: a raw reqwest
   transport error names the full URL plus the OS-level TCP cause
@@ -79,15 +79,15 @@
   `src/watcher.rs`). Self-hosters who deliberately run their JMAP server
   on an internal network can opt back in with
   `ALLOW_PRIVATE_JMAP_HOSTS=1`; this re-enables the requests themselves
-  but not the error oracle — even opted in, network failures still only
+  but not the error oracle - even opted in, network failures still only
   ever produce the generic chat message.
 
-  Residual risk — a known, accepted TOCTOU: the guard resolves the
+  Residual risk - a known, accepted TOCTOU: the guard resolves the
   hostname once, right before the session handshake, and `jmap-client`
   re-resolves on every request (the crate builds its own internal
   `reqwest::Client` per call site: the session handshake and
   `send_request` in `src/client.rs`, the EventSource stream in
-  `src/event_source/stream.rs`, blob upload/download — all inside the
+  `src/event_source/stream.rs`, blob upload/download - all inside the
   crate), so a DNS answer that changes between the check and the
   actual request (rebinding) is not covered. With the error oracle
   closed, rebinding no longer leaks port states: an attacker can still
@@ -95,7 +95,7 @@
   token) toward internal addresses, but cannot read the results back.
   Two minor channels remain and are accepted: a success bit (the
   "✅ connecté" reply if an internal service both spoke JMAP and
-  accepted the attacker's arbitrary token — vanishingly unlikely) and
+  accepted the attacker's arbitrary token - vanishingly unlikely) and
   response latency (fast refusal vs slow timeout, heavily
   noise-washed by the connect timeout and ordinary network jitter).
   Treat `ALLOW_PRIVATE_JMAP_HOSTS` as "trust this deployment's
@@ -118,7 +118,7 @@
   the addresses the SSRF guard validated. Until that exists, the only
   real fixes are a `[patch.crates-io]` fork carrying the same resolver
   propagation, or reimplementing the session handshake and EventSource
-  on top of our own `reqwest::Client` — both deliberately out of scope
+  on top of our own `reqwest::Client` - both deliberately out of scope
   for now.
 - **Group chats.** The bot only responds in private (1:1) chats. A group
   chat id in `AUTHORIZED_CHAT_IDS` would otherwise hand every current and
@@ -157,34 +157,34 @@ policies, signed-off procedures) that the *deployer* carries out, not
 something a codebase can claim on its own. What follows is an honest
 mapping of the technical controls actually implemented here to the
 requirements each framework cares about, so a deployer's own compliance
-work starts from an accurate picture rather than from zero — not a claim
+work starts from an accurate picture rather than from zero - not a claim
 of certification.
 
 ### GDPR
 
-- **Art. 5(1)(c) data minimization** — the only data ever persisted is
+- **Art. 5(1)(c) data minimization** - the only data ever persisted is
   what `/login` needs to keep working: JMAP server URL, bearer token,
   the account's email address, and an opaque sync cursor. No message
   content (subject, body, sender) ever touches disk.
 - **Art. 5(1)(f) / Art. 32 integrity, confidentiality, security of
-  processing** — AES-256-GCM at rest, TLS (rustls) in transit, a hard
+  processing** - AES-256-GCM at rest, TLS (rustls) in transit, a hard
   per-chat access allowlist, and (see above) a documented threat model
   covering SSRF, injection, and resource-exhaustion classes of risk.
-- **Art. 17 right to erasure** — `/logout` deletes the chat's stored
+- **Art. 17 right to erasure** - `/logout` deletes the chat's stored
   record synchronously and durably; nothing is soft-deleted, queued, or
   retained past that call.
-- **Art. 25 data protection by design and by default** — the "two env
+- **Art. 25 data protection by design and by default** - the "two env
   vars, everything else live in chat" design *is* the privacy posture:
   there's no config file, CI secret, or support ticket that could ever
   contain a user's JMAP credentials except the encrypted on-disk store
   itself.
-- **Art. 33/34 breach notification** — this is an operational duty of
+- **Art. 33/34 breach notification** - this is an operational duty of
   whoever deploys and operates the bot (the data controller), not
   something the software can discharge for them. What the software gives
   them going in: a breach of the encrypted store exposes JMAP tokens and
   the deployment key, but never historical email content, since none is
   stored.
-- **Controller/processor roles** — a self-hosting deployer is the data
+- **Controller/processor roles** - a self-hosting deployer is the data
   controller for their users' data; Telegram (message transport) and the
   chosen JMAP provider (mail hosting) act as processors/sub-processors
   under their own terms. Confirming that arrangement is suitable is the
@@ -192,17 +192,17 @@ of certification.
 
 ### ISO/IEC 27001 (Annex A, 2022)
 
-Controls this codebase directly supports: **A.8.24** (cryptography —
-AES-256-GCM, TLS), **A.8.9** (configuration management — the Helm chart's
+Controls this codebase directly supports: **A.8.24** (cryptography -
+AES-256-GCM, TLS), **A.8.9** (configuration management - the Helm chart's
 explicit `securityContext`, non-root, read-only rootfs), **A.8.3 / A.8.2**
-(access restriction — the chat allowlist, private-chat-only enforcement),
-**A.8.12** (data leakage prevention — data minimization, no content
-persistence), **A.8.28 / A.8.29** (secure coding and security testing —
+(access restriction - the chat allowlist, private-chat-only enforcement),
+**A.8.12** (data leakage prevention - data minimization, no content
+persistence), **A.8.28 / A.8.29** (secure coding and security testing -
 `clippy -D warnings`, `cargo audit`, the CI test suite, and two rounds of
 independent adversarial review whose findings are fixed and recorded in
-git history), **A.5.7 / A.8.8** (vulnerability management — Dependabot +
+git history), **A.5.7 / A.8.8** (vulnerability management - Dependabot +
 `cargo audit` gating every CI run), and **A.5.24–5.28** (incident
-handling — the reporting process below). Building an ISMS around this
+handling - the reporting process below). Building an ISMS around this
 (risk register, management review, internal audit) is the deployer's
 work; the technical controls above are what that ISMS would find in
 place.
@@ -210,7 +210,7 @@ place.
 ### NIS2 (Directive (EU) 2022/2555, Art. 21 risk-management measures)
 
 NIS2 obligations attach to "essential"/"important" entities, not to a
-piece of software — but its Art. 21 measures map cleanly to what's here:
+piece of software - but its Art. 21 measures map cleanly to what's here:
 supply-chain security (**Dependabot** across cargo/Docker/GitHub Actions,
 plus `cargo audit` in CI), vulnerability handling and disclosure (this
 file's reporting process), cryptography (TLS + AES-256-GCM), access
@@ -225,7 +225,7 @@ software layers MFA on top of).
 ### PCI-DSS
 
 **Not applicable.** This application never processes, stores, or
-transmits payment card data (PAN, CVV, expiry) in any form — there is no
+transmits payment card data (PAN, CVV, expiry) in any form - there is no
 cardholder data environment here to bring into PCI-DSS scope.
 
 ## Reporting a vulnerability

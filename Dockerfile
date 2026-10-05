@@ -4,7 +4,7 @@
 # allocator makes multi-core rustc/cargo builds noticeably slower than
 # glibc for a dependency tree this size, and that difference is the
 # dominant cost in CI, not final image size (we don't ship OpenSSL either
-# way — TLS is rustls end to end, so glibc adds no extra runtime
+# way - TLS is rustls end to end, so glibc adds no extra runtime
 # dependency risk). The runtime stage is distroless: no shell, no package
 # manager, nothing beyond the binary, libc, and CA roots.
 
@@ -45,7 +45,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     && strip /build/jmap2telegram
 
 FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
-# distroless nonroot's fixed identity (65532:65532) — keep the Helm
+# distroless nonroot's fixed identity (65532:65532) - keep the Helm
 # chart's securityContext in sync with this.
 COPY --from=builder /build/jmap2telegram /usr/local/bin/jmap2telegram
 

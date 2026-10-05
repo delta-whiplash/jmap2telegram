@@ -31,7 +31,7 @@ pub type Bot = teloxide::adaptors::Throttle<teloxide::Bot>;
 async fn main() -> anyhow::Result<()> {
     // Timezone is needed before `Config` is fully loaded (to time-stamp
     // even the earliest log lines), so it's parsed once here and again
-    // inside `Config::parse` — both go through the same validated helper.
+    // inside `Config::parse` - both go through the same validated helper.
     let early_timezone = config::parse_timezone(std::env::var("TIMEZONE").ok().as_deref())
         .unwrap_or(chrono_tz::Tz::UTC);
     logging::init(std::env::var("LOG_LEVEL").ok().as_deref(), early_timezone);
@@ -64,7 +64,7 @@ async fn main() -> anyhow::Result<()> {
     // the encrypted store).
     //
     // spawn_boot_resume registers every persisted target in the health
-    // registry (disconnected — /readyz says 503 until they come up) and
+    // registry (disconnected - /readyz says 503 until they come up) and
     // retries each connect in its own background task, so neither a JMAP
     // server that is still down nor N accounts × a 10s connect timeout may
     // hold the dispatcher below hostage: the bot must answer /login and

@@ -19,7 +19,7 @@ use crate::store::{Account, ExtraAccount};
 type HandlerResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
 /// Repeated verbatim across every command that needs a primary account and
-/// doesn't have one — one string, so it can't drift between call sites.
+/// doesn't have one - one string, so it can't drift between call sites.
 const NO_ACCOUNT_MSG: &str = "Aucun compte connecté. Tape /login pour commencer.";
 
 #[derive(BotCommands, Clone)]
@@ -66,7 +66,7 @@ async fn message_handler(bot: Bot, msg: Message, me: Me, state: AppState) -> Han
     // Every stored JMAP account is fully controlled (read, archive,
     // delete) by whoever can talk in its chat. That's a reasonable model
     // for a 1:1 DM, but silently extends to every member of a group if an
-    // operator ever puts a group chat id in AUTHORIZED_CHAT_IDS — so
+    // operator ever puts a group chat id in AUTHORIZED_CHAT_IDS - so
     // refuse non-private chats outright rather than let that happen.
     if !msg.chat.is_private() {
         return Ok(());
@@ -155,9 +155,9 @@ async fn cmd_start(bot: &Bot, state: &AppState, chat_id: ChatId) -> HandlerResul
          Pour recevoir tes mails ici, connecte ton compte JMAP avec :\n\
          /login <server_url> <token>\n\n\
          • server_url est l'URL racine du serveur JMAP de ton fournisseur \
-           (ex. Fastmail : https://jmap.fastmail.com) — le bot découvre \
+           (ex. Fastmail : https://jmap.fastmail.com) - le bot découvre \
            automatiquement le point d'entrée via /.well-known/jmap.\n\
-         • token est un jeton d'API (Bearer), pas ton mot de passe — \
+         • token est un jeton d'API (Bearer), pas ton mot de passe - \
            génère-le dans les paramètres de sécurité de ton fournisseur.\n\n\
          Ce message /login sera automatiquement supprimé du chat juste après, \
          pour ne pas laisser le jeton traîner dans l'historique.",
@@ -294,7 +294,7 @@ async fn cmd_status(bot: &Bot, state: &AppState, chat_id: ChatId) -> HandlerResu
 
 /// `/comptes` (no args) lists the chat's primary account plus every extra,
 /// fully independent personal account connected via `/comptes <url>
-/// <token>` — distinct from `/partages`' delegated/shared accounts, which
+/// <token>` - distinct from `/partages`' delegated/shared accounts, which
 /// live under the primary token rather than having their own credentials.
 async fn cmd_comptes(bot: &Bot, state: &AppState, chat_id: ChatId, args: String) -> HandlerResult {
     let args = args.trim();
@@ -314,7 +314,7 @@ async fn cmd_comptes(bot: &Bot, state: &AppState, chat_id: ChatId, args: String)
     let Some((server_url, token)) = args.split_once(char::is_whitespace) else {
         bot.send_message(
             chat_id,
-            "Usage : /comptes <server_url> <token> — comme /login, mais pour un compte \
+            "Usage : /comptes <server_url> <token> - comme /login, mais pour un compte \
              supplémentaire plutôt que de remplacer le principal.",
         )
         .await?;
@@ -460,7 +460,7 @@ async fn cmd_partages(bot: &Bot, state: &AppState, chat_id: ChatId) -> HandlerRe
     let keyboard = format::shared_accounts_keyboard(&accounts, &enabled);
     bot.send_message(
         chat_id,
-        "📂 Boîtes partagées accessibles avec ce compte — active ou désactive leurs \
+        "📂 Boîtes partagées accessibles avec ce compte - active ou désactive leurs \
          notifications ici :",
     )
     .reply_markup(keyboard)
@@ -505,7 +505,7 @@ async fn refresh_partages_keyboard(
 
 /// Disconnects one extra personal account (the "🗑 Déconnecter" button on
 /// `/comptes`'s listing). Unlike `/partages`' shared-account toggle, this
-/// is one-directional — reconnecting means running `/comptes <url>
+/// is one-directional - reconnecting means running `/comptes <url>
 /// <token>` again with its credentials, not a re-enable button, since we
 /// don't keep a disconnected extra account's token around to reuse.
 async fn disconnect_extra_account(
@@ -705,7 +705,7 @@ async fn cmd_unmute(bot: &Bot, state: &AppState, chat_id: ChatId, term: String) 
 }
 
 /// Read-only full-text search against the chat's own mailbox (not its
-/// shared accounts — those would need their own per-account search, kept
+/// shared accounts - those would need their own per-account search, kept
 /// out of scope here). Results are rendered as ordinary notification
 /// messages, complete with the same action buttons, so triage works the
 /// same way whether a message arrived live or was dug up by search.
@@ -773,7 +773,7 @@ enum TriageAction {
     Delete,
 }
 
-/// Which chat/message a callback tap came from — bundled together purely
+/// Which chat/message a callback tap came from - bundled together purely
 /// to keep `perform_triage_action`'s argument count sane.
 struct CallbackCtx {
     chat_id: ChatId,
@@ -878,7 +878,7 @@ async fn callback_handler(bot: Bot, q: CallbackQuery, state: AppState) -> Handle
     // Two shapes: "s:{account_id}" (toggle a shared account from
     // /partages) or an email action, either "{action}:{email_id}" (the
     // chat's own mailbox) or "{action}:{account_id}:{email_id}" (a shared
-    // mailbox — JMAP email ids are only unique within their account, so
+    // mailbox - JMAP email ids are only unique within their account, so
     // the account has to travel with the id to route to the right client).
     let mut parts = data.splitn(3, ':');
     let (Some(action), Some(second)) = (parts.next(), parts.next()) else {
@@ -900,7 +900,7 @@ async fn callback_handler(bot: Bot, q: CallbackQuery, state: AppState) -> Handle
     };
 
     // account_id names either a shared JMAP account (under the primary
-    // token) or an extra, fully independent one — two separate key spaces
+    // token) or an extra, fully independent one - two separate key spaces
     // (see store::Account::extra_accounts), so try shared first and only
     // fall back to extra when it's a clean "not found there", not an
     // actual connection error.
@@ -1045,7 +1045,7 @@ async fn callback_handler(bot: Bot, q: CallbackQuery, state: AppState) -> Handle
                     bot.answer_callback_query(q.id).await?;
                     // One chunk failing to send (a flood limit, a network
                     // blip, Telegram hiccup) must not silently abort every
-                    // chunk after it — the reader would get the first
+                    // chunk after it - the reader would get the first
                     // pages of a long mail and then silence, with nothing
                     // to hint that content is missing. So: log each
                     // failure, keep sending the rest, and close with a
@@ -1069,7 +1069,7 @@ async fn callback_handler(bot: Bot, q: CallbackQuery, state: AppState) -> Handle
                     if !failed.is_empty() {
                         // Best-effort: if Telegram is unreachable wholesale,
                         // this summary fails too and we only lose the
-                        // in-chat notice — the per-chunk errors are already
+                        // in-chat notice - the per-chunk errors are already
                         // in the logs. Retrying "Lire tout" resends the
                         // whole body, which is why the hint says so.
                         let listing = failed
@@ -1097,7 +1097,7 @@ async fn callback_handler(bot: Bot, q: CallbackQuery, state: AppState) -> Handle
                 }
             }
         }
-        // "n" ("already read") is an intentionally inert label button —
+        // "n" ("already read") is an intentionally inert label button -
         // it still needs to answer the callback so Telegram stops showing
         // a loading spinner on the tap, but there's nothing to do.
         "n" => {
