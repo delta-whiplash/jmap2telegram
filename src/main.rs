@@ -2,6 +2,7 @@ mod accounts;
 mod bot;
 mod config;
 mod format;
+mod health;
 mod jmap;
 mod logging;
 mod state;
@@ -40,6 +41,12 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState::new(config.clone(), store.clone());
 
     let bot = teloxide::Bot::new(&config.telegram_token).throttle(Limits::default());
+
+    // Probe listener for Kubernetes liveness/readiness (see src/health.rs).
+    // Bound here rather than in the spawned task so a bind failure is a
+    // loud startup error instead of a silently absent probe endpoint.
+    let probe_listener = health::bind().await?;
+    tokio::spawn(health::serve(probe_listener));
 
     // Registers the command list with Telegram itself, so the client's "/"
     // menu autocompletes every command with its description instead of the

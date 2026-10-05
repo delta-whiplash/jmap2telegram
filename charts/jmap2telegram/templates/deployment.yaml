@@ -57,6 +57,26 @@ spec:
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
+          ports:
+            - name: health
+              containerPort: 8080
+              protocol: TCP
+          # Both endpoints are served by the same minimal responder (see
+          # src/health.rs): 200 as long as the tokio runtime is scheduling
+          # the accept loop. No startupProbe: boot work (store decrypt) is
+          # sub-second and the readiness below covers the gap.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            periodSeconds: 30
+            timeoutSeconds: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            periodSeconds: 10
+            timeoutSeconds: 3
           volumeMounts:
             - name: data
               mountPath: /data

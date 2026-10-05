@@ -141,7 +141,12 @@ jobs:
           VERSION="${{ needs.prep.outputs.version }}"
           sed -i "s/^version:.*/version: ${VERSION}/" charts/jmap2telegram/Chart.yaml
           sed -i "s/^appVersion:.*/appVersion: \"${VERSION}\"/" charts/jmap2telegram/Chart.yaml
-          sed -i "s/^  tag:.*/  tag: \"${VERSION}\"/" charts/jmap2telegram/values.yaml
+          # The image tags published by docker/metadata-action above carry
+          # the leading v (v0.1.1, plus floating 0.1/0/latest); the plain
+          # "0.1.1" form has never been pushed to GHCR. The chart's default
+          # image tag must therefore keep the v, or an install with default
+          # values points at an image that does not exist.
+          sed -i "s/^  tag:.*/  tag: \"v${VERSION}\"/" charts/jmap2telegram/values.yaml
 
       - run: helm lint charts/jmap2telegram
       - run: helm package charts/jmap2telegram --destination /tmp/chart-out
