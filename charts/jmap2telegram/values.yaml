@@ -2,7 +2,12 @@
 
 image:
   repository: ghcr.io/delta-whiplash/jmap2telegram
-  tag: "latest"
+  # Empty by default: the chart then falls back to .Chart.AppVersion, which
+  # the release pipeline pins to the exact released version. A public chart
+  # must never default to a mutable tag ("latest") — installs would be
+  # non-reproducible and rollbacks would silently pull different code.
+  # Set explicitly only to override (e.g. testing a branch build).
+  tag: ""
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []

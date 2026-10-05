@@ -140,13 +140,13 @@ jobs:
           set -euo pipefail
           VERSION="${{ needs.prep.outputs.version }}"
           sed -i "s/^version:.*/version: ${VERSION}/" charts/jmap2telegram/Chart.yaml
-          sed -i "s/^appVersion:.*/appVersion: \"${VERSION}\"/" charts/jmap2telegram/Chart.yaml
-          # The image tags published by docker/metadata-action above carry
-          # the leading v (v0.1.1, plus floating 0.1/0/latest); the plain
-          # "0.1.1" form has never been pushed to GHCR. The chart's default
-          # image tag must therefore keep the v, or an install with default
-          # values points at an image that does not exist.
-          sed -i "s/^  tag:.*/  tag: \"v${VERSION}\"/" charts/jmap2telegram/values.yaml
+          # appVersion keeps the leading v: docker/metadata-action publishes
+          # only vX.Y.Z / X.Y / X / latest, and the chart resolves an empty
+          # image.tag to appVersion — a bare version there was an
+          # ImagePullBackOff waiting for default-value installs (the bug
+          # behind v0.1.1's chart). Chart *version* itself stays bare, per
+          # helm convention.
+          sed -i "s/^appVersion:.*/appVersion: \"v${VERSION}\"/" charts/jmap2telegram/Chart.yaml
 
       - run: helm lint charts/jmap2telegram
       - run: helm package charts/jmap2telegram --destination /tmp/chart-out
