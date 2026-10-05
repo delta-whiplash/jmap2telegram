@@ -3,7 +3,9 @@ use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup};
 
 use crate::jmap::EmailSummary;
 
-/// Telegram's hard limit for a single message's text.
+/// Telegram's hard limit for a single message's text, counted in UTF-16
+/// code units (the Bot API's unit for message length), not in Rust chars
+/// — see `chunk_text` for why the distinction matters.
 pub const TELEGRAM_MAX_MESSAGE_LEN: usize = 4096;
 
 /// Every field below (subject, sender name, preview) comes straight from
@@ -320,6 +322,14 @@ fn escape_markdown(input: &str) -> String {
 
 /// Splits a long plain-text body into chunks that fit within Telegram's
 /// message size limit, breaking on line boundaries where possible.
+///
+/// Telegram measures message length in UTF-16 code units, not in Rust
+/// chars (Unicode scalar values): an emoji outside the BMP — 😀, U+1F600
+/// — costs one `char` but two UTF-16 units, so budgeting in `chars()`
+/// would let an emoji-heavy body produce chunks Telegram rejects as
+/// "message is too long" despite the char count saying they fit. Every
+/// budget below is therefore maintained in the same unit Telegram
+/// counts in.
 pub fn chunk_text(text: &str, max_len: usize) -> Vec<String> {
     if text.is_empty() {
         return vec!["(message vide)".to_string()];
@@ -327,28 +337,37 @@ pub fn chunk_text(text: &str, max_len: usize) -> Vec<String> {
 
     let mut chunks = Vec::new();
     let mut current = String::new();
+    let mut current_len = 0usize;
 
     for line in text.lines() {
-        if current.chars().count() + line.chars().count() + 1 > max_len {
-            if !current.is_empty() {
-                chunks.push(std::mem::take(&mut current));
-            }
-            if line.chars().count() > max_len {
-                for part in line
-                    .chars()
-                    .collect::<Vec<_>>()
-                    .chunks(max_len)
-                    .map(|c| c.iter().collect::<String>())
-                {
-                    chunks.push(part);
+        let line_len = line.encode_utf16().count();
+        // +1 is the '\n' that would join `line` onto `current`.
+        if current_len + line_len + 1 > max_len && !current.is_empty() {
+            chunks.push(std::mem::take(&mut current));
+            current_len = 0;
+        }
+        if line_len > max_len {
+            // A single line longer than a whole message: split it at
+            // char boundaries, never mid-surrogate-pair — accumulating
+            // one char at a time guarantees that, and a lone half-pair
+            // would render as U+FFFD even if Telegram accepted it.
+            for c in line.chars() {
+                let units = c.len_utf16();
+                if current_len + units > max_len {
+                    chunks.push(std::mem::take(&mut current));
+                    current_len = 0;
                 }
-                continue;
+                current.push(c);
+                current_len += units;
             }
+            continue;
         }
         if !current.is_empty() {
             current.push('\n');
+            current_len += 1;
         }
         current.push_str(line);
+        current_len += line_len;
     }
     if !current.is_empty() {
         chunks.push(current);
@@ -711,5 +730,66 @@ mod tests {
     fn chunk_text_handles_empty_input() {
         let chunks = chunk_text("", 100);
         assert_eq!(chunks, vec!["(message vide)".to_string()]);
+    }
+
+    #[test]
+    fn chunk_text_budgets_in_utf16_units_for_astral_emoji() {
+        // Telegram measures message length in UTF-16 code units, where
+        // an astral emoji costs two — a body that fits "4096 chars" can
+        // still be twice the real budget. This one is 10 000 chars but
+        // 20 000 UTF-16 units, so under the old char-based chunker it
+        // would have produced five "fits in 4096" chunks that Telegram
+        // rejected wholesale.
+        let emoji = "😀".repeat(10_000);
+        // 4080 is what bot.rs passes (4096 minus headroom); the budget
+        // must hold in the unit Telegram counts in.
+        let max = 4080;
+        let chunks = chunk_text(&emoji, max);
+        assert!(chunks.len() > 1);
+        for chunk in &chunks {
+            assert!(
+                chunk.encode_utf16().count() <= max,
+                "chunk of {} UTF-16 units exceeds the {max}-unit budget",
+                chunk.encode_utf16().count()
+            );
+        }
+        // Astral code points must never be split mid-pair: a lone
+        // surrogate half would render as U+FFFD even if Telegram
+        // accepted the message. Reassembling the chunks without any
+        // separator must give the body back exactly.
+        assert_eq!(chunks.concat(), emoji);
+    }
+
+    #[test]
+    fn chunk_text_with_emoji_lines_respects_the_utf16_budget() {
+        // Lines short enough to join several per chunk, but each still
+        // two units per char: the '\n'-joining budget has to account
+        // for the doubled line lengths or lines silently overflow past
+        // the limit one '\n' at a time.
+        let lines: Vec<String> = (0..20).map(|_| "🚀".repeat(30)).collect(); // 60 units each
+        let text = lines.join("\n");
+        let max = 250;
+        let chunks = chunk_text(&text, max);
+        assert!(chunks.len() > 1);
+        for chunk in &chunks {
+            assert!(
+                chunk.encode_utf16().count() <= max,
+                "chunk of {} UTF-16 units exceeds the {max}-unit budget",
+                chunk.encode_utf16().count()
+            );
+        }
+        // Line-boundary chunking must never lose or reorder a line:
+        // joining the chunks back with '\n' is the original body.
+        assert_eq!(chunks.join("\n"), text);
+    }
+
+    #[test]
+    fn chunk_text_allows_a_chunk_exactly_at_the_limit() {
+        // 2040 astral emoji = 4080 UTF-16 units = exactly the budget;
+        // the overflow check must be `>` and not `>=`, or the chunker
+        // would needlessly split messages Telegram would have accepted.
+        let emoji = "😀".repeat(2040);
+        let chunks = chunk_text(&emoji, 4080);
+        assert_eq!(chunks, vec![emoji]);
     }
 }

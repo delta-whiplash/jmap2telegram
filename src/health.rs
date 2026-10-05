@@ -27,6 +27,18 @@
 //!   ArgoCDAppDegraded alert, without restarting anything that a backoff
 //!   loop can heal on its own.
 //!
+//!   Registration is what makes that honest, so it happens *before* the
+//!   first connect attempt everywhere: `watcher::spawn` registers its key
+//!   before its task starts, and boot resume (see `accounts.rs`) registers
+//!   every persisted account up-front, then retries the connect with the
+//!   watcher's own backoff. An account whose server never comes back is
+//!   therefore a *permanent* registered-but-disconnected entry — /readyz
+//!   503 naming it — and never a green pod that quietly watches nothing.
+//!   The flip side is the pairing obligation: a registration must be
+//!   dropped on every teardown path (`Health::deregister` /
+//!   `deregister_chat`), including `handle.abort()`, since an aborted task
+//!   never gets to run its own cleanup.
+//!
 //! - **`/metrics` exposes Prometheus text format** so vmagent can scrape
 //!   the same registry: `jmap2telegram_watchers_registered` /
 //!   `_connected` gauges and per-watcher
@@ -35,16 +47,31 @@
 //!   fallback poll), so an age above `FALLBACK_POLL` + margin means that
 //!   watcher is neither receiving events nor completing fallback syncs —
 //!   alert material, not restart material.
+//!
+//! Two hardening rules apply to the wire path itself:
+//!
+//! - **Request reads are deadline-bounded** (see [`REQUEST_DEADLINE`]). A
+//!   connection that opens and then never sends a byte — a port scanner, a
+//!   wedged scraper — is closed when the deadline expires, instead of
+//!   pinning the accept-spawned task and its socket forever.
+//!
+//! - **Watcher keys are escaped before they reach a probe response.** Part
+//!   of a key is the JMAP account id, chosen by the *server* (see
+//!   `watcher::shared_health_key`), so it is not trusted to be
+//!   format-safe: [`escape_prometheus_label`] keeps a key containing `\`,
+//!   `"` or a newline from breaking the scrape or injecting fake metric
+//!   lines.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 /// One watched JMAP account's live state, as tracked by its watcher task.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct WatcherStatus {
     /// Whether the EventSource connection is currently open.
     pub connected: bool,
@@ -93,6 +120,25 @@ impl Health {
         self.watchers.lock().unwrap().remove(key);
     }
 
+    /// Drops every registry entry belonging to `chat_id` — primary,
+    /// shared and extra slots alike — in one sweep. The full-chat teardown
+    /// in `state.rs` (`forget`, on /logout and /login) needs this because
+    /// it must also clear entries for targets that have no live watcher
+    /// handle to iterate over, such as a boot-resume still waiting out
+    /// its reconnect backoff with an entry registered *before* its first
+    /// connect attempt.
+    ///
+    /// Prefix matching on `"{chat_id}/"` is exact: the trailing separator
+    /// means chat 4's keys (`"4/primary"`, `"4/shared-…"`, …) can never
+    /// match a scan for chat 42, and vice versa.
+    pub fn deregister_chat(&self, chat_id: i64) {
+        let prefix = format!("{chat_id}/");
+        self.watchers
+            .lock()
+            .unwrap()
+            .retain(|key, _| !key.starts_with(&prefix));
+    }
+
     /// Records whether this watcher's EventSource connection is open.
     pub fn set_connected(&self, key: &str, connected: bool) {
         self.update(key, |s| s.connected = connected);
@@ -103,13 +149,17 @@ impl Health {
         self.update(key, |s| s.last_activity = Some(Instant::now()));
     }
 
-    fn snapshot(&self) -> HashMap<String, WatcherStatus> {
+    /// Point-in-time copy of the whole registry, as /metrics renders it.
+    /// Crate-visible so the teardown and boot-resume tests in other
+    /// modules can assert on the same view the endpoints serve.
+    pub(crate) fn snapshot(&self) -> HashMap<String, WatcherStatus> {
         self.watchers.lock().unwrap().clone()
     }
 
     /// Readiness: every registered watcher connected, or nothing to watch.
-    /// Returns the failing keys for the 503 body.
-    fn readiness(&self) -> Result<(), Vec<String>> {
+    /// Returns the failing keys for the 503 body. Crate-visible for the
+    /// same cross-module test reasons as [`snapshot`](Health::snapshot).
+    pub(crate) fn readiness(&self) -> Result<(), Vec<String>> {
         let disconnected: Vec<String> = self
             .snapshot()
             .iter()
@@ -133,15 +183,34 @@ pub async fn bind() -> std::io::Result<TcpListener> {
     Ok(listener)
 }
 
+/// How long a probe connection may take to deliver its request line before
+/// the responder gives up on it. Five seconds is deliberately generous
+/// (kubelet and vmagent send their fixed, tiny request line immediately);
+/// anything slower is a broken or deliberately silent peer, and the
+/// deadline's job is to make sure it costs nothing more than a closed
+/// socket, never a pinned task.
+const REQUEST_DEADLINE: Duration = Duration::from_secs(5);
+
 /// Serves probe and metrics requests until the process exits. Never
 /// returns on its own; run it in a spawned task.
 pub async fn serve(listener: TcpListener, health: Arc<Health>) {
+    serve_with_request_deadline(listener, health, REQUEST_DEADLINE).await
+}
+
+/// Same as [`serve`], with the per-connection request deadline injectable
+/// so tests can exercise the silent-connection path without waiting out
+/// the full five seconds of [`REQUEST_DEADLINE`].
+async fn serve_with_request_deadline(
+    listener: TcpListener,
+    health: Arc<Health>,
+    request_deadline: Duration,
+) {
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
                 let health = health.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = respond(stream, &health).await {
+                    if let Err(e) = respond(stream, &health, request_deadline).await {
                         // A client hanging up mid-request lands here; not
                         // worth more than a trace line.
                         tracing::trace!(error = %e, "health connection error");
@@ -158,13 +227,24 @@ pub async fn serve(listener: TcpListener, health: Arc<Health>) {
     }
 }
 
-async fn respond(mut stream: TcpStream, health: &Health) -> std::io::Result<()> {
+async fn respond(
+    mut stream: TcpStream,
+    health: &Health,
+    request_deadline: Duration,
+) -> std::io::Result<()> {
     // Probes and scrapers send a fixed, tiny request line + headers; one
     // read of a small buffer is enough (kubelet never sends bodies here).
     // Reading exactly once and replying immediately keeps this
-    // allocation-free.
+    // allocation-free. The read itself is deadline-bounded: a peer that
+    // opens the socket and then goes silent must not pin this task and
+    // the socket for the life of the process. On expiry the plainest
+    // thing is also the right one — drop the stream (which closes the
+    // socket) without any response.
     let mut buf = [0u8; 512];
-    let n = stream.read(&mut buf).await?;
+    let n = match tokio::time::timeout(request_deadline, stream.read(&mut buf)).await {
+        Ok(read) => read?,
+        Err(_elapsed) => return Ok(()),
+    };
     let request = String::from_utf8_lossy(&buf[..n]);
     let path = request.split_whitespace().nth(1).unwrap_or_default();
 
@@ -172,9 +252,20 @@ async fn respond(mut stream: TcpStream, health: &Health) -> std::io::Result<()> 
         "/healthz" => ("200 OK", "ok\n".to_string()),
         "/readyz" => match health.readiness() {
             Ok(()) => ("200 OK", "ok\n".to_string()),
+            // The keys are escaped with the same rules as the /metrics
+            // label: one key can smuggle in a newline via a server-chosen
+            // account id, and a raw newline here would turn one 503 line
+            // into response-line confusion for whatever parses the body.
             Err(disconnected) => (
                 "503 Service Unavailable",
-                format!("watchers disconnected: {}\n", disconnected.join(", ")),
+                format!(
+                    "watchers disconnected: {}\n",
+                    disconnected
+                        .iter()
+                        .map(|key| escape_prometheus_label(key).into_owned())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
             ),
         },
         "/metrics" => ("200 OK", render_metrics(health)),
@@ -211,18 +302,49 @@ fn render_metrics(health: &Health) -> String {
     );
     for (key, status) in &snapshot {
         // Watcher keys embed the Telegram chat id and the account slot —
-        // internal identifiers, never credentials. +Inf until the first
-        // sync so a fresh watcher doesn't masquerade as a fresh stream.
-        // Spelled "+Inf" (not Rust's "inf") per the Prometheus text format.
+        // internal identifiers, never credentials. The JMAP account id
+        // part is *not* internal though (the server picks it), so the key
+        // is escaped into the label value per the text format rather than
+        // interpolated raw; see escape_prometheus_label. +Inf until the
+        // first sync so a fresh watcher doesn't masquerade as a fresh
+        // stream. Spelled "+Inf" (not Rust's "inf") per the text format.
         let age = match status.last_activity {
             Some(t) => t.elapsed().as_secs_f64().to_string(),
             None => "+Inf".to_string(),
         };
         out.push_str(&format!(
-            "jmap2telegram_last_activity_age_seconds{{watcher=\"{key}\"}} {age}\n"
+            "jmap2telegram_last_activity_age_seconds{{watcher=\"{}\"}} {age}\n",
+            escape_prometheus_label(key)
         ));
     }
     out
+}
+
+/// Escapes a string for inclusion in a Prometheus label value — and, for
+/// consistency, in the /readyz 503 body naming the same watcher keys.
+///
+/// The text format mandates label values be quoted with `\` (`\\`), `"`
+/// (`\"`) and newline (`\n`) escaped inside the quotes. Watcher keys embed
+/// a JMAP account id that the *server* chooses (see
+/// `watcher::shared_health_key`), not us: an account id containing any of
+/// those characters would, unescaped, terminate the label early and break
+/// the scrape — or, with a newline, inject whole fake metric lines into
+/// the stream vmagent ingests.
+///
+/// Real keys are almost always plain ASCII, so the common case borrows
+/// instead of allocating.
+fn escape_prometheus_label(value: &str) -> Cow<'_, str> {
+    if !value.contains(['\\', '"', '\n']) {
+        return Cow::Borrowed(value);
+    }
+    // Backslash must be escaped first, or the backslashes this chain just
+    // inserted for `"` and `\n` would get doubled again.
+    Cow::Owned(
+        value
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n"),
+    )
 }
 
 #[cfg(test)]
@@ -363,6 +485,34 @@ mod tests {
         assert!(health.snapshot().is_empty());
     }
 
+    #[test]
+    fn deregister_chat_clears_every_target_kind_of_that_chat_and_only_that_chat() {
+        // Keys exactly as watcher::spawn derives them from its targets, to
+        // lock the coupling deregister_chat's "{chat_id}/" prefix scan
+        // relies on (see watcher::shared_health_key / extra_health_key).
+        let health = Arc::new(Health::default());
+        for key in [
+            crate::watcher::WatchTarget::Primary.health_key(42),
+            crate::watcher::shared_health_key(42, "acc7"),
+            crate::watcher::extra_health_key(42, "slot1"),
+        ] {
+            health.register(&key);
+            health.set_connected(&key, true);
+        }
+        // neighbouring chat ids must not be caught by the prefix scan
+        health.register("4/primary");
+        health.register("43/shared-acc7");
+
+        health.deregister_chat(42);
+
+        let snapshot = health.snapshot();
+        assert!(!snapshot.contains_key("42/primary"), "{snapshot:?}");
+        assert!(!snapshot.contains_key("42/shared-acc7"), "{snapshot:?}");
+        assert!(!snapshot.contains_key("42/extra-slot1"), "{snapshot:?}");
+        assert!(snapshot.contains_key("4/primary"), "{snapshot:?}");
+        assert!(snapshot.contains_key("43/shared-acc7"), "{snapshot:?}");
+    }
+
     #[tokio::test]
     async fn unknown_path_is_404_with_empty_body() {
         let health = Arc::new(Health::default());
@@ -381,5 +531,97 @@ mod tests {
         for _ in 0..20 {
             assert_eq!(get(addr, "/healthz").await.0, 200);
         }
+    }
+
+    #[test]
+    fn escape_prometheus_label_escapes_backslash_quote_and_newline() {
+        // Plain keys — the overwhelming majority — come back untouched.
+        assert_eq!(escape_prometheus_label("42/shared-acc7"), "42/shared-acc7");
+        // Each character the text format forbids raw inside a label value.
+        assert_eq!(escape_prometheus_label(r"a\b"), r"a\\b");
+        assert_eq!(escape_prometheus_label(r#"a"b"#), r#"a\"b"#);
+        assert_eq!(escape_prometheus_label("a\nb"), r"a\nb");
+        // All three at once: backslash doubling must not re-escape the
+        // backslashes inserted for the quote and the newline.
+        assert_eq!(escape_prometheus_label("\\\"\n"), r#"\\\"\n"#);
+        // A key that arrives *already* escaped has its backslashes doubled
+        // (a label value never has an odd number of them).
+        assert_eq!(escape_prometheus_label(r"a\nb"), r"a\\nb");
+    }
+
+    #[tokio::test]
+    async fn metrics_escape_watcher_keys_containing_quote_backslash_and_newline() {
+        // A JMAP account id is chosen by the server (see
+        // watcher::shared_health_key); one containing a quote, a backslash
+        // or even a newline must not terminate the label value or the
+        // metric line.
+        let health = Arc::new(Health::default());
+        let key = String::from(r#"42/shared-a"b\c"#) + "\n" + "d";
+        health.register(&key);
+        let addr = spawn_ephemeral(health).await;
+        let (status, body) = get(addr, "/metrics").await;
+        assert_eq!(status, 200);
+        let line = body
+            .lines()
+            .find(|l| l.contains("42/shared-a"))
+            .expect("per-watcher metric line present");
+        // One line, label value escaped per the text format: an unescaped
+        // newline would have split it, an unescaped quote closed the label
+        // early — either way this exact line would not exist.
+        assert_eq!(
+            line,
+            r#"jmap2telegram_last_activity_age_seconds{watcher="42/shared-a\"b\\c\nd"} +Inf"#
+        );
+        // The sibling aggregate lines still parse as usual.
+        assert!(
+            body.contains("jmap2telegram_watchers_registered 1"),
+            "body: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn readyz_503_body_escapes_watcher_keys() {
+        let health = Arc::new(Health::default());
+        let key = String::from(r#"42/shared-a"b\c"#) + "\n" + "d";
+        health.register(&key);
+        let addr = spawn_ephemeral(health).await;
+        let (status, body) = get(addr, "/readyz").await;
+        assert_eq!(status, 503);
+        // The raw newline inside the key must not leak into the body — it
+        // stays one line.
+        assert_eq!(body.lines().count(), 1, "body: {body}");
+        assert_eq!(
+            body.trim_end(),
+            r#"watchers disconnected: 42/shared-a\"b\\c\nd"#,
+            "body: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn silent_connection_is_closed_at_the_read_deadline() {
+        // A peer that connects and then never sends a byte must not pin
+        // the accept-spawned task and its socket for the life of the
+        // process: the deadline-bounded read gives up and dropping the
+        // stream closes the socket. Production gives probes the full
+        // REQUEST_DEADLINE (5s); the test injects a short deadline through
+        // serve_with_request_deadline so it observes the close in
+        // milliseconds instead of waiting out five seconds.
+        let health = Arc::new(Health::default());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve_with_request_deadline(
+            listener,
+            health,
+            Duration::from_millis(150),
+        ));
+        let mut silent = TcpStream::connect(addr).await.unwrap();
+        let mut buf = Vec::new();
+        // EOF (read_to_end returning) is the observable close; the outer
+        // timeout fails the test if the deadline path ever regresses.
+        tokio::time::timeout(Duration::from_secs(2), silent.read_to_end(&mut buf))
+            .await
+            .expect("silent connection closed before the test timeout")
+            .unwrap();
+        assert!(buf.is_empty());
     }
 }

@@ -60,79 +60,18 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Resume watching every account that survived a restart, without
-    // re-notifying about anything already seen (last_state is resumed
-    // from the encrypted store).
+    // re-notifying about anything already seen (last_state is resumed from
+    // the encrypted store).
+    //
+    // spawn_boot_resume registers every persisted target in the health
+    // registry (disconnected — /readyz says 503 until they come up) and
+    // retries each connect in its own background task, so neither a JMAP
+    // server that is still down nor N accounts × a 10s connect timeout may
+    // hold the dispatcher below hostage: the bot must answer /login and
+    // /logout while it is still bringing its own watchers back.
     for (chat_id, account) in store.all() {
-        match jmap::connect(
-            &account.server_url,
-            &account.token,
-            config.allow_private_jmap_hosts,
-        )
-        .await
-        {
-            Ok(client) => {
-                accounts::adopt_primary(&bot, &state, chat_id, client).await;
-                tracing::info!(chat_id, email = %account.email, "resumed JMAP watcher");
-            }
-            Err(e) => {
-                tracing::warn!(chat_id, error = %e, "failed to resume JMAP account, it will need /login again");
-            }
-        }
-
-        for (account_id, shared) in &account.shared_accounts {
-            match jmap::connect_shared(
-                &account.server_url,
-                &account.token,
-                config.allow_private_jmap_hosts,
-                account_id,
-            )
-            .await
-            {
-                Ok(client) => {
-                    accounts::adopt_shared(
-                        &bot,
-                        &state,
-                        chat_id,
-                        account_id.clone(),
-                        shared.name.clone(),
-                        client,
-                    )
-                    .await;
-                    tracing::info!(chat_id, account_id, name = %shared.name, "resumed shared-account JMAP watcher");
-                }
-                Err(e) => {
-                    tracing::warn!(chat_id, account_id, error = %e, "failed to resume shared JMAP account");
-                }
-            }
-        }
-
-        for (slot_id, extra) in &account.extra_accounts {
-            match jmap::connect(
-                &extra.server_url,
-                &extra.token,
-                config.allow_private_jmap_hosts,
-            )
-            .await
-            {
-                Ok(client) => {
-                    accounts::adopt_extra(
-                        &bot,
-                        &state,
-                        chat_id,
-                        slot_id.clone(),
-                        extra.email.clone(),
-                        client,
-                    )
-                    .await;
-                    tracing::info!(chat_id, slot_id, email = %extra.email, "resumed extra-account JMAP watcher");
-                }
-                Err(e) => {
-                    tracing::warn!(chat_id, slot_id, error = %e, "failed to resume extra JMAP account");
-                }
-            }
-        }
+        accounts::spawn_boot_resume(&bot, &state, chat_id, &account);
     }
-
     tracing::info!("jmap2telegram starting");
 
     Dispatcher::builder(bot, bot::schema())

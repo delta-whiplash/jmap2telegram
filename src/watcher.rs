@@ -14,7 +14,22 @@ use crate::jmap;
 use crate::state::AppState;
 
 const FALLBACK_POLL: Duration = Duration::from_secs(300);
-const MAX_BACKOFF: Duration = Duration::from_secs(300);
+
+/// Backoff schedule shared by this module's reconnect loop and the
+/// boot-resume retry loop in accounts.rs: double after each failure,
+/// starting at 2s and never exceeding [`MAX_BACKOFF`]. Shared constants
+/// (rather than two coincidentally identical schedules) so the two loops
+/// stay honest about being the same policy: wait out a transient failure
+/// without hammering a struggling server, and still recover within one
+/// interval once it comes back.
+pub(crate) const INITIAL_BACKOFF: Duration = Duration::from_secs(2);
+pub(crate) const MAX_BACKOFF: Duration = Duration::from_secs(300);
+
+/// The next value of [`INITIAL_BACKOFF`]-seeded doubling backoff after a
+/// failed attempt (2s, 4s, 8s, ..., capped at [`MAX_BACKOFF`]).
+pub(crate) fn next_backoff(current: Duration) -> Duration {
+    (current * 2).min(MAX_BACKOFF)
+}
 
 /// How many *consecutive* failures to even open the EventSource connection
 /// (not counting a later drop of an already-working stream, which the
@@ -30,7 +45,7 @@ const FAILURE_NOTIFY_THRESHOLD: u32 = 5;
 /// that needs to read/write the right cursor in the store, decide when to
 /// stop, and label/route notifications so an action button lands on a
 /// JMAP client connected to the right account.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum WatchTarget {
     Primary,
     Shared { account_id: String, label: String },
@@ -53,9 +68,10 @@ impl WatchTarget {
     }
 
     /// Whether this target is still opted into, i.e. whether the watcher
-    /// should keep running. `false` means /logout, a /partages toggle-off,
-    /// or a /comptes disconnect happened while we were waiting.
-    fn still_active(&self, account: &crate::store::Account) -> bool {
+    /// (or a boot-resume retrying its connect) should keep going. `false`
+    /// means /logout, a /partages toggle-off, or a /comptes disconnect
+    /// happened while we were waiting.
+    pub(crate) fn still_active(&self, account: &crate::store::Account) -> bool {
         match self {
             WatchTarget::Primary => true,
             WatchTarget::Shared { account_id, .. } => {
@@ -99,7 +115,7 @@ impl WatchTarget {
     /// account within a chat, and readable in `kubectl` output and metric
     /// labels. Embeds the chat id and the account slot — internal
     /// identifiers only, never credentials.
-    fn health_key(&self, chat_id: i64) -> String {
+    pub(crate) fn health_key(&self, chat_id: i64) -> String {
         match self {
             WatchTarget::Primary => format!("{chat_id}/primary"),
             WatchTarget::Shared { account_id, .. } => format!("{chat_id}/shared-{account_id}"),
@@ -117,12 +133,46 @@ impl WatchTarget {
     }
 }
 
-fn connection_broken_text(target: &WatchTarget, last_error: &anyhow::Error) -> String {
+/// Health-registry key for one shared account's watcher, for teardown
+/// sites (`state.rs`'s `forget_shared`) that only know the slot
+/// identifiers, never the display label — which plays no part in
+/// [`WatchTarget::health_key`] anyway. Building the minimal target and
+/// reusing the same key builder the watcher itself uses keeps the key
+/// format defined in exactly one place.
+pub(crate) fn shared_health_key(chat_id: i64, account_id: &str) -> String {
+    WatchTarget::Shared {
+        account_id: account_id.to_string(),
+        label: String::new(),
+    }
+    .health_key(chat_id)
+}
+
+/// Same as [`shared_health_key`], for an extra account's slot
+/// (`state.rs`'s `forget_extra`).
+pub(crate) fn extra_health_key(chat_id: i64, slot_id: &str) -> String {
+    WatchTarget::Extra {
+        slot_id: slot_id.to_string(),
+        label: String::new(),
+    }
+    .health_key(chat_id)
+}
+
+/// Connection-broken health notice. Deliberately interpolates *no*
+/// runtime error at all: the last connect/stream error used to be
+/// rendered here verbatim, and against a server hostname an attacker can
+/// influence (see the residual DNS-rebinding TOCTOU in SECURITY.md,
+/// "SSRF via /login") that verbatim transport error — jmap-client's
+/// Display for it is "Transport error: <full URL + OS-level TCP cause>"
+/// — is an internal-port-reachability oracle landing directly in the
+/// attacker's chat. Every failure is already traced server-side by the
+/// reconnect loop below, so the notice points at the logs instead of
+/// quoting the error. Keep it that way: no `{}` of an error, ever.
+fn connection_broken_text(target: &WatchTarget) -> String {
     format!(
         "⚠️ La connexion à {scope} échoue depuis plusieurs tentatives : le jeton a peut-être \
          été révoqué, ou le serveur est injoignable. Les notifications sont en pause pour ce \
          compte jusqu'à ce que la connexion reprenne d'elle-même.\n\n\
-         Dernière erreur : {last_error}\n\n\
+         Le détail technique de chaque échec est consigné dans les logs serveur.\n\n\
          Si le jeton a été révoqué, reconnecte-toi avec /login (ou /partages pour une boîte \
          partagée).",
         scope = target.scope_label(),
@@ -151,7 +201,7 @@ pub fn spawn(
     let health_key = target.health_key(chat_id);
     state.health.register(&health_key);
     tokio::spawn(async move {
-        let mut backoff = Duration::from_secs(2);
+        let mut backoff = INITIAL_BACKOFF;
         let mut consecutive_connect_failures: u32 = 0;
         let mut notified_broken = false;
         // Set by run_once as soon as the EventSource connection actually
@@ -182,7 +232,7 @@ pub fn spawn(
 
                     if connected.load(Ordering::Relaxed) {
                         consecutive_connect_failures = 0;
-                        backoff = Duration::from_secs(2);
+                        backoff = INITIAL_BACKOFF;
                         if notified_broken {
                             notified_broken = false;
                             notify(&bot, &state, chat_id, connection_recovered_text(&target)).await;
@@ -193,15 +243,19 @@ pub fn spawn(
                             && !notified_broken
                         {
                             notified_broken = true;
-                            notify(&bot, &state, chat_id, connection_broken_text(&target, &e))
-                                .await;
+                            // No error object crosses into the notice:
+                            // the reconnect loop's warn! above already
+                            // traced it server-side (see
+                            // connection_broken_text for why the chat
+                            // must never see it).
+                            notify(&bot, &state, chat_id, connection_broken_text(&target)).await;
                         }
                     }
                 }
             }
 
             tokio::time::sleep(backoff).await;
-            backoff = (backoff * 2).min(MAX_BACKOFF);
+            backoff = next_backoff(backoff);
         }
     })
 }
@@ -458,24 +512,112 @@ mod tests {
     }
 
     #[test]
-    fn connection_broken_text_names_the_primary_mailbox_and_the_error() {
-        let err = anyhow::anyhow!("401 Unauthorized");
-        let text = connection_broken_text(&WatchTarget::Primary, &err);
+    fn health_keys_use_a_stable_slash_separated_format() {
+        // The exact format matters beyond readability: health.rs's
+        // deregister_chat strips entries by "{chat_id}/" prefix and the
+        // keys end up in /readyz bodies, kubectl output and Prometheus
+        // labels, so a change is user-visible and must be deliberate.
+        assert_eq!(WatchTarget::Primary.health_key(42), "42/primary");
+        assert_eq!(shared_health_key(42, "acc7"), "42/shared-acc7");
+        assert_eq!(extra_health_key(42, "slot1"), "42/extra-slot1");
+        // The teardown helpers must derive exactly the key a real watcher
+        // registers, including when the label differs — the label never
+        // participates in the key.
+        assert_eq!(
+            shared_health_key(42, "acc7"),
+            WatchTarget::Shared {
+                account_id: "acc7".to_string(),
+                label: "contact@delta-net.ovh".to_string(),
+            }
+            .health_key(42)
+        );
+        assert_eq!(
+            extra_health_key(42, "slot1"),
+            WatchTarget::Extra {
+                slot_id: "slot1".to_string(),
+                label: "second@other.example".to_string(),
+            }
+            .health_key(42)
+        );
+    }
+
+    #[test]
+    fn health_keys_keep_neighbouring_chats_prefix_distinct() {
+        // deregister_chat in health.rs matches keys by "{chat_id}/"
+        // prefix; the trailing separator is what makes that exact, so
+        // chat 4's teardown must never sweep chat 42's entries (or the
+        // other way around).
+        assert!(WatchTarget::Primary.health_key(4).starts_with("4/"));
+        assert!(!WatchTarget::Primary.health_key(42).starts_with("4/"));
+        assert_ne!(
+            WatchTarget::Primary.health_key(4),
+            WatchTarget::Primary.health_key(42)
+        );
+    }
+
+    #[test]
+    fn next_backoff_doubles_from_2s_and_caps_at_300s() {
+        // The exact schedule the watcher reconnect loop and the boot-resume
+        // retry loop share (see INITIAL_BACKOFF): 2s, 4s, ..., doubling,
+        // never past MAX_BACKOFF.
+        let mut backoff = INITIAL_BACKOFF;
+        assert_eq!(backoff, Duration::from_secs(2));
+        assert_eq!(next_backoff(backoff), Duration::from_secs(4));
+        for _ in 0..20 {
+            backoff = next_backoff(backoff);
+        }
+        assert_eq!(backoff, MAX_BACKOFF);
+        assert_eq!(MAX_BACKOFF, Duration::from_secs(300));
+    }
+
+    #[test]
+    fn connection_broken_text_names_the_primary_mailbox_and_points_at_the_logs() {
+        let text = connection_broken_text(&WatchTarget::Primary);
         assert!(text.contains("ta boîte JMAP"));
-        assert!(text.contains("401 Unauthorized"));
+        assert!(text.contains("logs serveur"));
         assert!(text.contains("/login"));
     }
 
     #[test]
     fn connection_broken_text_names_the_shared_mailbox() {
-        let err = anyhow::anyhow!("connection refused");
         let target = WatchTarget::Shared {
             account_id: "acc7".to_string(),
             label: "contact@delta-net.ovh".to_string(),
         };
-        let text = connection_broken_text(&target, &err);
+        let text = connection_broken_text(&target);
         assert!(text.contains("contact@delta-net.ovh"));
-        assert!(text.contains("connection refused"));
+        assert!(text.contains("logs serveur"));
+    }
+
+    /// Regression test for the SSRF error oracle: the "connection broken"
+    /// notice used to interpolate the last runtime error verbatim, and
+    /// that error is the raw jmap-client transport error (its Display is
+    /// "Transport error: <full URL + OS-level TCP cause>"), which —
+    /// especially after the DNS-rebinding TOCTOU documented in
+    /// SECURITY.md — reads back as a port-state fingerprint of whatever
+    /// the watched account's hostname currently resolves to. The notice
+    /// must interpolate no error at all; the details live in the
+    /// server-side tracing::warn of the reconnect loop.
+    #[test]
+    fn connection_broken_text_never_interpolates_the_transport_error() {
+        let text = connection_broken_text(&WatchTarget::Primary);
+        // Fragments of a plausible raw transport error, exactly what the
+        // notice used to quote, plus the old quoting line itself.
+        for fragment in [
+            "Dernière erreur",
+            "Connection refused",
+            "Transport error",
+            "error sending request",
+            "os error",
+            "timed out",
+            "401",
+            "internal-host",
+        ] {
+            assert!(
+                !text.contains(fragment),
+                "error-oracle leak via {fragment:?}: {text}"
+            );
+        }
     }
 
     #[test]
