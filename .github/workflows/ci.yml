@@ -92,3 +92,21 @@ jobs:
       - uses: azure/setup-helm@v5
       - run: helm lint charts/jmap2telegram
       - run: helm template charts/jmap2telegram --set telegram.botToken=dummy --set telegram.authorizedChatIds=1 > /dev/null
+
+  gitleaks:
+    # Full git history, not just the diff: a secret introduced then deleted
+    # stays detectable. History is clean today (verified 2026-10-05), so no
+    # baseline file is needed — a finding should fail the build.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Install gitleaks
+        run: |
+          set -euo pipefail
+          curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz" \
+            | sudo tar xz -C /usr/local/bin gitleaks
+          gitleaks version
+      - name: Scan full git history
+        run: gitleaks git . --redact --exit-code 1 -v
