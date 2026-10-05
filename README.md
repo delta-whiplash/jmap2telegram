@@ -253,8 +253,9 @@ Tagging `vX.Y.Z` and pushing it triggers
 1. re-runs the full CI suite (fmt, clippy, tests, `cargo audit`, Docker
    build, Helm lint);
 2. builds and pushes a multi-arch (`amd64`/`arm64`) Docker image to
-   `ghcr.io/delta-whiplash/jmap2telegram`, tagged `X.Y.Z`, `X.Y`, `X`, and
-   `latest`;
+   `ghcr.io/delta-whiplash/jmap2telegram`, tagged `vX.Y.Z` (the exact
+   release), `X.Y`, `X`, and `latest` — the bare `X.Y.Z` form is **not**
+   published, so pin pull commands to the `v`-prefixed tag;
 3. packages and pushes the Helm chart as an OCI artifact to
    `oci://ghcr.io/delta-whiplash/charts/jmap2telegram`, versioned from the
    same tag;

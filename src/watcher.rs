@@ -174,6 +174,11 @@ pub fn spawn(
                 }
                 Err(e) => {
                     tracing::warn!(chat_id, error = %e, "watcher JMAP EventSource error, reconnecting");
+                    // Le stream vient de tomber (ou n'a jamais ouvert) : le
+                    // registre health doit le refléter dès maintenant, sinon
+                    // /readyz reste 200 pendant tout le backoff — exactement
+                    // la panne silencieuse qu'il est censé signaler.
+                    state.health.set_connected(&health_key, false);
 
                     if connected.load(Ordering::Relaxed) {
                         consecutive_connect_failures = 0;
