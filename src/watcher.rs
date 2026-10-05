@@ -14,7 +14,22 @@ use crate::jmap;
 use crate::state::AppState;
 
 const FALLBACK_POLL: Duration = Duration::from_secs(300);
-const MAX_BACKOFF: Duration = Duration::from_secs(300);
+
+/// Backoff schedule shared by this module's reconnect loop and the
+/// boot-resume retry loop in accounts.rs: double after each failure,
+/// starting at 2s and never exceeding [`MAX_BACKOFF`]. Shared constants
+/// (rather than two coincidentally identical schedules) so the two loops
+/// stay honest about being the same policy: wait out a transient failure
+/// without hammering a struggling server, and still recover within one
+/// interval once it comes back.
+pub(crate) const INITIAL_BACKOFF: Duration = Duration::from_secs(2);
+pub(crate) const MAX_BACKOFF: Duration = Duration::from_secs(300);
+
+/// The next value of [`INITIAL_BACKOFF`]-seeded doubling backoff after a
+/// failed attempt (2s, 4s, 8s, ..., capped at [`MAX_BACKOFF`]).
+pub(crate) fn next_backoff(current: Duration) -> Duration {
+    (current * 2).min(MAX_BACKOFF)
+}
 
 /// How many *consecutive* failures to even open the EventSource connection
 /// (not counting a later drop of an already-working stream, which the
@@ -30,7 +45,7 @@ const FAILURE_NOTIFY_THRESHOLD: u32 = 5;
 /// that needs to read/write the right cursor in the store, decide when to
 /// stop, and label/route notifications so an action button lands on a
 /// JMAP client connected to the right account.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum WatchTarget {
     Primary,
     Shared { account_id: String, label: String },
@@ -53,9 +68,10 @@ impl WatchTarget {
     }
 
     /// Whether this target is still opted into, i.e. whether the watcher
-    /// should keep running. `false` means /logout, a /partages toggle-off,
-    /// or a /comptes disconnect happened while we were waiting.
-    fn still_active(&self, account: &crate::store::Account) -> bool {
+    /// (or a boot-resume retrying its connect) should keep going. `false`
+    /// means /logout, a /partages toggle-off, or a /comptes disconnect
+    /// happened while we were waiting.
+    pub(crate) fn still_active(&self, account: &crate::store::Account) -> bool {
         match self {
             WatchTarget::Primary => true,
             WatchTarget::Shared { account_id, .. } => {
@@ -175,7 +191,7 @@ pub fn spawn(
     let health_key = target.health_key(chat_id);
     state.health.register(&health_key);
     tokio::spawn(async move {
-        let mut backoff = Duration::from_secs(2);
+        let mut backoff = INITIAL_BACKOFF;
         let mut consecutive_connect_failures: u32 = 0;
         let mut notified_broken = false;
         // Set by run_once as soon as the EventSource connection actually
@@ -206,7 +222,7 @@ pub fn spawn(
 
                     if connected.load(Ordering::Relaxed) {
                         consecutive_connect_failures = 0;
-                        backoff = Duration::from_secs(2);
+                        backoff = INITIAL_BACKOFF;
                         if notified_broken {
                             notified_broken = false;
                             notify(&bot, &state, chat_id, connection_recovered_text(&target)).await;
@@ -225,7 +241,7 @@ pub fn spawn(
             }
 
             tokio::time::sleep(backoff).await;
-            backoff = (backoff * 2).min(MAX_BACKOFF);
+            backoff = next_backoff(backoff);
         }
     })
 }
@@ -523,6 +539,21 @@ mod tests {
             WatchTarget::Primary.health_key(4),
             WatchTarget::Primary.health_key(42)
         );
+    }
+
+    #[test]
+    fn next_backoff_doubles_from_2s_and_caps_at_300s() {
+        // The exact schedule the watcher reconnect loop and the boot-resume
+        // retry loop share (see INITIAL_BACKOFF): 2s, 4s, ..., doubling,
+        // never past MAX_BACKOFF.
+        let mut backoff = INITIAL_BACKOFF;
+        assert_eq!(backoff, Duration::from_secs(2));
+        assert_eq!(next_backoff(backoff), Duration::from_secs(4));
+        for _ in 0..20 {
+            backoff = next_backoff(backoff);
+        }
+        assert_eq!(backoff, MAX_BACKOFF);
+        assert_eq!(MAX_BACKOFF, Duration::from_secs(300));
     }
 
     #[test]

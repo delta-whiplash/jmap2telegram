@@ -27,6 +27,18 @@
 //!   ArgoCDAppDegraded alert, without restarting anything that a backoff
 //!   loop can heal on its own.
 //!
+//!   Registration is what makes that honest, so it happens *before* the
+//!   first connect attempt everywhere: `watcher::spawn` registers its key
+//!   before its task starts, and boot resume (see `accounts.rs`) registers
+//!   every persisted account up-front, then retries the connect with the
+//!   watcher's own backoff. An account whose server never comes back is
+//!   therefore a *permanent* registered-but-disconnected entry — /readyz
+//!   503 naming it — and never a green pod that quietly watches nothing.
+//!   The flip side is the pairing obligation: a registration must be
+//!   dropped on every teardown path (`Health::deregister` /
+//!   `deregister_chat`), including `handle.abort()`, since an aborted task
+//!   never gets to run its own cleanup.
+//!
 //! - **`/metrics` exposes Prometheus text format** so vmagent can scrape
 //!   the same registry: `jmap2telegram_watchers_registered` /
 //!   `_connected` gauges and per-watcher
