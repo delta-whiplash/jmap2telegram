@@ -1,0 +1,21 @@
+{{- if .Values.metrics.service.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "jmap2telegram.fullname" . }}-metrics
+  labels:
+    {{- include "jmap2telegram.labels" . | nindent 4 }}
+spec:
+  # Cluster-local only on purpose: port 8080 carries the kubelet probe
+  # endpoints and the Prometheus metrics, neither of which belongs outside
+  # the cluster. ClusterIP is the default, but the exposure boundary is the
+  # whole point of this Service, so spell it out.
+  type: ClusterIP
+  ports:
+    - name: metrics
+      port: 8080
+      targetPort: health
+      protocol: TCP
+  selector:
+    {{- include "jmap2telegram.selectorLabels" . | nindent 4 }}
+{{- end }}

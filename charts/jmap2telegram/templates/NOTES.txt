@@ -1,7 +1,28 @@
 jmap2telegram is deploying.
 
-This bot makes no inbound connections (no Service/Ingress is created): it
-long-polls the Telegram Bot API outbound, so there's nothing to expose.
+The bot works by long-polling the Telegram Bot API outbound: nothing needs
+to be exposed to the outside, and by default no Service is created. The
+container still listens on port 8080 ("health"), where it serves the
+kubelet probes (/healthz, /readyz — the kubelet reaches the pod directly,
+no Service involved) and /metrics in Prometheus text format.
+
+{{- if .Values.metrics.service.enabled }}
+
+metrics.service.enabled is on: a cluster-local Service,
+{{ include "jmap2telegram.fullname" . }}-metrics, exposes port 8080 for
+in-cluster scraping:
+  kubectl get service {{ include "jmap2telegram.fullname" . }}-metrics -n {{ .Release.Namespace }}
+  kubectl port-forward service/{{ include "jmap2telegram.fullname" . }}-metrics 8080:8080 -n {{ .Release.Namespace }}
+
+If your scraper relies on annotation-based discovery, remember to opt the
+pod in via podAnnotations (prometheus.io/scrape, prometheus.io/port,
+prometheus.io/path — see the example in values.yaml).
+{{- else }}
+
+metrics.service.enabled is off, so port 8080 stays reachable only by the
+kubelet. To scrape /metrics from inside the cluster, redeploy with:
+  --set metrics.service.enabled=true
+{{- end }}
 
 Check it came up:
   kubectl get pods -l app.kubernetes.io/instance={{ .Release.Name }} -n {{ .Release.Namespace }}

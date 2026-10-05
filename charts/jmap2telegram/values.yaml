@@ -75,8 +75,27 @@ nodeSelector: {}
 tolerations: []
 affinity: {}
 
+# Annotations for the pod template. Notably how the pod opts into
+# annotation-based Prometheus/vmagent discovery — the chart deliberately
+# never injects scrape annotations itself (discovery is the scraper's
+# business, not the workload's). When metrics.service.enabled=true, wire
+# them like:
+#   prometheus.io/scrape: "true"
+#   prometheus.io/port: "8080"
+#   prometheus.io/path: /metrics
 podAnnotations: {}
 podLabels: {}
+
+# Optional cluster-local Service exposing the container's health port 8080.
+# That single port serves /healthz and /readyz (what the kubelet probes hit
+# directly on the pod, no Service involved) as well as /metrics in
+# Prometheus text format. Off by default: the bot needs no inbound traffic
+# and nothing in the cluster probes it out of the box. Enable it only to
+# scrape /metrics from inside the cluster (Prometheus/vmagent with a
+# kubernetes_sd_configs monitor).
+metrics:
+  service:
+    enabled: false
 
 extraEnv: []
 # For advanced per-module filtering (tracing's EnvFilter syntax), which
