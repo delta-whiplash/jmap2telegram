@@ -51,6 +51,8 @@ impl PendingUndo {
 pub struct AppState {
     pub config: Arc<Config>,
     pub store: Arc<Store>,
+    /// Live watcher registry backing /readyz and /metrics (see health.rs).
+    pub health: Arc<crate::health::Health>,
     /// Live JMAP clients for each chat's own mailbox, keyed by chat id,
     /// shared between the watcher tasks and the inline-button handlers so
     /// an action doesn't need a fresh session negotiation every time.
@@ -80,6 +82,7 @@ impl AppState {
         Self {
             config,
             store,
+            health: Arc::new(crate::health::Health::default()),
             clients: Arc::new(RwLock::new(HashMap::new())),
             watchers: Arc::new(RwLock::new(HashMap::new())),
             shared_clients: Arc::new(RwLock::new(HashMap::new())),
@@ -213,6 +216,17 @@ impl AppState {
         }
         self.pending_undo.write().await.remove(&chat_id);
 
+        // `abort()` cancels a watcher task at its next await point, so it
+        // never gets to run its own registry cleanup (the deregister on
+        // its clean-exit path). Without this sweep, the entry
+        // `watcher::spawn` registered would outlive the task forever and
+        // pin /readyz at 503 for an account nobody is watching anymore.
+        // One prefix sweep covers the primary mailbox, every shared and
+        // every extra slot, *and* targets that hold a registry entry but
+        // no live handle to iterate over here — e.g. a boot-resume still
+        // waiting out its retry backoff (see accounts.rs).
+        self.health.deregister_chat(chat_id);
+
         Self::forget_all_for_chat(&self.shared_clients, &self.shared_watchers, chat_id).await;
         Self::forget_all_for_chat(&self.extra_clients, &self.extra_watchers, chat_id).await;
     }
@@ -243,6 +257,14 @@ impl AppState {
     /// chat's own mailbox and its other shared accounts untouched. Used
     /// when a single shared account is toggled off via /partages.
     pub async fn forget_shared(&self, chat_id: i64, account_id: &str) {
+        // Same deregister obligation as `forget` above — an aborted
+        // watcher task can't clean up after itself — keyed exactly like
+        // `watcher::spawn` keys it, and unconditional on purpose: the
+        // entry exists (registered by the watcher, or at boot before its
+        // first connect attempt) even when no handle sits in the map
+        // below, so deregistering only on abort would leak exactly those.
+        self.health
+            .deregister(&crate::watcher::shared_health_key(chat_id, account_id));
         let key = (chat_id, account_id.to_string());
         self.shared_clients.write().await.remove(&key);
         if let Some(handle) = self.shared_watchers.write().await.remove(&key) {
@@ -253,6 +275,9 @@ impl AppState {
     /// Tears down just one extra account's watcher/client. Used when it's
     /// disconnected via /comptes.
     pub async fn forget_extra(&self, chat_id: i64, slot_id: &str) {
+        // Same deregister obligation as `forget_shared` above.
+        self.health
+            .deregister(&crate::watcher::extra_health_key(chat_id, slot_id));
         let key = (chat_id, slot_id.to_string());
         self.extra_clients.write().await.remove(&key);
         if let Some(handle) = self.extra_watchers.write().await.remove(&key) {
@@ -264,6 +289,46 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
+    use crate::watcher::{self, WatchTarget};
+    use std::collections::HashSet;
+    use teloxide::types::ChatId;
+
+    /// An `AppState` pair around a throwaway encrypted store. The Config
+    /// here is never exercised for anything the tests below touch (no JMAP
+    /// connects, no Telegram requests) — it just has to exist.
+    async fn test_state() -> (AppState, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Arc::new(Config {
+            telegram_token: "t:test-token".to_string(),
+            authorized_chat_ids: HashSet::from([ChatId(42)]),
+            data_dir: dir.path().to_path_buf(),
+            allow_private_jmap_hosts: true,
+            timezone: chrono_tz::Tz::UTC,
+        });
+        let store = Arc::new(Store::open(dir.path()).unwrap());
+        (AppState::new(config, store), dir)
+    }
+
+    /// A watcher stand-in that never finishes, so the `forget*` teardowns
+    /// have a real `JoinHandle` to remove and abort.
+    fn parked_handle() -> JoinHandle<()> {
+        tokio::spawn(std::future::pending::<()>())
+    }
+
+    /// Registers — and marks connected — the health entries a fully online
+    /// chat 42 would hold: its primary mailbox plus one shared and one
+    /// extra account, keyed exactly as `watcher::spawn` derives them.
+    fn register_chat_42_targets(state: &AppState) {
+        for key in [
+            WatchTarget::Primary.health_key(42),
+            watcher::shared_health_key(42, "acc7"),
+            watcher::extra_health_key(42, "slot1"),
+        ] {
+            state.health.register(&key);
+            state.health.set_connected(&key, true);
+        }
+    }
 
     #[test]
     fn pending_undo_is_expired_reflects_the_deadline() {
@@ -280,5 +345,117 @@ mod tests {
             ..fresh
         };
         assert!(stale.is_expired());
+    }
+
+    #[tokio::test]
+    async fn forget_deregisters_every_health_entry_of_the_chat() {
+        // Regression test for the ghost-entry leak: `handle.abort()` used
+        // to leave the registry entry behind, pinning /readyz at 503
+        // forever for a chat nobody was watching anymore.
+        let (state, _dir) = test_state().await;
+        register_chat_42_targets(&state);
+        // A different chat's watcher must survive chat 42's teardown.
+        state.health.register(&WatchTarget::Primary.health_key(43));
+
+        // Live handles, as running watchers would have left behind.
+        state.watchers.write().await.insert(42, parked_handle());
+        state
+            .shared_watchers
+            .write()
+            .await
+            .insert((42, "acc7".to_string()), parked_handle());
+        state
+            .extra_watchers
+            .write()
+            .await
+            .insert((42, "slot1".to_string()), parked_handle());
+
+        state.forget(42).await;
+
+        let snapshot = state.health.snapshot();
+        assert!(!snapshot.contains_key("42/primary"), "{snapshot:?}");
+        assert!(!snapshot.contains_key("42/shared-acc7"), "{snapshot:?}");
+        assert!(!snapshot.contains_key("42/extra-slot1"), "{snapshot:?}");
+        assert!(snapshot.contains_key("43/primary"), "{snapshot:?}");
+        // The watcher maps went with it, so a later forget is a no-op
+        // rather than an abort of a stale handle.
+        assert!(state.watchers.read().await.is_empty());
+        assert!(state.shared_watchers.read().await.is_empty());
+        assert!(state.extra_watchers.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn forget_clears_entries_of_targets_without_a_running_watcher() {
+        // Boot-resume shape (see accounts.rs): the registry entry exists —
+        // registered *before* the first connect attempt — but no handle
+        // sits in the watcher maps yet. A /logout racing that retry must
+        // still clear the entry, or /readyz would never recover.
+        let (state, _dir) = test_state().await;
+        state
+            .health
+            .register(&watcher::shared_health_key(42, "acc7"));
+        state
+            .health
+            .register(&watcher::extra_health_key(42, "slot1"));
+
+        state.forget(42).await;
+
+        assert!(state.health.snapshot().is_empty());
+    }
+
+    #[tokio::test]
+    async fn forget_shared_deregisters_only_that_accounts_entry() {
+        let (state, _dir) = test_state().await;
+        register_chat_42_targets(&state);
+        // A second shared account of the same chat: it has an entry but no
+        // handle (boot-resume shape), and toggling acc7 off must not touch
+        // it.
+        state
+            .health
+            .register(&watcher::shared_health_key(42, "acc8"));
+        state
+            .shared_watchers
+            .write()
+            .await
+            .insert((42, "acc7".to_string()), parked_handle());
+
+        state.forget_shared(42, "acc7").await;
+
+        let snapshot = state.health.snapshot();
+        assert!(!snapshot.contains_key("42/shared-acc7"), "{snapshot:?}");
+        assert!(snapshot.contains_key("42/primary"), "{snapshot:?}");
+        assert!(snapshot.contains_key("42/extra-slot1"), "{snapshot:?}");
+        assert!(snapshot.contains_key("42/shared-acc8"), "{snapshot:?}");
+        // Readiness reflects the surviving state exactly: acc8 was
+        // registered but never connected, so it alone holds /readyz at
+        // 503 until its watcher comes up.
+        assert_eq!(
+            state.health.readiness(),
+            Err(vec!["42/shared-acc8".to_string()])
+        );
+        state
+            .health
+            .set_connected(&watcher::shared_health_key(42, "acc8"), true);
+        assert_eq!(state.health.readiness(), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn forget_extra_deregisters_only_that_slots_entry() {
+        let (state, _dir) = test_state().await;
+        register_chat_42_targets(&state);
+        // No handle for slot1 here on purpose: the deregister must not
+        // depend on there being a watcher to abort.
+        state
+            .extra_watchers
+            .write()
+            .await
+            .insert((42, "slot1".to_string()), parked_handle());
+
+        state.forget_extra(42, "slot1").await;
+
+        let snapshot = state.health.snapshot();
+        assert!(!snapshot.contains_key("42/extra-slot1"), "{snapshot:?}");
+        assert!(snapshot.contains_key("42/primary"), "{snapshot:?}");
+        assert!(snapshot.contains_key("42/shared-acc7"), "{snapshot:?}");
     }
 }

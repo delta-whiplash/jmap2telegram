@@ -52,19 +52,74 @@
   Its credentials are stored with the same shape and the same encrypted
   file as the primary account; disconnecting it or `/logout` erases it
   the same way.
-- **SSRF via `/login`.** `server_url` is attacker-controlled (it's
-  whatever an authorized chat typed in), and `AUTHORIZED_CHAT_IDS` can
-  list several mutually-untrusted chats. By default, any hostname that
-  resolves to a private/loopback/link-local/multicast address (including
-  the `169.254.169.254` cloud metadata endpoint) is refused before the
+- **SSRF via `/login` (resolution guard + error-oracle neutralization).**
+  `server_url` is attacker-controlled (it's whatever an authorized chat
+  typed in), and `AUTHORIZED_CHAT_IDS` can list several
+  mutually-untrusted chats. By default, any hostname that resolves to a
+  private/loopback/link-local/multicast address (including the
+  `169.254.169.254` cloud metadata endpoint) is refused before the
   bearer token is ever sent to it — otherwise `/login` would be a
-  ready-made SSRF probe of the deployment's internal network. Self-hosters
-  who deliberately run their JMAP server on an internal network can opt
-  back in with `ALLOW_PRIVATE_JMAP_HOSTS=1`. Residual risk: this is a
-  pre-connect DNS check, not a per-connection resolver, so a DNS answer
-  that changes between the check and the actual request (rebinding) is
-  not covered — treat `ALLOW_PRIVATE_JMAP_HOSTS` as "trust this
-  deployment's authorized chats," not as a sandboxed boundary.
+  ready-made SSRF probe of the deployment's internal network. The
+  guard's own refusal stays detailed (it explains a policy decision
+  about a name the user themselves supplied, not a probe result);
+  every *network-level* failure past it — DNS resolution, TCP/TLS
+  connect, autodiscovery, session negotiation, authentication, and the
+  watcher's EventSource reconnects — is by contrast collapsed into a
+  single fixed generic chat message, with the real cause logged
+  server-side only. That is error-oracle neutralization: a raw reqwest
+  transport error names the full URL plus the OS-level TCP cause
+  ("connection refused" vs "timed out" vs a TLS/HTTP error), which
+  fingerprints exactly one internal port state, and echoing it back to
+  the chat used to turn `/login` (and, after a DNS rebound, the
+  recurring "connection broken" watcher notice) into a readable
+  internal-port-reachability oracle. Two regression tests pin the
+  surfaces (`connect_failure_error_message_carries_no_transport_detail`
+  in `src/jmap.rs`,
+  `connection_broken_text_never_interpolates_the_transport_error` in
+  `src/watcher.rs`). Self-hosters who deliberately run their JMAP server
+  on an internal network can opt back in with
+  `ALLOW_PRIVATE_JMAP_HOSTS=1`; this re-enables the requests themselves
+  but not the error oracle — even opted in, network failures still only
+  ever produce the generic chat message.
+
+  Residual risk — a known, accepted TOCTOU: the guard resolves the
+  hostname once, right before the session handshake, and `jmap-client`
+  re-resolves on every request (the crate builds its own internal
+  `reqwest::Client` per call site: the session handshake and
+  `send_request` in `src/client.rs`, the EventSource stream in
+  `src/event_source/stream.rs`, blob upload/download — all inside the
+  crate), so a DNS answer that changes between the check and the
+  actual request (rebinding) is not covered. With the error oracle
+  closed, rebinding no longer leaks port states: an attacker can still
+  *make* the bot emit requests (carrying the attacker's own bearer
+  token) toward internal addresses, but cannot read the results back.
+  Two minor channels remain and are accepted: a success bit (the
+  "✅ connecté" reply if an internal service both spoke JMAP and
+  accepted the attacker's arbitrary token — vanishingly unlikely) and
+  response latency (fast refusal vs slow timeout, heavily
+  noise-washed by the connect timeout and ordinary network jitter).
+  Treat `ALLOW_PRIVATE_JMAP_HOSTS` as "trust this deployment's
+  authorized chats," not as a sandboxed boundary.
+
+  Upstream fix path (removes the TOCTOU and both minor channels): pin
+  the guard-validated IPs for the client's whole lifetime, so session,
+  EventSource and blob requests all connect to exactly what was
+  checked. As of `jmap-client` 0.4.2 **and** 0.4.3 (released
+  2026-09-28; its only delta vs 0.4.2 is a base64→encodify refactor of
+  three files, no API change), `ClientBuilder` cannot do this: its
+  five fields (`credentials`, `trusted_hosts`, `forwarded_for`,
+  `accept_invalid_certs`, `timeout`) are all private, with no setter
+  for a `reqwest::Client` or a resolver. The clean upstream change is
+  a `ClientBuilder::http_client(reqwest::Client)` (or equivalently a
+  `ClientBuilder::resolver()`) propagated to every internal
+  `reqwest::Client` construction site in the crate, so `connect()` can
+  build a client with
+  `reqwest::ClientBuilder::resolve_to(domain, SocketAddr)` seeded from
+  the addresses the SSRF guard validated. Until that exists, the only
+  real fixes are a `[patch.crates-io]` fork carrying the same resolver
+  propagation, or reimplementing the session handshake and EventSource
+  on top of our own `reqwest::Client` — both deliberately out of scope
+  for now.
 - **Group chats.** The bot only responds in private (1:1) chats. A group
   chat id in `AUTHORIZED_CHAT_IDS` would otherwise hand every current and
   future member of that group full control (read/archive/delete) over

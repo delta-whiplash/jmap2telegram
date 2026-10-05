@@ -30,13 +30,34 @@ jobs:
       version: ${{ steps.version.outputs.version }}
     steps:
       - id: version
+        env:
+          # Anything typed into the dispatch form (or sneaked into a ref
+          # name) must reach the shell through env, never through `run:`
+          # interpolation — bash would expand it before any validation
+          # below gets a chance to look at it.
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "version=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            version="$INPUT_VERSION"
           else
-            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+            version="${REF_NAME#v}"
           fi
+          # Whatever produced it — a typed dispatch input or the pushed
+          # tag's ref name — the version is only trusted once this
+          # whole-string check has passed; `[[ =~ ]]` anchors against the
+          # entire variable, unlike grep, which anchors per line and so
+          # would wave through a multi-line value whose second line is a
+          # `<<EOF` heredoc (the GITHUB_OUTPUT injection shape). Every
+          # later step interpolates steps.version.outputs.version, which
+          # from here on can only be digits and dots.
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Invalid version '$version': expected X.Y.Z (dot-separated digits, no leading v, nothing else)."
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Create or move release tag (manual dispatch only)
         if: github.event_name == 'workflow_dispatch'
@@ -140,8 +161,13 @@ jobs:
           set -euo pipefail
           VERSION="${{ needs.prep.outputs.version }}"
           sed -i "s/^version:.*/version: ${VERSION}/" charts/jmap2telegram/Chart.yaml
-          sed -i "s/^appVersion:.*/appVersion: \"${VERSION}\"/" charts/jmap2telegram/Chart.yaml
-          sed -i "s/^  tag:.*/  tag: \"${VERSION}\"/" charts/jmap2telegram/values.yaml
+          # appVersion keeps the leading v: docker/metadata-action publishes
+          # only vX.Y.Z / X.Y / X / latest, and the chart resolves an empty
+          # image.tag to appVersion — a bare version there was an
+          # ImagePullBackOff waiting for default-value installs (the bug
+          # behind v0.1.1's chart). Chart *version* itself stays bare, per
+          # helm convention.
+          sed -i "s/^appVersion:.*/appVersion: \"v${VERSION}\"/" charts/jmap2telegram/Chart.yaml
 
       - run: helm lint charts/jmap2telegram
       - run: helm package charts/jmap2telegram --destination /tmp/chart-out

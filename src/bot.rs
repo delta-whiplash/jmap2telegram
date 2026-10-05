@@ -1043,8 +1043,50 @@ async fn callback_handler(bot: Bot, q: CallbackQuery, state: AppState) -> Handle
             match jmap::fetch_full_text(&client, email_id).await {
                 Ok(text) => {
                     bot.answer_callback_query(q.id).await?;
-                    for chunk in chunk_text(&text, TELEGRAM_MAX_MESSAGE_LEN - 16) {
-                        bot.send_message(chat_id, chunk).await?;
+                    // One chunk failing to send (a flood limit, a network
+                    // blip, Telegram hiccup) must not silently abort every
+                    // chunk after it — the reader would get the first
+                    // pages of a long mail and then silence, with nothing
+                    // to hint that content is missing. So: log each
+                    // failure, keep sending the rest, and close with a
+                    // message listing which parts never arrived.
+                    let chunks = chunk_text(&text, TELEGRAM_MAX_MESSAGE_LEN - 16);
+                    let total = chunks.len();
+                    let mut failed: Vec<usize> = Vec::new();
+                    for (index, chunk) in chunks.into_iter().enumerate() {
+                        if let Err(e) = bot.send_message(chat_id, chunk).await {
+                            tracing::error!(
+                                chat_id = chat_id.0,
+                                email_id,
+                                part = index + 1,
+                                total_parts = total,
+                                error = %e,
+                                "failed to send a chunk of the full message"
+                            );
+                            failed.push(index + 1);
+                        }
+                    }
+                    if !failed.is_empty() {
+                        // Best-effort: if Telegram is unreachable wholesale,
+                        // this summary fails too and we only lose the
+                        // in-chat notice — the per-chunk errors are already
+                        // in the logs. Retrying "Lire tout" resends the
+                        // whole body, which is why the hint says so.
+                        let listing = failed
+                            .iter()
+                            .map(|p| format!("{p}/{total}"))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let _ = bot
+                            .send_message(
+                                chat_id,
+                                format!(
+                                    "⚠️ {} partie(s) du message n'ont pas pu être envoyées \
+                                     ({listing}). Réessaie « Lire tout » pour tout relire.",
+                                    failed.len()
+                                ),
+                            )
+                            .await;
                     }
                 }
                 Err(e) => {

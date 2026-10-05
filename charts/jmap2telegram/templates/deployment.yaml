@@ -5,9 +5,11 @@ metadata:
   labels:
     {{- include "jmap2telegram.labels" . | nindent 4 }}
 spec:
-  # Never scale this beyond 1: a single stateful long-poller against the
-  # Telegram Bot API, backed by one local encrypted file store. See
-  # values.yaml for why replicaCount isn't meant to be tuned.
+  # Invariant of the app, not a tunable: exactly one replica — a single
+  # stateful long-poller against the Telegram Bot API with one local
+  # encrypted file store. Two replicas would double-notify every chat and
+  # race on the same volume, so this is hardcoded and there is deliberately
+  # no replicaCount knob in values.yaml.
   replicas: 1
   strategy:
     type: Recreate
@@ -26,6 +28,9 @@ spec:
         {{- toYaml . | nindent 8 }}
         {{- end }}
     spec:
+      # The bot never talks to the Kubernetes API (it only long-polls the
+      # Telegram Bot API outbound), so it gets no mounted token at all.
+      automountServiceAccountToken: false
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
@@ -34,7 +39,7 @@ spec:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       containers:
         - name: jmap2telegram
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
@@ -57,6 +62,26 @@ spec:
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
+          ports:
+            - name: health
+              containerPort: 8080
+              protocol: TCP
+          # Both endpoints are served by the same minimal responder (see
+          # src/health.rs): 200 as long as the tokio runtime is scheduling
+          # the accept loop. No startupProbe: boot work (store decrypt) is
+          # sub-second and the readiness below covers the gap.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            periodSeconds: 30
+            timeoutSeconds: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            periodSeconds: 10
+            timeoutSeconds: 3
           volumeMounts:
             - name: data
               mountPath: /data
