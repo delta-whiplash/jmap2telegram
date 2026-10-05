@@ -95,6 +95,18 @@ impl WatchTarget {
         }
     }
 
+    /// Registry key for the health endpoint: stable, unique per watched
+    /// account within a chat, and readable in `kubectl` output and metric
+    /// labels. Embeds the chat id and the account slot — internal
+    /// identifiers only, never credentials.
+    fn health_key(&self, chat_id: i64) -> String {
+        match self {
+            WatchTarget::Primary => format!("{chat_id}/primary"),
+            WatchTarget::Shared { account_id, .. } => format!("{chat_id}/shared-{account_id}"),
+            WatchTarget::Extra { slot_id, .. } => format!("{chat_id}/extra-{slot_id}"),
+        }
+    }
+
     /// How this target is referred to in a connection-health notification.
     fn scope_label(&self) -> String {
         match self {
@@ -136,6 +148,8 @@ pub fn spawn(
     client: Arc<JmapClient>,
     target: WatchTarget,
 ) -> tokio::task::JoinHandle<()> {
+    let health_key = target.health_key(chat_id);
+    state.health.register(&health_key);
     tokio::spawn(async move {
         let mut backoff = Duration::from_secs(2);
         let mut consecutive_connect_failures: u32 = 0;
@@ -152,6 +166,10 @@ pub fn spawn(
             match run_once(&bot, &state, chat_id, &client, &target, &connected).await {
                 Ok(()) => {
                     // Clean shutdown requested (account removed/toggled off).
+                    // Dropping the registry entry here (rather than on task
+                    // exit below) keeps /readyz and /metrics exact even
+                    // though the JoinHandle outlives the account.
+                    state.health.deregister(&health_key);
                     return;
                 }
                 Err(e) => {
@@ -206,6 +224,9 @@ async fn run_once(
         .event_source(Some(jmap::WATCHED_TYPES), false, Some(60), None)
         .await?;
     connected.store(true, Ordering::Relaxed);
+    state
+        .health
+        .set_connected(&target.health_key(chat_id), true);
 
     let mut interval = tokio::time::interval(FALLBACK_POLL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -263,6 +284,9 @@ async fn sync_and_notify(
             return;
         }
     };
+    // Successful sync (event-driven or fallback poll): advance the health
+    // activity clock behind jmap2telegram_last_activity_age_seconds.
+    state.health.touch(&target.health_key(chat_id));
 
     for summary in &summaries {
         if is_muted(summary, &account.muted) {

@@ -51,6 +51,8 @@ impl PendingUndo {
 pub struct AppState {
     pub config: Arc<Config>,
     pub store: Arc<Store>,
+    /// Live watcher registry backing /readyz and /metrics (see health.rs).
+    pub health: Arc<crate::health::Health>,
     /// Live JMAP clients for each chat's own mailbox, keyed by chat id,
     /// shared between the watcher tasks and the inline-button handlers so
     /// an action doesn't need a fresh session negotiation every time.
@@ -80,6 +82,7 @@ impl AppState {
         Self {
             config,
             store,
+            health: Arc::new(crate::health::Health::default()),
             clients: Arc::new(RwLock::new(HashMap::new())),
             watchers: Arc::new(RwLock::new(HashMap::new())),
             shared_clients: Arc::new(RwLock::new(HashMap::new())),

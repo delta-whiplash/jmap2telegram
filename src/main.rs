@@ -46,7 +46,7 @@ async fn main() -> anyhow::Result<()> {
     // Bound here rather than in the spawned task so a bind failure is a
     // loud startup error instead of a silently absent probe endpoint.
     let probe_listener = health::bind().await?;
-    tokio::spawn(health::serve(probe_listener));
+    tokio::spawn(health::serve(probe_listener, state.health.clone()));
 
     // Registers the command list with Telegram itself, so the client's "/"
     // menu autocompletes every command with its description instead of the
