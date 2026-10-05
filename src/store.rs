@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, RwLock};
 
@@ -371,29 +371,103 @@ impl Store {
         }
         fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600))?;
         fs::rename(&tmp_path, &self.state_path)?;
+        // The rename is only durable once the directory entry change is
+        // fsynced too: without this, a crash right after persist() could
+        // still roll back to the previous state.enc (or lose the rename
+        // entirely) even though the file's own sync_all() above made the
+        // data durable. Best-effort on purpose: some filesystems (network
+        // volumes, older FUSE mounts) refuse directory fsync outright, and
+        // failing persist() for that would make the bot unusable for no
+        // benefit — the file content itself is already synced, so the
+        // worst case is that the previous consistent state survives.
+        if let Some(parent) = self.state_path.parent()
+            && let Err(e) = fs::File::open(parent).and_then(|dir| dir.sync_all())
+        {
+            tracing::warn!(
+                error = %e,
+                "failed to fsync the data directory after the state rename (non-fatal)"
+            );
+        }
         Ok(())
     }
 }
 
 fn load_or_create_key(key_path: &Path) -> Result<[u8; KEY_LEN]> {
-    if key_path.exists() {
-        let bytes = fs::read(key_path).context("reading master key")?;
-        if bytes.len() != KEY_LEN {
-            bail!(
-                "master key file has unexpected length ({} bytes)",
-                bytes.len()
-            );
+    if !key_path.exists() {
+        // create_new() + mode(0600) makes the file appear on disk already
+        // owner-only: the mode is part of the open(2) that creates the
+        // inode, so there is no instant at which the key is readable by
+        // group/others — unlike the previous write-then-chmod, which left
+        // a crash window (and a 0644 key on disk) whenever the process
+        // died between fs::write and set_permissions. The mode is still
+        // subject to umask, but a umask can only clear permission bits,
+        // so it can never widen 0600.
+        match fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(key_path)
+        {
+            Ok(mut f) => {
+                let mut key = [0u8; KEY_LEN];
+                rng().fill_bytes(&mut key);
+                f.write_all(&key).context("writing master key")?;
+                // sync_all() before returning: a crash right after this
+                // must never leave a zero-length or partially-written key
+                // behind — every subsequent boot would then refuse to
+                // start ("unexpected length") while the state file stays
+                // undecryptable forever.
+                f.sync_all()
+                    .context("flushing master key to stable storage")?;
+                return Ok(key);
+            }
+            // Lost a creation race: the key file appeared between the
+            // exists() check above and create_new() (e.g. a second bot
+            // process starting against the same volume). create_new()
+            // guarantees we did not touch or truncate the winner's file,
+            // so the honest move is to fall through and read the key that
+            // won the race like any pre-existing one.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e).context("creating master key"),
         }
-        let mut key = [0u8; KEY_LEN];
-        key.copy_from_slice(&bytes);
-        Ok(key)
-    } else {
-        let mut key = [0u8; KEY_LEN];
-        rng().fill_bytes(&mut key);
-        fs::write(key_path, key).context("writing master key")?;
-        fs::set_permissions(key_path, fs::Permissions::from_mode(0o600))?;
-        Ok(key)
     }
+
+    // The key file existed on entry (or another process just created it):
+    // verify it is still 0600 before trusting it. Anything could have
+    // widened the mode after creation — an operator restoring from a
+    // backup that dropped permissions, a `cp` that recreated the file,
+    // a container image rebuild — and this key decrypts the whole state
+    // file, so quietly tighten it back instead of trusting the mode to
+    // have survived. Only *widenings* are fixed: a stricter mode (e.g.
+    // 0400) is left alone, since resetting it to 0600 would grant the
+    // owner write permission the operator deliberately removed. A failure
+    // to tighten is fatal on purpose: continuing would mean serving the
+    // bot with a world-readable master key we were unable to protect.
+    let perms = fs::metadata(key_path)
+        .with_context(|| format!("statting master key {key_path:?}"))?
+        .permissions()
+        .mode()
+        & 0o777;
+    if (perms & !0o600) != 0 {
+        tracing::warn!(
+            path = %key_path.display(),
+            mode = %format!("{perms:o}"),
+            "master key file permissions wider than 0600, tightening back to 0600"
+        );
+        fs::set_permissions(key_path, fs::Permissions::from_mode(0o600))
+            .context("tightening master key permissions back to 0600")?;
+    }
+
+    let bytes = fs::read(key_path).context("reading master key")?;
+    if bytes.len() != KEY_LEN {
+        bail!(
+            "master key file has unexpected length ({} bytes)",
+            bytes.len()
+        );
+    }
+    let mut key = [0u8; KEY_LEN];
+    key.copy_from_slice(&bytes);
+    Ok(key)
 }
 
 fn encrypt(key: &[u8; KEY_LEN], plaintext: &[u8]) -> Result<Vec<u8>> {
@@ -509,6 +583,92 @@ mod tests {
         let _store = Store::open(dir.path()).unwrap();
         let meta = fs::metadata(dir.path().join("master.key")).unwrap();
         assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+    }
+
+    /// `load_or_create_key` creates the key with `create_new()` + mode
+    /// 0600, so the file is born owner-only even under the most permissive
+    /// umask — unlike the previous `fs::write` + chmod, which first created
+    /// it 0644 and only then tightened it. umask(2) is process-global and
+    /// all tests share one process, so setting it in-process would leak
+    /// into concurrently running tests; instead re-exec this same test
+    /// binary through `sh -c 'umask 0000; exec "$@"'` and run the ignored
+    /// child test below there, where the child itself asserts the mode.
+    #[test]
+    fn master_key_is_created_0600_even_under_a_permissive_umask() {
+        let exe = std::env::current_exe().unwrap();
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("umask 0000; exec \"$@\"")
+            .arg("sh") // $0 for "$@" expansion
+            .arg(&exe)
+            .args(["--ignored", "master_key_created_0600_child"])
+            .output()
+            .expect("re-exec test binary under a permissive umask");
+        assert!(
+            out.status.success(),
+            "child test under umask 0000 failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// Child half of the permissive-umask test above: only ever run by it,
+    /// via `sh` with `umask 0000` (hence #[ignore] — a plain `cargo test`
+    /// must not pick it up, the parent passes `--ignored` explicitly).
+    #[test]
+    #[ignore = "in-process child; driven by master_key_is_created_0600_even_under_a_permissive_umask"]
+    fn master_key_created_0600_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let _store = Store::open(dir.path()).unwrap();
+        let mode = fs::metadata(dir.path().join("master.key"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "key must be born 0600 even under umask 0000 (got {mode:o})"
+        );
+    }
+
+    #[test]
+    fn widened_master_key_permissions_are_tightened_back_on_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let store = Store::open(dir.path()).unwrap();
+            store.set(1, account("a@b.c")).unwrap();
+        }
+        // Simulate anything that could have widened the mode behind our
+        // back (backup restore, operator `cp`, container rebuild): the
+        // next open() must tighten it back and still use the *same* key,
+        // i.e. the persisted state must keep decrypting.
+        let key_path = dir.path().join("master.key");
+        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o644)).unwrap();
+        let reopened = Store::open(dir.path()).unwrap();
+        assert_eq!(reopened.get(1).unwrap().email, "a@b.c");
+        assert_eq!(
+            fs::metadata(&key_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn stricter_master_key_permissions_are_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let store = Store::open(dir.path()).unwrap();
+            store.set(1, account("a@b.c")).unwrap();
+        }
+        // 0400 is strictly safer than 0600: reloading must not "fix" it
+        // by re-granting the owner write permission.
+        let key_path = dir.path().join("master.key");
+        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o400)).unwrap();
+        let reopened = Store::open(dir.path()).unwrap();
+        assert_eq!(reopened.get(1).unwrap().email, "a@b.c");
+        assert_eq!(
+            fs::metadata(&key_path).unwrap().permissions().mode() & 0o777,
+            0o400
+        );
     }
 
     #[test]
