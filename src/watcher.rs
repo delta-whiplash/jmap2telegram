@@ -99,7 +99,7 @@ impl WatchTarget {
     /// account within a chat, and readable in `kubectl` output and metric
     /// labels. Embeds the chat id and the account slot — internal
     /// identifiers only, never credentials.
-    fn health_key(&self, chat_id: i64) -> String {
+    pub(crate) fn health_key(&self, chat_id: i64) -> String {
         match self {
             WatchTarget::Primary => format!("{chat_id}/primary"),
             WatchTarget::Shared { account_id, .. } => format!("{chat_id}/shared-{account_id}"),
@@ -115,6 +115,30 @@ impl WatchTarget {
             WatchTarget::Extra { label, .. } => format!("le compte « {label} »"),
         }
     }
+}
+
+/// Health-registry key for one shared account's watcher, for teardown
+/// sites (`state.rs`'s `forget_shared`) that only know the slot
+/// identifiers, never the display label — which plays no part in
+/// [`WatchTarget::health_key`] anyway. Building the minimal target and
+/// reusing the same key builder the watcher itself uses keeps the key
+/// format defined in exactly one place.
+pub(crate) fn shared_health_key(chat_id: i64, account_id: &str) -> String {
+    WatchTarget::Shared {
+        account_id: account_id.to_string(),
+        label: String::new(),
+    }
+    .health_key(chat_id)
+}
+
+/// Same as [`shared_health_key`], for an extra account's slot
+/// (`state.rs`'s `forget_extra`).
+pub(crate) fn extra_health_key(chat_id: i64, slot_id: &str) -> String {
+    WatchTarget::Extra {
+        slot_id: slot_id.to_string(),
+        label: String::new(),
+    }
+    .health_key(chat_id)
 }
 
 fn connection_broken_text(target: &WatchTarget, last_error: &anyhow::Error) -> String {
@@ -455,6 +479,50 @@ mod tests {
         assert!(!acc.extra_accounts.contains_key("acc7"));
         assert!(acc.extra_accounts.contains_key("slot1"));
         assert!(!acc.shared_accounts.contains_key("slot1"));
+    }
+
+    #[test]
+    fn health_keys_use_a_stable_slash_separated_format() {
+        // The exact format matters beyond readability: health.rs's
+        // deregister_chat strips entries by "{chat_id}/" prefix and the
+        // keys end up in /readyz bodies, kubectl output and Prometheus
+        // labels, so a change is user-visible and must be deliberate.
+        assert_eq!(WatchTarget::Primary.health_key(42), "42/primary");
+        assert_eq!(shared_health_key(42, "acc7"), "42/shared-acc7");
+        assert_eq!(extra_health_key(42, "slot1"), "42/extra-slot1");
+        // The teardown helpers must derive exactly the key a real watcher
+        // registers, including when the label differs — the label never
+        // participates in the key.
+        assert_eq!(
+            shared_health_key(42, "acc7"),
+            WatchTarget::Shared {
+                account_id: "acc7".to_string(),
+                label: "contact@delta-net.ovh".to_string(),
+            }
+            .health_key(42)
+        );
+        assert_eq!(
+            extra_health_key(42, "slot1"),
+            WatchTarget::Extra {
+                slot_id: "slot1".to_string(),
+                label: "second@other.example".to_string(),
+            }
+            .health_key(42)
+        );
+    }
+
+    #[test]
+    fn health_keys_keep_neighbouring_chats_prefix_distinct() {
+        // deregister_chat in health.rs matches keys by "{chat_id}/"
+        // prefix; the trailing separator is what makes that exact, so
+        // chat 4's teardown must never sweep chat 42's entries (or the
+        // other way around).
+        assert!(WatchTarget::Primary.health_key(4).starts_with("4/"));
+        assert!(!WatchTarget::Primary.health_key(42).starts_with("4/"));
+        assert_ne!(
+            WatchTarget::Primary.health_key(4),
+            WatchTarget::Primary.health_key(42)
+        );
     }
 
     #[test]

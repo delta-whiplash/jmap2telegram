@@ -44,7 +44,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 /// One watched JMAP account's live state, as tracked by its watcher task.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct WatcherStatus {
     /// Whether the EventSource connection is currently open.
     pub connected: bool,
@@ -93,6 +93,25 @@ impl Health {
         self.watchers.lock().unwrap().remove(key);
     }
 
+    /// Drops every registry entry belonging to `chat_id` — primary,
+    /// shared and extra slots alike — in one sweep. The full-chat teardown
+    /// in `state.rs` (`forget`, on /logout and /login) needs this because
+    /// it must also clear entries for targets that have no live watcher
+    /// handle to iterate over, such as a boot-resume still waiting out
+    /// its reconnect backoff with an entry registered *before* its first
+    /// connect attempt.
+    ///
+    /// Prefix matching on `"{chat_id}/"` is exact: the trailing separator
+    /// means chat 4's keys (`"4/primary"`, `"4/shared-…"`, …) can never
+    /// match a scan for chat 42, and vice versa.
+    pub fn deregister_chat(&self, chat_id: i64) {
+        let prefix = format!("{chat_id}/");
+        self.watchers
+            .lock()
+            .unwrap()
+            .retain(|key, _| !key.starts_with(&prefix));
+    }
+
     /// Records whether this watcher's EventSource connection is open.
     pub fn set_connected(&self, key: &str, connected: bool) {
         self.update(key, |s| s.connected = connected);
@@ -103,13 +122,17 @@ impl Health {
         self.update(key, |s| s.last_activity = Some(Instant::now()));
     }
 
-    fn snapshot(&self) -> HashMap<String, WatcherStatus> {
+    /// Point-in-time copy of the whole registry, as /metrics renders it.
+    /// Crate-visible so the teardown and boot-resume tests in other
+    /// modules can assert on the same view the endpoints serve.
+    pub(crate) fn snapshot(&self) -> HashMap<String, WatcherStatus> {
         self.watchers.lock().unwrap().clone()
     }
 
     /// Readiness: every registered watcher connected, or nothing to watch.
-    /// Returns the failing keys for the 503 body.
-    fn readiness(&self) -> Result<(), Vec<String>> {
+    /// Returns the failing keys for the 503 body. Crate-visible for the
+    /// same cross-module test reasons as [`snapshot`](Health::snapshot).
+    pub(crate) fn readiness(&self) -> Result<(), Vec<String>> {
         let disconnected: Vec<String> = self
             .snapshot()
             .iter()
@@ -361,6 +384,34 @@ mod tests {
         health.set_connected("42/primary", true);
         health.touch("42/primary");
         assert!(health.snapshot().is_empty());
+    }
+
+    #[test]
+    fn deregister_chat_clears_every_target_kind_of_that_chat_and_only_that_chat() {
+        // Keys exactly as watcher::spawn derives them from its targets, to
+        // lock the coupling deregister_chat's "{chat_id}/" prefix scan
+        // relies on (see watcher::shared_health_key / extra_health_key).
+        let health = Arc::new(Health::default());
+        for key in [
+            crate::watcher::WatchTarget::Primary.health_key(42),
+            crate::watcher::shared_health_key(42, "acc7"),
+            crate::watcher::extra_health_key(42, "slot1"),
+        ] {
+            health.register(&key);
+            health.set_connected(&key, true);
+        }
+        // neighbouring chat ids must not be caught by the prefix scan
+        health.register("4/primary");
+        health.register("43/shared-acc7");
+
+        health.deregister_chat(42);
+
+        let snapshot = health.snapshot();
+        assert!(!snapshot.contains_key("42/primary"), "{snapshot:?}");
+        assert!(!snapshot.contains_key("42/shared-acc7"), "{snapshot:?}");
+        assert!(!snapshot.contains_key("42/extra-slot1"), "{snapshot:?}");
+        assert!(snapshot.contains_key("4/primary"), "{snapshot:?}");
+        assert!(snapshot.contains_key("43/shared-acc7"), "{snapshot:?}");
     }
 
     #[tokio::test]
