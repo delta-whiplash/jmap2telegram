@@ -422,15 +422,20 @@ after every merge and removes two kinds of leftovers:
   Once that index is pruned or moved on by a re-release, its children are
   stranded. Only manifests unreachable from *any* tag are eligible, so a
   published image is never affected;
-- **all but the newest 20 unreleased `sha-<commit>` images.** A released one
-  also carries `vX.Y.Z` / `X.Y` / `X` / `latest`, which makes it ineligible.
+- **per-commit `sha-<commit>` images older than 30 days.** The window is a
+  duration, not a number of commits: what matters is how long a merge may
+  sit unreleased, which is a delay, and twenty commits is a week on a busy
+  repository and a year on a quiet one. A released image is ineligible
+  twice over - it also carries `vX.Y.Z` / `X.Y` / `X` / `latest` on the
+  same version, and its commit carries a tag - and the commit `main` is on
+  is kept whatever its age, since that is the one a release would promote.
 
 The same script runs with `DRY_RUN=true` on every pull request - printing
 what it *would* delete - so the rules stay exercised rather than merely
-trusted; only a push to `main` ever deletes. The twenty-deep window is the
-one sharp edge: a tag pushed on a commit more than twenty unreleased merges
-old has no image left to promote, and says so instead of shipping something
-else.
+trusted; only a push to `main` ever deletes. The one sharp edge left is a
+tag pushed on a commit that is neither `main`'s HEAD nor less than thirty
+days old: it has no image left to promote, and the release says so instead
+of shipping something else.
 
 ### Staying current with no one at the wheel
 

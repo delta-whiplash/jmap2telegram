@@ -9,8 +9,10 @@
 #      (and its attestation) untagged, then points a tagged index at them.
 #      When that index is later pruned, or re-tagged away by a re-release,
 #      its children are left behind, referenced by nothing. Those go.
-#   2. Excess per-commit tags. ci.yml publishes every merge as
-#      `sha-<commit>`; only the newest KEEP unreleased ones are kept.
+#   2. Stale per-commit tags. ci.yml publishes every merge as
+#      `sha-<commit>`; those are kept for MAX_AGE_DAYS, so a release can
+#      still be cut from a recent merge. Older unreleased ones go, except
+#      the commit main is on, which is never pruned whatever its age.
 #
 # Nothing reachable from a tag is ever deleted, and nothing created in the
 # last hour is either: an in-flight build's children look unreferenced until
@@ -20,16 +22,28 @@
 #   OWNER    package owner (user or org)
 #   REPO     "owner/name" of the repository the package belongs to
 #   PKG      package name
-#   KEEP     per-commit tags to keep (default 20)
-#   DRY_RUN  "true" logs what would be deleted and deletes nothing
+#   MAX_AGE_DAYS  keep per-commit images younger than this (default 30)
+#   HEAD_SHA      commit to keep whatever its age (ci.yml passes main's HEAD)
+#   DRY_RUN       "true" logs what would be deleted and deletes nothing
 #
 set -euo pipefail
 
 : "${OWNER:?OWNER is required}"
 : "${REPO:?REPO is required}"
 : "${PKG:?PKG is required}"
-KEEP="${KEEP:-20}"
+MAX_AGE_DAYS="${MAX_AGE_DAYS:-30}"
+HEAD_SHA="${HEAD_SHA:-}"
 DRY_RUN="${DRY_RUN:-false}"
+
+# Retention is a duration, not a number of commits: what matters is how
+# long a merge may sit unreleased, and that is a delay, not a count. Twenty
+# commits is a week on a busy repository and a year on a quiet one.
+# Registries that ship retention do the same - Azure ACR prunes untagged
+# manifests by age, default 7 days, and offers no commit-count rule.
+if ! [[ "$MAX_AGE_DAYS" =~ ^[0-9]+$ ]]; then
+  echo "MAX_AGE_DAYS must be a whole number of days, got '${MAX_AGE_DAYS}'" >&2
+  exit 1
+fi
 
 REG="ghcr.io/${REPO}"
 WORK="$(mktemp -d)"
@@ -106,7 +120,7 @@ while IFS=$'\t' read -r id digest created tags; do
   echo "$id" >> "${WORK}/delete.tsv"
 done < "${WORK}/versions.tsv"
 
-# --- rule 2: the oldest per-commit tags --------------------------------
+# --- rule 2: stale per-commit tags -------------------------------------
 # Only versions whose tags are *all* `sha-*` are considered, so a released
 # image - whose version also carries vX.Y.Z / X.Y / X / latest - is never
 # eligible. (Promotion re-tags the very same index digest, so this is what
@@ -115,7 +129,7 @@ list_versions \
   | awk -F'\t' '$4 == "" { next } { n = split($4, tags, " "); for (i = 1; i <= n; i++) if (tags[i] !~ /^sha-/) next; print $3 "\t" $1 "\t" $4 }' \
   | sort -r > "${WORK}/commits.tsv"
 
-kept=0
+AGE_CUTOFF="$(date -u -d "${MAX_AGE_DAYS} days ago" +%Y-%m-%dT%H:%M:%SZ)"
 while IFS=$'\t' read -r created id tag; do
   [ -z "${id:-}" ] && continue
   # Rule 1 owns untagged versions; make sure rule 2 can never reach one even
@@ -125,12 +139,21 @@ while IFS=$'\t' read -r created id tag; do
     echo "keep  ${tag} - released"
     continue
   fi
-  kept=$((kept + 1))
-  [ "$kept" -le "$KEEP" ] && continue
-  echo "prune ${tag} - older than the newest ${KEEP} unreleased per-commit tags"
+  # The commit main is on: it is the one a release would promote, so it
+  # survives however long the repository has been idle. Age alone would
+  # eventually strand a release with no image to point at.
+  if [ -n "$HEAD_SHA" ] && [ "${tag#sha-}" = "$HEAD_SHA" ]; then
+    echo "keep  ${tag} - the commit main is on, the one a release would promote"
+    continue
+  fi
+  if [[ "$created" > "$AGE_CUTOFF" ]]; then
+    echo "keep  ${tag} - younger than ${MAX_AGE_DAYS} days"
+    continue
+  fi
+  echo "prune ${tag} - unreleased, not main's HEAD, older than ${MAX_AGE_DAYS} days (${created})"
   echo "$id" >> "${WORK}/delete.tsv"
 done < "${WORK}/commits.tsv"
-echo "per-commit tags: kept the newest ${KEEP} unreleased, plus every released one"
+echo "per-commit tags: kept every released one, main's HEAD, and those younger than ${MAX_AGE_DAYS} days"
 
 # --- act ---------------------------------------------------------------
 count="$(wc -l < "${WORK}/delete.tsv")"
