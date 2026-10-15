@@ -21,8 +21,13 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Every job below carries a `timeout-minutes`: the default is six hours, so
+  # without one a hung job burns a runner for the afternoon instead of failing
+  # in a quarter of an hour. The numbers are ~10-30x the observed duration, so
+  # they catch a hang, not a slow day.
   fmt:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -36,6 +41,7 @@ jobs:
 
   clippy:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -48,6 +54,7 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -57,6 +64,7 @@ jobs:
 
   audit:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -68,6 +76,7 @@ jobs:
 
   helm-lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -81,6 +90,7 @@ jobs:
     # stays detectable. History is clean today (verified 2026-10-05), so no
     # baseline file is needed - a finding should fail the build.
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -110,6 +120,7 @@ jobs:
   # gitleaks above, rather than pulled in as one more action to trust.
   zizmor:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -159,6 +170,7 @@ jobs:
             platform: linux/arm64
             arch: arm64
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -241,9 +253,15 @@ jobs:
   image-merge:
     if: github.event_name == 'push'
     needs: [image]
+    timeout-minutes: 15
     permissions:
       contents: read
       packages: write
+      # attest-build-provenance signs with this job's OIDC identity and files
+      # the result in the repository's attestation store; the image push itself
+      # is what needs `packages: write`.
+      id-token: write
+      attestations: write
     runs-on: ubuntu-26.04
     steps:
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
@@ -261,6 +279,7 @@ jobs:
           merge-multiple: true
 
       - name: Publish the multi-arch index as sha-<sha>
+        id: index
         working-directory: ${{ runner.temp }}/digests
         env:
           REPO: ghcr.io/${{ github.repository }}
@@ -271,6 +290,26 @@ jobs:
           for d in *; do digest_args+=("${REPO}@sha256:${d}"); done
           docker buildx imagetools create -t "${REPO}:${TAG}" "${digest_args[@]}"
           docker buildx imagetools inspect "${REPO}:${TAG}"
+          # Read the digest back rather than assembling it from the inputs:
+          # this is the index a user pulls by tag, so it is the thing an
+          # attestation should name.
+          digest="$(docker buildx imagetools inspect "${REPO}:${TAG}" --format '{{.Manifest.Digest}}')"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          echo "published ${TAG} at ${digest}"
+
+      # buildkit's own provenance (in the `image` job above) lives in the
+      # registry and is *unsigned*: anyone who can push to this package could
+      # write an equally well-formed statement beside the image. This adds a
+      # signed one - this job's OIDC identity, recorded in the repository's
+      # attestation store and pushed next to the image - so that `gh
+      # attestation verify` can check the claim instead of the registry
+      # asserting it. Verification is documented in the README.
+      - name: Attest the published index
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
+        with:
+          subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ steps.index.outputs.digest }}
+          push-to-registry: true
 
   # Version pruning lives in .github/scripts/prune-package-versions.sh so it
   # can be run (in dry-run) on every pull request rather than only reasoned
@@ -278,6 +317,7 @@ jobs:
   image-retention:
     if: github.event_name == 'push'
     needs: [image-merge]
+    timeout-minutes: 20
     permissions:
       contents: read
       packages: write
@@ -316,6 +356,7 @@ jobs:
       contents: read
       packages: read
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       OWNER: ${{ github.repository_owner }}
@@ -340,3 +381,132 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Report what pruning would delete
         run: bash .github/scripts/prune-package-versions.sh
+
+  # release.yml's four decisions, exercised on every pull request from this
+  # repository - the same reasoning as `image-retention-check` above, and the
+  # same rule: a release workflow that only ever runs during a release is a
+  # workflow nobody tests. Both bugs found in release.yml so far (an annotated
+  # tag read as a moved one; a release creation that failed on a retry instead
+  # of doing nothing) were found in production, by cutting real releases.
+  #
+  # Everything below is read-only, and the one guard that *can* write - the tag
+  # guard - runs in DRY_RUN, which reports what it would do. The versions used
+  # as fixtures are pinned deliberately: v0.8.0 is the repository's one
+  # annotated tag, v0.8.1 a lightweight one, release tags are immutable so both
+  # stay as they are, and their images can never be pruned either - nothing
+  # reachable from a tag is ever deleted (see prune-package-versions.sh).
+  release-guards-check:
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    permissions:
+      contents: read
+      packages: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      REPO_SLUG: ${{ github.repository }}
+      OWNER: ${{ github.repository_owner }}
+      REPO: ghcr.io/${{ github.repository }}
+      DRY_RUN: "true"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+
+      # The release path is shell, so lint it as shell. Fetched from its
+      # release page at a pinned version, like zizmor and gitleaks above.
+      - name: Lint the scripts
+        run: |
+          set -euo pipefail
+          curl -sSL "https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.linux.x86_64.tar.xz" \
+            | tar -xJ -C /tmp
+          /tmp/shellcheck-v0.11.0/shellcheck -S style .github/scripts/*.sh
+
+      - name: Version guard accepts Cargo.toml's version and refuses another
+        run: |
+          set -euo pipefail
+          crate_version="$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1 | tr -d '\r')"
+          VERSION="$crate_version" bash .github/scripts/release-guards.sh version
+          if VERSION=9.9.9 bash .github/scripts/release-guards.sh version; then
+            echo "::error::the version guard accepted a version Cargo.toml does not carry"
+            exit 1
+          fi
+          echo "refused 9.9.9, as it should."
+
+      - name: Tag guard reads both tag kinds, refuses to move either, creates nothing
+        run: |
+          set -euo pipefail
+          # Annotated (v0.8.0) and lightweight (v0.8.1): that difference is
+          # what the first bug turned on, so both kinds get exercised.
+          annotated_sha="$(gh api "repos/${REPO_SLUG}/commits/v0.8.0" --jq .sha)"
+          lightweight_sha="$(gh api "repos/${REPO_SLUG}/commits/v0.8.1" --jq .sha)"
+          TAG=v0.8.0 SHA="$annotated_sha" bash .github/scripts/release-guards.sh tag
+          TAG=v0.8.1 SHA="$lightweight_sha" bash .github/scripts/release-guards.sh tag
+          if TAG=v0.8.0 SHA="$lightweight_sha" bash .github/scripts/release-guards.sh tag; then
+            echo "::error::the tag guard agreed to move the annotated tag v0.8.0"
+            exit 1
+          fi
+          if TAG=v0.8.1 SHA="$annotated_sha" bash .github/scripts/release-guards.sh tag; then
+            echo "::error::the tag guard agreed to move the lightweight tag v0.8.1"
+            exit 1
+          fi
+          TAG=v0.0.0-release-guards-check SHA="$lightweight_sha" bash .github/scripts/release-guards.sh tag
+          if gh api "repos/${REPO_SLUG}/git/refs/tags/v0.0.0-release-guards-check" > /dev/null 2>&1; then
+            echo "::error::the dry run created a tag"
+            exit 1
+          fi
+          echo "both kinds dereferenced, nothing moved, nothing created."
+
+      - name: Image-tag guard is a no-op on the same digest and refuses another
+        run: |
+          set -euo pipefail
+          VERSION=0.8.1 SRC="${REPO}:v0.8.1" bash .github/scripts/release-guards.sh image-tag
+          VERSION=9.9.9 SRC="${REPO}:v0.8.1" bash .github/scripts/release-guards.sh image-tag
+          # A real, different digest: one platform manifest of the same image.
+          other="$(docker buildx imagetools inspect "${REPO}:v0.8.1" \
+            --format '{{range .Manifest.Manifests}}{{.Digest}}{{"\n"}}{{end}}' | head -1)"
+          if VERSION=0.8.1 SRC="${REPO}@${other}" bash .github/scripts/release-guards.sh image-tag; then
+            echo "::error::the image-tag guard agreed to re-point v0.8.1 at another digest"
+            exit 1
+          fi
+          echo "no-op, nothing-to-refuse, and refusal all behave."
+
+      - name: Chart guard skips identical content and refuses different content
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          oci="oci://ghcr.io/${OWNER}/charts/jmap2telegram"
+          helm pull "$oci" --version 0.8.1 --destination "$tmp"
+          tar -xzf "${tmp}/jmap2telegram-0.8.1.tgz" -C "$tmp"
+          # Repackaged from the published tree: same content, new mtimes -
+          # which is precisely why the guard compares content, not digests.
+          helm package "${tmp}/jmap2telegram" --destination "${tmp}/identical"
+          echo "# deliberately different content" >> "${tmp}/jmap2telegram/values.yaml"
+          helm package "${tmp}/jmap2telegram" --destination "${tmp}/different"
+
+          # `publish` is how the workflow gates the push, so assert on it.
+          GITHUB_OUTPUT="${tmp}/out" \
+            VERSION=0.8.1 LOCAL_TGZ="${tmp}/identical/jmap2telegram-0.8.1.tgz" \
+            bash .github/scripts/release-guards.sh chart
+          grep -qx 'publish=false' "${tmp}/out" || {
+            echo "::error::identical content did not report publish=false"; exit 1; }
+
+          if GITHUB_OUTPUT="${tmp}/out" \
+            VERSION=0.8.1 LOCAL_TGZ="${tmp}/different/jmap2telegram-0.8.1.tgz" \
+            bash .github/scripts/release-guards.sh chart; then
+            echo "::error::the chart guard accepted different content for a published version"
+            exit 1
+          fi
+          grep -qx 'publish=true' "${tmp}/out" || {
+            echo "::error::a refused chart left publish=false, so a push step could run"; exit 1; }
+
+          GITHUB_OUTPUT="${tmp}/out" \
+            VERSION=9.9.9 LOCAL_TGZ="${tmp}/identical/jmap2telegram-0.8.1.tgz" \
+            bash .github/scripts/release-guards.sh chart
+          grep -qx 'publish=true' "${tmp}/out" || {
+            echo "::error::an unpublished version did not report publish=true"; exit 1; }
+          echo "publish, skip and refuse all behave."
