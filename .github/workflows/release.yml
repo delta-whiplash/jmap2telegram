@@ -39,9 +39,17 @@ on:
 permissions:
   contents: read
 
+# One release at a time, and never cancelled: a tag push and a dispatch for
+# the same version would otherwise race to promote the same tags, and killing a
+# half-finished release is worse than making the second one wait.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
   prep:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: write
     outputs:
@@ -88,22 +96,14 @@ jobs:
       # v0.6.0 once ended up shipping a 0.5.2 binary. Cargo.toml's version is
       # what `cargo build` stamps into the artifact, so comparing the two
       # here is what keeps the name on the tin honest.
+      #
+      # The decision lives in .github/scripts/release-guards.sh with the other
+      # three, so ci.yml's `release-guards-check` can exercise it on every
+      # pull request instead of only here.
       - name: The release version must match the crate version
         env:
           VERSION: ${{ steps.version.outputs.version }}
-        run: |
-          set -euo pipefail
-          # First `version = "..."` line: Cargo.toml's [package] table, which
-          # cargo requires to come before the tables that may quote other
-          # crates' versions. `tr -d '\r'` because a checkout with CRLF line
-          # endings (a developer's autocrlf, say) would otherwise fail the
-          # comparison while printing the same version twice.
-          crate_version="$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1 | tr -d '\r')"
-          if [ "$crate_version" != "$VERSION" ]; then
-            echo "::error::Cargo.toml says version = \"${crate_version}\" but this is release ${VERSION}. Set the crate version first, merge that, and release from the resulting commit."
-            exit 1
-          fi
-          echo "Cargo.toml version ${crate_version} matches the release version."
+        run: bash .github/scripts/release-guards.sh version
 
       - name: Create the release tag (manual dispatch only)
         if: github.event_name == 'workflow_dispatch'
@@ -112,48 +112,16 @@ jobs:
           REPO_SLUG: ${{ github.repository }}
           SHA: ${{ github.sha }}
           TAG: v${{ steps.version.outputs.version }}
-        run: |
-          set -euo pipefail
-          # A manual dispatch means "release what's at this ref right now",
-          # but only if that version has not been published yet. Moving an
-          # existing tag would rewrite history for anyone who already
-          # pinned it, so the collision is reported instead of resolved.
-          ref=$(curl -s \
-            -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${REPO_SLUG}/git/refs/tags/${TAG}")
-          existing_sha=$(echo "$ref" | jq -r '.object.sha // empty')
-          # An *annotated* tag's ref points at the tag object, not at the
-          # commit it names, so follow it before comparing: without this,
-          # re-running a release whose tag was cut with `git tag -a` looks
-          # exactly like a tag that was moved, and prep refuses a legitimate
-          # retry. Lightweight tags - which is what the branch below creates,
-          # and what every tag in this repository's history is - need no
-          # dereference.
-          if [ "$(echo "$ref" | jq -r '.object.type // empty')" = "tag" ]; then
-            existing_sha=$(curl -s \
-              -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${REPO_SLUG}/git/tags/${existing_sha}" \
-              | jq -r '.object.sha // empty')
-          fi
-
-          if [ -z "$existing_sha" ]; then
-            curl -sS -f -X POST \
-              -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${REPO_SLUG}/git/refs" \
-              -d "{\"ref\":\"refs/tags/${TAG}\",\"sha\":\"${SHA}\"}"
-            echo "Created tag ${TAG} at ${SHA}."
-          elif [ "$existing_sha" = "$SHA" ]; then
-            echo "Tag ${TAG} already points at ${SHA}."
-          else
-            echo "::error::${TAG} already points at ${existing_sha}, not at ${SHA}. Release tags are immutable: bump the version and release that, rather than moving a published tag."
-            exit 1
-          fi
+        run: bash .github/scripts/release-guards.sh tag
 
   promote:
     needs: [prep]
+    timeout-minutes: 20
     permissions:
       contents: read
       packages: write
+    outputs:
+      image-digest: ${{ steps.promote.outputs.digest }}
     runs-on: ubuntu-26.04
     env:
       REPO: ghcr.io/${{ github.repository }}
@@ -187,34 +155,22 @@ jobs:
           echo "::error::$SRC was never published. Did the CI run for ${SHA} finish, and did every gate pass?"
           exit 1
 
-      # The tag side of the same rule. `imagetools create` happily
-      # overwrites an existing tag, which would leave `vX.Y.Z` pointing at
-      # a digest other than the one it published - so refuse before
-      # touching it. Re-running a release for the same digest stays a
-      # no-op, which keeps retrying a failed run safe.
+      # The tag side of the same rule, in .github/scripts/release-guards.sh so
+      # it can be exercised on every pull request. `imagetools create` happily
+      # overwrites an existing tag, which would leave `vX.Y.Z` pointing at a
+      # digest other than the one it published - so refuse before touching it.
+      # Re-running a release for the same digest stays a no-op, which keeps
+      # retrying a failed run safe.
       - name: Refuse to overwrite an already-published release tag
         env:
           VERSION: ${{ needs.prep.outputs.version }}
-        run: |
-          set -euo pipefail
-          published="$(docker buildx imagetools inspect "${REPO}:v${VERSION}" \
-            --format '{{.Manifest.Digest}}' 2>/dev/null || true)"
-          if [ -z "$published" ]; then
-            echo "v${VERSION} is not published yet - nothing to refuse."
-            exit 0
-          fi
-          built="$(docker buildx imagetools inspect "$SRC" --format '{{.Manifest.Digest}}')"
-          if [ "$published" = "$built" ]; then
-            echo "v${VERSION} already points at ${built}; promoting it again is a no-op."
-            exit 0
-          fi
-          echo "::error::v${VERSION} already exists at ${published}, but this build is ${built}. Release tags are immutable: bump the version and release that, rather than republishing a published tag."
-          exit 1
+        run: bash .github/scripts/release-guards.sh image-tag
 
       # Re-tag the digest CI already built. `imagetools create` copies the
       # whole index - both platform manifests, their attestations and the
       # SBOM - so the release keeps the provenance of the tested build.
       - name: Promote the digest to the release tags
+        id: promote
         env:
           VERSION: ${{ needs.prep.outputs.version }}
         run: |
@@ -228,12 +184,21 @@ jobs:
             -t "${REPO}:latest" \
             "${SRC}"
           docker buildx imagetools inspect "${REPO}:v${VERSION}"
+          # Read the digest back off the published tag rather than reusing the
+          # one CI reported: this is the digest a user who pulls vX.Y.Z gets,
+          # and it is what the release notes and the attestation verification
+          # command have to name.
+          digest="$(docker buildx imagetools inspect "${REPO}:v${VERSION}" --format '{{.Manifest.Digest}}')"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
 
   helm:
     needs: [prep, promote]
+    timeout-minutes: 20
     permissions:
       contents: read
       packages: write
+    outputs:
+      chart-digest: ${{ steps.chart-digest.outputs.digest }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -268,43 +233,24 @@ jobs:
           printf '%s' "$GH_TOKEN" | helm registry login ghcr.io -u "$ACTOR" --password-stdin
 
       # The chart's half of the immutability rule, and the reason it has to
-      # be checked here rather than left to the registry: GHCR has no
-      # per-tag protection for OCI artifacts (the ruleset mechanism is a git
-      # feature), so `helm push` would happily rewrite a published version.
-      # The digest cannot be compared the way the image's is - `helm package`
-      # stamps file mtimes into the tarball, so the same chart packaged twice
-      # has two different digests - but its *content* is comparable, and a
+      # be checked rather than left to the registry: GHCR has no per-tag
+      # protection for OCI artifacts (the ruleset mechanism is a git feature),
+      # so `helm push` would happily rewrite a published version. The digest
+      # cannot be compared the way the image's is - `helm package` stamps file
+      # mtimes into the tarball, so the same chart packaged twice has two
+      # different digests - but its *content* is comparable, and a
       # byte-identical republish is exactly the case a retried run hits.
+      #
+      # The comparison lives in .github/scripts/release-guards.sh with the
+      # other guards, so ci.yml's `release-guards-check` exercises all three
+      # of its outcomes (publish, skip, refuse) on every pull request.
       - name: Refuse to republish a chart version with different content
         id: chart
         env:
           VERSION: ${{ needs.prep.outputs.version }}
           OWNER: ${{ github.repository_owner }}
-        run: |
-          set -euo pipefail
-          oci_chart="oci://ghcr.io/${OWNER}/charts/jmap2telegram"
-          oci_ref="ghcr.io/${OWNER}/charts/jmap2telegram:${VERSION}"
-          echo "publish=true" >> "$GITHUB_OUTPUT"
-          if ! docker buildx imagetools inspect "$oci_ref" > /dev/null 2>&1; then
-            echo "chart ${VERSION} is not published yet - publishing it."
-            exit 0
-          fi
-          # Published, so it must be identical. Every step past this point
-          # is allowed to fail but not to fall through to the push below:
-          # `set -e` plus the explicit diff keeps a transient failure from
-          # turning into a silent overwrite.
-          tmp="$(mktemp -d)"
-          helm pull "$oci_chart" --version "$VERSION" --destination "$tmp" > /dev/null
-          mkdir -p "${tmp}/published" "${tmp}/local"
-          tar -xzf "${tmp}"/jmap2telegram-"${VERSION}".tgz -C "${tmp}/published"
-          tar -xzf /tmp/chart-out/jmap2telegram-"${VERSION}".tgz -C "${tmp}/local"
-          if diff -r --brief "${tmp}/local/jmap2telegram" "${tmp}/published/jmap2telegram"; then
-            echo "chart ${VERSION} is already published with identical content - nothing to push."
-            echo "publish=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          echo "::error::chart ${VERSION} is already published with different content. Chart versions are immutable: bump the version and release that."
-          exit 1
+          LOCAL_TGZ: /tmp/chart-out/jmap2telegram-${{ needs.prep.outputs.version }}.tgz
+        run: bash .github/scripts/release-guards.sh chart
 
       - name: Push chart to GHCR (OCI)
         if: steps.chart.outputs.publish == 'true'
@@ -314,8 +260,25 @@ jobs:
           set -euo pipefail
           helm push /tmp/chart-out/jmap2telegram-*.tgz "oci://ghcr.io/${OWNER}/charts"
 
+      # Read the digest back off the published tag rather than from `helm
+      # push`'s output: a skipped push (identical content, retried run) has no
+      # such output, and the point of the number is what a user who pulls this
+      # chart version gets.
+      - name: Record the published chart digest
+        id: chart-digest
+        env:
+          VERSION: ${{ needs.prep.outputs.version }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          digest="$(docker buildx imagetools inspect \
+            "ghcr.io/${OWNER}/charts/jmap2telegram:${VERSION}" \
+            --format '{{.Manifest.Digest}}')"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+
   github-release:
     needs: [prep, promote, helm]
+    timeout-minutes: 10
     permissions:
       contents: write
     runs-on: ubuntu-latest
@@ -324,11 +287,32 @@ jobs:
       # neither a working tree nor the git credentials a checkout would leave
       # behind. `--verify-tag` fails rather than creating a release for a tag
       # that isn't there.
+      #
+      # The notes begin with what was actually published: the digests are the
+      # only way to name an artifact that cannot be re-pointed later, and
+      # GitHub's autogenerated notes are a commit list that says nothing about
+      # them. `--notes` is *prepended* to the generated notes, so this lands on
+      # top of the changelog.
       - name: Cut the GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO_SLUG: ${{ github.repository }}
           VERSION: ${{ needs.prep.outputs.version }}
+          NOTES: |
+            **Container image** - `ghcr.io/${{ github.repository }}:v${{ needs.prep.outputs.version }}`
+            `${{ needs.promote.outputs.image-digest }}`
+
+            **Helm chart** - `oci://ghcr.io/${{ github.repository_owner }}/charts/jmap2telegram:${{ needs.prep.outputs.version }}`
+            `${{ needs.helm.outputs.chart-digest }}`
+
+            The image is byte-for-byte the `sha-${{ github.sha }}` artifact this
+            repository's CI built and gated: releasing only re-tagged it. Verify
+            that it was built here, from that commit, with:
+
+            ```sh
+            gh attestation verify oci://ghcr.io/${{ github.repository }}@${{ needs.promote.outputs.image-digest }} \
+              --repo ${{ github.repository }}
+            ```
         run: |
           set -euo pipefail
           # A published release is left exactly as it is, like the tag and the
@@ -345,4 +329,5 @@ jobs:
             --repo "$REPO_SLUG" \
             --title "v${VERSION}" \
             --generate-notes \
+            --notes "$NOTES" \
             --verify-tag

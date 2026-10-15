@@ -397,9 +397,21 @@ green, publishes the multi-arch (`amd64`/`arm64`) image under a
 commit-addressed tag `sha-<sha>`. Each platform's manifest carries an
 attached SLSA provenance and an SPDX SBOM (`provenance: mode=max`,
 `sbom: true`), so what a given digest contains, and what built it, are
-answerable from the registry alone. The release is then a pure *promotion*
-of that exact digest, so what ships is byte-for-byte what CI built and
-tested:
+answerable from the registry alone. Those two are attached but unsigned -
+readable, not verifiable - so the same run also signs one: `actions/attest-build-provenance`
+records the workflow's OIDC identity against the published index and pushes
+the bundle to the registry next to it, which turns the claim into something
+anyone can check rather than merely read:
+
+```bash
+gh attestation verify oci://ghcr.io/delta-whiplash/jmap2telegram@sha256:<digest> \
+  --repo delta-whiplash/jmap2telegram
+```
+
+Both digests are printed at the top of every release's notes, because a
+digest is the only name for an artifact that cannot be re-pointed later.
+The release is then a pure *promotion* of that exact digest, so what ships
+is byte-for-byte what CI built and tested:
 
 1. promotes the commit's `sha-<sha>` digest to the release tags on
    `ghcr.io/delta-whiplash/jmap2telegram`: `vX.Y.Z` (the exact release),
@@ -442,6 +454,19 @@ points at - which is how `v0.6.0` once shipped a 0.5.2 binary. `prep`
 therefore refuses a release unless `Cargo.toml`'s version matches the tag,
 so the name on the tin is checked against what `cargo build` stamped into
 the artifact.
+
+All four of those decisions live in
+[`release-guards.sh`](.github/scripts/release-guards.sh), and CI runs them
+on every pull request rather than leaving them to the next release:
+`release-guards-check` reads both tag kinds and asserts the guard refuses
+to move either, runs the image-tag guard against a real published digest,
+and puts the chart guard through all three of its outcomes (publish, skip,
+refuse). Everything there is read-only; the one guard that *can* write runs
+in `DRY_RUN` and the check asserts it created nothing. That is not
+decoration: `release.yml` is the one workflow no ordinary CI run executes,
+and both bugs found in it so far - an annotated tag read as a moved one,
+and a release creation that failed a retry instead of doing nothing - were
+found in production, by cutting real releases.
 
 The rule is enforced in two places rather than merely intended: the
 workflows above refuse the collision, and a repository ruleset
