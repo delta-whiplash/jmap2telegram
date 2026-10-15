@@ -95,6 +95,11 @@ jobs:
   test:
     needs: prep
     uses: ./.github/workflows/ci.yml
+    with:
+      # The docker job below builds both arches natively; the amd64-only
+      # docker-build inside CI would only duplicate that work on the
+      # release's critical path.
+      skip_image: true
 
   docker:
     needs: [prep, test]
