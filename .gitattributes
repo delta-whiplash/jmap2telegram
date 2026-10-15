@@ -1,0 +1,7 @@
+# Normalise line endings to LF in the repository and in the working tree.
+# The checked-out bytes are what a runner executes: a CRLF shell script dies
+# with `syntax error near unexpected token $'{\r'', and leaving that to each
+# contributor's core.autocrlf is not a guarantee. No file in the tree needed
+# converting when this was added - the blobs were already LF - so this only
+# stops them drifting apart again.
+* text=auto eol=lf
