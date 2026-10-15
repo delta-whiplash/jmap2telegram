@@ -392,10 +392,14 @@ Tagging `vX.Y.Z` and pushing it triggers
 [`.github/workflows/release.yml`](.github/workflows/release.yml) - but the
 tag itself builds nothing. The image is already built and gated: every
 push to `main` runs the full CI suite (fmt, clippy, tests, `cargo audit`,
-Docker build, Helm lint, gitleaks) and, only once every gate is green,
-publishes the multi-arch (`amd64`/`arm64`) image under a commit-addressed
-tag `sha-<sha>`. The release is then a pure *promotion* of that exact
-digest, so what ships is byte-for-byte what CI built and tested:
+Docker build, Helm lint, gitleaks, `zizmor`) and, only once every gate is
+green, publishes the multi-arch (`amd64`/`arm64`) image under a
+commit-addressed tag `sha-<sha>`. Each platform's manifest carries an
+attached SLSA provenance and an SPDX SBOM (`provenance: mode=max`,
+`sbom: true`), so what a given digest contains, and what built it, are
+answerable from the registry alone. The release is then a pure *promotion*
+of that exact digest, so what ships is byte-for-byte what CI built and
+tested:
 
 1. promotes the commit's `sha-<sha>` digest to the release tags on
    `ghcr.io/delta-whiplash/jmap2telegram`: `vX.Y.Z` (the exact release),
@@ -418,12 +422,30 @@ that is already out therefore fails loudly - the fix is a new patch
 version, not a moved tag. A manual dispatch that lands on the very same
 commit is a no-op, so retrying a failed run stays safe.
 
+The chart is held to the same rule, for the same reason. GHCR has no
+per-tag protection for OCI artifacts (the ruleset mechanism is a git
+feature), so `helm push` would rewrite a published version without
+complaining. The chart is therefore compared by *content* rather than by
+digest - `helm package` stamps file mtimes into the tarball, so the same
+chart packaged twice has two different digests - and an already-published
+version is only re-pushed when its content is byte-identical, which makes
+retrying a half-finished release a no-op instead of a silent rewrite.
+
+The tag ruleset cannot cover everything, though: it stops a *published*
+tag from being moved, not a tag whose version disagrees with the code it
+points at - which is how `v0.6.0` once shipped a 0.5.2 binary. `prep`
+therefore refuses a release unless `Cargo.toml`'s version matches the tag,
+so the name on the tin is checked against what `cargo build` stamped into
+the artifact.
+
 The rule is enforced in two places rather than merely intended: the
 workflows above refuse the collision, and a repository ruleset
 (`immutable release tags`, targeting `refs/tags/v*`) blocks updates and
 deletions outright - so a forced `git push` cannot rewrite a published tag
 either. Tag *creation* is deliberately left open: that is how a release is
-cut.
+cut. `main` is protected the same way: a second ruleset requires a pull
+request and a green CI run before anything lands on it, so the maintainer's
+own commits pass the same gates as anyone else's.
 
 ### Keeping the registry tidy
 
@@ -458,11 +480,27 @@ The repo is meant to look after itself between feature work:
 - **Dependency updates.** [Renovate](renovate.json5) runs from a
   dedicated self-hosted instance and opens PRs for Cargo, the Docker
   builder image (`rust:1-slim-bookworm`, digest-pinned; the runtime stage
-  is `scratch`, so it has no base image to track), and GitHub Actions -
-  grouped, and gated by the same CI suite as any other PR.
+  is `scratch`, so it has no base image to track), the Rust compiler pin
+  in [`rust-toolchain.toml`](rust-toolchain.toml), and GitHub Actions -
+  every action pinned to a commit SHA, grouped, and gated by the same CI
+  suite as any other PR.
 - **Auto-merge for routine bumps.** Patch/minor updates merge themselves
   once CI is green (Renovate automerge rules); major bumps are always
   left for manual review.
+- **The workflows audit themselves.** `zizmor` runs on every push and pull
+  request and fails the build on an unpinned action, a `${{ }}` expansion
+  inside a `run:` block, an over-broad token permission, or a
+  poisoning-prone cache. It runs online, so its `impostor-commit` audit
+  independently re-checks that every pinned SHA really is a commit of the
+  repository it claims to come from. The single exemption it carries is
+  written down and argued in
+  [`.github/zizmor.yml`](.github/zizmor.yml).
+- **A pinned compiler on both sides.** Rust is pinned once, in
+  `rust-toolchain.toml`: CI resolves it through the runner's rustup and
+  the Dockerfile copies it into the build, so the compiler that checks a
+  commit is the compiler that builds the shipped binary - they cannot
+  drift apart on a base-image bump. `cargo build` runs `--locked` in
+  both, so the artifact is built from the lockfile CI validated.
 - **Weekly lockfile maintenance.** `Cargo.lock` is refreshed weekly so
   transitive dependency fixes (e.g. RUSTSEC advisables in dependencies of
   dependencies) land without waiting for an upstream release.
