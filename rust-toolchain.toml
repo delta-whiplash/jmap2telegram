@@ -1,0 +1,15 @@
+# The pinned compiler, in one place, for everything that compiles Rust here:
+#
+#   * CI's fmt/clippy/test jobs resolve it through the runner's preinstalled
+#     rustup, which installs the pinned toolchain (and the components below)
+#     on first use - so there is no `dtolnay/rust-toolchain@stable` step left
+#     to silently follow the stable channel from one week to the next.
+#   * The Docker build COPYs it and installs the same toolchain, so the
+#     compiler that builds the shipped binary is the compiler CI tested,
+#     whatever version the `rust:1` base image happens to carry.
+#
+# Renovate updates the pin (its `rust-toolchain` manager), and a bump arrives
+# as a pull request that CI validates - the version never moves on its own.
+[toolchain]
+channel = "1.99.0"
+components = ["rustfmt", "clippy"]
