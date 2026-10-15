@@ -482,13 +482,23 @@ of shipping something else.
 
 The repo is meant to look after itself between feature work:
 
-- **Dependency updates.** [Renovate](renovate.json5) runs from a
-  dedicated self-hosted instance and opens PRs for Cargo, the Docker
-  builder image (`rust:1-slim-bookworm`, digest-pinned; the runtime stage
-  is `scratch`, so it has no base image to track), the Rust compiler pin
-  in [`rust-toolchain.toml`](rust-toolchain.toml), and GitHub Actions -
-  every action pinned to a commit SHA, grouped, and gated by the same CI
-  suite as any other PR.
+- **Dependency updates.** [Renovate](https://github.com/renovatebot/renovate)
+  runs from [`renovate.yml`](.github/workflows/renovate.yml) on a schedule,
+  driven by [`renovate.json5`](renovate.json5), and opens PRs for Cargo,
+  the Docker builder image (`rust:1-slim-bookworm`, digest-pinned; the
+  runtime stage is `scratch`, so it has no base image to track), the Rust
+  compiler pin in [`rust-toolchain.toml`](rust-toolchain.toml), and GitHub
+  Actions - every action pinned to a commit SHA, grouped, and gated by the
+  same CI suite as any other PR. It authenticates with its own GitHub App
+  (`RENOVATE_APP_ID` + `RENOVATE_APP_PRIVATE_KEY` repository secrets) whose
+  repository permissions are exactly `Administration` (read), `Dependabot
+  alerts` (read) and read+write on `Checks`, `Commit statuses`, `Contents`,
+  `Issues`, `Pull requests` and `Workflows` - the set Renovate documents,
+  and the same set the workflow asks the token for, rather than the
+  workflow's `GITHUB_TOKEN`: a PR opened with `GITHUB_TOKEN` does not
+  trigger workflow runs, so with seven required checks it could never be
+  merged. With no secrets configured the workflow skips itself with a
+  notice and changes nothing.
 - **Auto-merge for routine bumps.** Patch/minor updates merge themselves
   once CI is green (Renovate automerge rules); major bumps are always
   left for manual review.

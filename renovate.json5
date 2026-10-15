@@ -1,13 +1,17 @@
 {
-  // Renovate - jmap2telegram (instance DW, self-hosted dans le cluster
-  // pemberton : projects/system/renovate-dw). Remplace Dependabot +
-  // dependabot-auto-merge.yml (supprimés) : un seul bot, automerge natif,
-  // lockFileMaintenance - ce que Dependabot ne couvrait pas.
+  // Renovate for jmap2telegram, run by .github/workflows/renovate.yml on a
+  // schedule rather than from a self-hosted instance. It replaces Dependabot
+  // (+ the dependabot-auto-merge.yml that went with it): one bot, native
+  // automerge, lockFileMaintenance - none of which Dependabot covered here.
+  //
+  // It needs a token of its own (a GitHub App, see the workflow): the PRs it
+  // opens must trigger this repository's CI, and the default GITHUB_TOKEN
+  // cannot do that.
   $schema: "https://docs.renovatebot.com/renovate-schema.json",
   extends: [
     "config:recommended",
     ":semanticCommits",
-    "docker:pinDigests", // Dockerfile : FROM rust:1-slim-bookworm → digest
+    "docker:pinDigests", // Dockerfile: FROM rust:1-slim-bookworm → digest
     "helpers:pinGitHubActionDigests",
   ],
   timezone: "Europe/Paris",
@@ -18,12 +22,12 @@
   prConcurrentLimit: 10,
   platformAutomerge: false,
 
-  // Cargo : clippy -D warnings + tests doivent rester verts pour merger.
-  // Patch/minor auto-mergés quand CI est vert ; major en revue manuelle
-  // (breaking API non détectable par la suite de tests).
+  // Cargo: clippy -D warnings and the test suite must stay green to merge.
+  // Patch/minor merge themselves once CI is green; major is left for manual
+  // review (a breaking API change is not something the test suite detects).
   packageRules: [
     {
-      description: "Cargo minor+patch groupés, automerge derrière CI verte",
+      description: "Cargo minor+patch grouped, automerged behind green CI",
       matchManagers: ["cargo"],
       matchUpdateTypes: ["patch", "minor"],
       groupName: "cargo minor+patch",
@@ -31,13 +35,13 @@
       automergeType: "pr",
     },
     {
-      description: "Cargo major : revue manuelle",
+      description: "Cargo major: manual review",
       matchManagers: ["cargo"],
       matchUpdateTypes: ["major"],
       automerge: false,
     },
     {
-      description: "GitHub Actions : minor+patch digest-pinnés, automerge",
+      description: "GitHub Actions: digest-pinned minor+patch, automerged",
       matchManagers: ["github-actions"],
       matchUpdateTypes: ["patch", "minor"],
       groupName: "github-actions minor+patch",
@@ -45,13 +49,13 @@
       automergeType: "pr",
     },
     {
-      description: "Docker (image builder rust) : revue, rare et cassable",
+      description: "Docker (rust builder image): manual review, rare and breakable",
       matchManagers: ["dockerfile"],
       automerge: false,
     },
   ],
 
-  // Refresh Cargo.lock sans bump de version (CVE transitives) - hebdo.
+  // Refresh Cargo.lock without a version bump (transitive CVEs) - weekly.
   lockFileMaintenance: {
     enabled: true,
     schedule: ["before 5am on monday"],
@@ -59,8 +63,15 @@
     automergeType: "pr",
   },
 
+  // Two independent sources, deliberately:
+  //  - vulnerabilityAlerts reads the platform's alerts (GitHub's dependency
+  //    graph + Dependabot alerts, enabled as a repository setting);
+  //  - osvVulnerabilityAlerts queries OSV.dev directly for direct
+  //    dependencies, so the security lane does not hinge on one toggle
+  //    staying enabled.
   vulnerabilityAlerts: {
     enabled: true,
     labels: ["security-alert", "priority-critical"],
   },
+  osvVulnerabilityAlerts: true,
 }
