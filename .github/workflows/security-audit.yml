@@ -20,9 +20,15 @@ jobs:
   audit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: taiki-e/install-action@cargo-audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      # No toolchain-setup action: rust-toolchain.toml pins the compiler and
+      # the runner's preinstalled rustup installs it on first use - the same
+      # file the Docker build resolves.
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2
+        with:
+          tool: cargo-audit
 
       - name: Run cargo audit
         id: audit
