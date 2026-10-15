@@ -1,6 +1,6 @@
 [package]
 name = "jmap2telegram"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 # "Cardinal Code Open1 Attribution License" - a custom text, so Cargo/
 # crates.io point at it via license-file rather than an SPDX license id
