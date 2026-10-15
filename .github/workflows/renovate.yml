@@ -1,0 +1,89 @@
+name: Renovate
+
+# Dependency updates run from here (scheduled), rather than from an external
+# Renovate instance: the pull requests it opens have to go through this
+# repository's own ruleset, and a pull request opened with the default
+# `GITHUB_TOKEN` never triggers a workflow run - GitHub suppresses runs for
+# commits it made itself. Since `main` requires seven status checks, such a
+# PR could never be merged. A GitHub App token does trigger them, which is
+# why the app is required rather than a nicety. The app also needs
+# `workflows: write`, because Renovate updates the pinned `uses:` SHAs under
+# .github/workflows.
+#
+# Until the two secrets exist (see README, "Staying current with no one at
+# the wheel") the job reports a notice and skips: an unconfigured scheduled
+# workflow should say so once a day, not fail once a day.
+on:
+  schedule:
+    # Renovate's own schedule in renovate.json5 (after 6am, before 10pm,
+    # Europe/Paris) narrows this further; the cron only has to start it.
+    - cron: "0 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: renovate
+  # Not cancellable: a run halfway through pushing branches or merging PRs
+  # should finish what it started.
+  cancel-in-progress: false
+
+jobs:
+  renovate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check the app is configured
+        id: app-configured
+        env:
+          APP_ID: ${{ secrets.RENOVATE_APP_ID }}
+          PRIVATE_KEY: ${{ secrets.RENOVATE_APP_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -n "$APP_ID" ] && [ -n "$PRIVATE_KEY" ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::RENOVATE_APP_ID / RENOVATE_APP_PRIVATE_KEY are not set - skipping. See README, 'Staying current with no one at the wheel'."
+          fi
+
+      - name: Check out the repository
+        if: steps.app-configured.outputs.ready == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Mint a token for the Renovate app
+        id: app-token
+        if: steps.app-configured.outputs.ready == 'true'
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
+        with:
+          app-id: ${{ secrets.RENOVATE_APP_ID }}
+          private-key: ${{ secrets.RENOVATE_APP_PRIVATE_KEY }}
+          # The app is created with exactly these (README, "Dependency
+          # updates"); requesting them here means the token cannot carry
+          # anything the app happens to have beyond them. This is the
+          # permission set Renovate documents for a GitHub App, restricted to
+          # the repository scope: no merge queue here, and the account is a
+          # user, so the org-level `Members` permission does not apply.
+          permission-administration: read
+          permission-checks: write
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
+          permission-statuses: write
+          permission-vulnerability-alerts: read
+          permission-workflows: write
+
+      - name: Run Renovate
+        if: steps.app-configured.outputs.ready == 'true'
+        uses: renovatebot/github-action@f0f41e5f2e706165f6814b1d0f0d0e319de7d1d9 # v46.3.8
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          configurationFile: renovate.json5
+        env:
+          # Without this the token's own repository access decides the scope,
+          # which is wider than "this repository"; say it explicitly.
+          RENOVATE_REPOSITORIES: ${{ github.repository }}
+          LOG_LEVEL: info

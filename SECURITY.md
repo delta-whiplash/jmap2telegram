@@ -213,7 +213,7 @@ explicit `securityContext`, non-root, read-only rootfs), **A.8.3 / A.8.2**
 persistence), **A.8.28 / A.8.29** (secure coding and security testing -
 `clippy -D warnings`, `cargo audit`, the CI test suite, and two rounds of
 independent adversarial review whose findings are fixed and recorded in
-git history), **A.5.7 / A.8.8** (vulnerability management - Dependabot +
+git history), **A.5.7 / A.8.8** (vulnerability management - Renovate +
 `cargo audit` gating every CI run), and **A.5.24–5.28** (incident
 handling - the reporting process below). Building an ISMS around this
 (risk register, management review, internal audit) is the deployer's
@@ -224,7 +224,7 @@ place.
 
 NIS2 obligations attach to "essential"/"important" entities, not to a
 piece of software - but its Art. 21 measures map cleanly to what's here:
-supply-chain security (**Dependabot** across cargo/Docker/GitHub Actions,
+supply-chain security (**Renovate** across cargo/Docker/GitHub Actions,
 plus `cargo audit` in CI), vulnerability handling and disclosure (this
 file's reporting process), cryptography (TLS + AES-256-GCM), access
 control (the chat allowlist), and secure development (CI gates + the
