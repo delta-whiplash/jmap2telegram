@@ -2,6 +2,10 @@
 name = "jmap2telegram"
 version = "0.8.1"
 edition = "2024"
+# Not a library and not on crates.io: the license below is a custom text, so
+# an accidental `cargo publish` is already impossible - but say so here
+# rather than leaving the intent to be inferred from a license file.
+publish = false
 # "Cardinal Code Open1 Attribution License" - a custom text, so Cargo/
 # crates.io point at it via license-file rather than an SPDX license id
 # (license and license-file are mutually exclusive in Cargo.toml).

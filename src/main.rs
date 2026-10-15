@@ -1,3 +1,11 @@
+// Nothing in this crate needs raw pointers, FFI or a hand-written Send/Sync,
+// and there is no `unsafe` anywhere in it - so the compiler now guarantees
+// that stays true. `forbid` rather than `deny` on purpose: an inner attribute
+// cannot re-enable what `forbid` forbids, so introducing `unsafe` in a later
+// patch has to be argued in review (and this line changed) rather than
+// slipped in behind a local `#[allow]`.
+#![forbid(unsafe_code)]
+
 // `t!` is used across modules (bot, watcher, format, jmap); this
 // `#[macro_use] extern crate` brings it into textual scope crate-wide, before
 // any `mod` declaration below refers to it.
