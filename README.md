@@ -411,6 +411,27 @@ already has a `sha-<sha>` image - i.e. a commit on `main` whose CI passed.
 A tag anywhere else fails loudly rather than publishing an untested
 build.
 
+### Keeping the registry tidy
+
+An immutable `sha-<commit>` image per merge would grow without bound, so
+[`prune-package-versions.sh`](.github/scripts/prune-package-versions.sh) runs
+after every merge and removes two kinds of leftovers:
+
+- **manifests nothing points at.** A multi-arch build pushes its per-arch
+  images and their attestations *untagged*, then attaches a tagged index.
+  Once that index is pruned or moved on by a re-release, its children are
+  stranded. Only manifests unreachable from *any* tag are eligible, so a
+  published image is never affected;
+- **all but the newest 20 unreleased `sha-<commit>` images.** A released one
+  also carries `vX.Y.Z` / `X.Y` / `X` / `latest`, which makes it ineligible.
+
+The same script runs with `DRY_RUN=true` on every pull request - printing
+what it *would* delete - so the rules stay exercised rather than merely
+trusted; only a push to `main` ever deletes. The twenty-deep window is the
+one sharp edge: a tag pushed on a commit more than twenty unreleased merges
+old has no image left to promote, and says so instead of shipping something
+else.
+
 ### Staying current with no one at the wheel
 
 The repo is meant to look after itself between feature work:
