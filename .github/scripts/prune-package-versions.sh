@@ -94,11 +94,14 @@ CUTOFF="$(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%SZ)"
 while IFS=$'\t' read -r id digest created tags; do
   [ -z "${id:-}" ] && continue
   [ -n "$tags" ] && continue
-  if [[ "$created" > "$CUTOFF" ]]; then
-    echo "keep  ${digest} - untagged but recent, may belong to an in-flight build"
+  if grep -qx "$digest" "${WORK}/protected.txt"; then
+    echo "keep  ${digest} - referenced by a tag"
     continue
   fi
-  grep -qx "$digest" "${WORK}/protected.txt" && continue
+  if [[ "$created" > "$CUTOFF" ]]; then
+    echo "keep  ${digest} - unreferenced but created ${created}, may belong to an in-flight build"
+    continue
+  fi
   echo "prune ${digest} - orphan manifest (${created})"
   echo "$id" >> "${WORK}/delete.tsv"
 done < "${WORK}/versions.tsv"
