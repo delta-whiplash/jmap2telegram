@@ -5,8 +5,10 @@
 # scanner has literally nothing to report (see "Container image" in
 # SECURITY.md). That is only achievable by statically linking against musl,
 # which is why the builder targets `<arch>-unknown-linux-musl` instead of the
-# host's glibc target. The build stays arch-agnostic so the release workflow's
-# multi-arch (amd64/arm64) publish keeps working unchanged.
+# host's glibc target. The build stays arch-agnostic: ci.yml builds this same
+# file once per architecture on native runners (ubuntu-26.04 / ubuntu-26.04-arm)
+# and merges the two manifests into one multi-arch index. Nothing is rebuilt at
+# release time.
 #
 # Two things the runtime image has to get right, both because `scratch` is
 # truly empty:
@@ -18,16 +20,23 @@
 #   * identity. `scratch` has no /etc/passwd, so the container user must be
 #     numeric and mirror the Helm chart's runAsUser/runAsGroup/fsGroup (65532).
 
-FROM rust:1-slim-bookworm AS builder
+FROM rust:1-slim-bookworm@sha256:2c3a22f0a5533ea2dd5a16627bc841228151faa2d4de2644ac9987e4a2f1f2fa AS builder
 # mold: fast linker. musl-tools: musl-gcc plus musl's crt objects and static
 # libc, required to link the musl target. Both packages exist for amd64 and
-# arm64, so this line is unchanged under the release workflow's QEMU arm64 leg.
+# arm64, so this line is architecture-independent.
 RUN apt-get update && apt-get install -y --no-install-recommends mold musl-tools \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /build
+# The compiler that builds the shipped binary is the one rust-toolchain.toml
+# pins - the same one ci.yml runs fmt/clippy/test with - rather than whatever
+# `rust:1` happens to ship today. Without this, the two could drift apart on
+# any base-image bump and the tested compiler would stop being the shipped one.
+# Copied on its own so the install layer stays cached until the pin changes.
+COPY rust-toolchain.toml ./
+RUN cargo --version && rustc --version
 # rustc has no bundled linker/crt for musl targets, so we pick the musl triple
-# matching the machine we are actually building on (native per-arch: arm64 runs
-# under QEMU).
+# matching the machine we are actually building on. Each architecture is built
+# on a native runner of that architecture (ci.yml), never emulated.
 RUN case "$(uname -m)" in \
       x86_64) musl_target=x86_64-unknown-linux-musl ;; \
       aarch64) musl_target=aarch64-unknown-linux-musl ;; \
@@ -45,14 +54,14 @@ RUN mkdir -p /build/.cargo && printf '%s\n' \
 # registry + target dir as BuildKit cache mounts on top of that. The
 # layer cache alone only survives unchanged; the mounts persist actual
 # rustc/cargo incremental state across builds via the GHA cache backend
-# (cache-from/cache-to: type=gha in release.yml/ci.yml), so even a
-# Cargo.lock bump only recompiles the crates that actually changed
-# instead of the whole dependency tree from zero.
+# (cache-from/cache-to: type=gha in ci.yml), so even a Cargo.lock bump only
+# recompiles the crates that actually changed instead of the whole
+# dependency tree from zero.
 COPY Cargo.toml Cargo.lock ./
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/build/target,sharing=locked \
     mkdir src && echo "fn main() {}" > src/main.rs \
-    && cargo build --release --target "$(cat /build/musl-target)" \
+    && cargo build --release --locked --target "$(cat /build/musl-target)" \
     && rm -rf src
 
 COPY src ./src
@@ -65,7 +74,7 @@ COPY locales ./locales
 # inside a cache mount does not become part of the image layer.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/build/target,sharing=locked \
-    touch src/main.rs && cargo build --release --target "$(cat /build/musl-target)" \
+    touch src/main.rs && cargo build --release --locked --target "$(cat /build/musl-target)" \
     && cp "target/$(cat /build/musl-target)/release/jmap2telegram" /build/jmap2telegram \
     && strip /build/jmap2telegram
 
