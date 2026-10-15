@@ -159,7 +159,10 @@ What you get on Stalwart specifically:
   the Telegram Bot API and your own JMAP server, both over TLS
   (`rustls`, no OpenSSL in the dependency tree).
 - **Minimal attack surface.** No inbound ports, no webhook server, no
-  database - a single static binary long-polling Telegram outbound.
+  database - a single static binary long-polling Telegram outbound. The
+  container image is `scratch`: that one statically-linked (musl) binary
+  and the CA roots, nothing else - no shell, no libc, no OS packages, so
+  an image scanner has nothing to report.
 
 See [`SECURITY.md`](SECURITY.md) for the full threat model and how to
 report a vulnerability.
@@ -404,9 +407,10 @@ Tagging `vX.Y.Z` and pushing it triggers
 The repo is meant to look after itself between feature work:
 
 - **Dependency updates.** [Renovate](renovate.json5) runs from a
-  dedicated self-hosted instance and opens PRs for Cargo, the Docker base
-  image (digest-pinned), and GitHub Actions - grouped, and gated by the
-  same CI suite as any other PR.
+  dedicated self-hosted instance and opens PRs for Cargo, the Docker
+  builder image (`rust:1-slim-bookworm`, digest-pinned; the runtime stage
+  is `scratch`, so it has no base image to track), and GitHub Actions -
+  grouped, and gated by the same CI suite as any other PR.
 - **Auto-merge for routine bumps.** Patch/minor updates merge themselves
   once CI is green (Renovate automerge rules); major bumps are always
   left for manual review.

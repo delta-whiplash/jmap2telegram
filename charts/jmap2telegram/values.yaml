@@ -51,7 +51,8 @@ resources:
 
 podSecurityContext:
   runAsNonRoot: true
-  # Matches gcr.io/distroless/cc-debian12:nonroot's fixed identity.
+  # Matches the Dockerfile runtime stage's numeric USER (the image is
+  # `scratch`, so there is no /etc/passwd to name a user).
   runAsUser: 65532
   runAsGroup: 65532
   fsGroup: 65532

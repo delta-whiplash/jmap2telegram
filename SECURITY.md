@@ -132,6 +132,19 @@
 - **Concurrent writes to the encrypted store.** Credential-store writes
   from different chats' watchers/handlers are serialized, so they can't
   race on the same temp file and corrupt or lose a write.
+- **Container attack surface / zero-package runtime image.** The runtime
+  stage is `scratch`, holding exactly two things: the statically-linked
+  (musl) binary and the CA bundle. There is no libc, no shell, no package
+  manager, and no OS package metadata at all, so an image scanner (Trivy)
+  finds nothing to report, and a hypothetical code-execution bug has no
+  shell or interpreter to land in. The container runs as numeric
+  uid/gid `65532` (`runAsNonRoot` + `readOnlyRootFilesystem` in the Helm
+  chart), and the only writable path is the mounted `/data`. The one
+  accepted caveat of static musl linking is that the binary uses musl's
+  resolver instead of glibc's, which handles `search`/`options ndots`
+  directives in `/etc/resolv.conf` less completely - a deliberate trade
+  for a runtime with literally zero OS packages, and only relevant to
+  unusual resolver configurations.
 
 **Explicitly out of scope / accepted trade-offs:**
 
