@@ -20,7 +20,10 @@ name: Release
 # different commit, and its image digest is never overwritten: either would
 # silently change what someone who already pinned or pulled that version
 # gets. A dispatch that lands on an already-published version fails loudly -
-# bump the version and release that.
+# bump the version and release that. The chart is held to the same rule: an
+# already-published chart version is only re-pushed when its content is
+# byte-identical, which makes re-running a half-finished release a no-op
+# instead of a silent rewrite.
 on:
   push:
     tags:
@@ -31,13 +34,16 @@ on:
         description: "Version to release, without the leading v (e.g. 0.1.0). Creates the vX.Y.Z tag if it doesn't exist yet; an already-published tag is never moved."
         required: true
 
+# Least privilege at the top: each job below asks for the one write scope it
+# actually needs (a job that sets `permissions` gets only what it lists).
 permissions:
-  contents: write
-  packages: write
+  contents: read
 
 jobs:
   prep:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
@@ -71,10 +77,40 @@ jobs:
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
+      - name: Check out the commit being released
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      # The version guard the tag ruleset cannot give us. Tag immutability
+      # stops a *published* tag from being moved, but nothing stops a tag
+      # whose version disagrees with the code it points at - which is how
+      # v0.6.0 once ended up shipping a 0.5.2 binary. Cargo.toml's version is
+      # what `cargo build` stamps into the artifact, so comparing the two
+      # here is what keeps the name on the tin honest.
+      - name: The release version must match the crate version
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          # First `version = "..."` line: Cargo.toml's [package] table, which
+          # cargo requires to come before the tables that may quote other
+          # crates' versions. `tr -d '\r'` because a checkout with CRLF line
+          # endings (a developer's autocrlf, say) would otherwise fail the
+          # comparison while printing the same version twice.
+          crate_version="$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1 | tr -d '\r')"
+          if [ "$crate_version" != "$VERSION" ]; then
+            echo "::error::Cargo.toml says version = \"${crate_version}\" but this is release ${VERSION}. Set the crate version first, merge that, and release from the resulting commit."
+            exit 1
+          fi
+          echo "Cargo.toml version ${crate_version} matches the release version."
+
       - name: Create the release tag (manual dispatch only)
         if: github.event_name == 'workflow_dispatch'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO_SLUG: ${{ github.repository }}
+          SHA: ${{ github.sha }}
           TAG: v${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
@@ -84,38 +120,43 @@ jobs:
           # pinned it, so the collision is reported instead of resolved.
           existing_sha=$(curl -s \
             -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${{ github.repository }}/git/refs/tags/${TAG}" \
+            "https://api.github.com/repos/${REPO_SLUG}/git/refs/tags/${TAG}" \
             | jq -r '.object.sha // empty')
 
           if [ -z "$existing_sha" ]; then
             curl -sS -f -X POST \
               -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${{ github.repository }}/git/refs" \
-              -d "{\"ref\":\"refs/tags/${TAG}\",\"sha\":\"${{ github.sha }}\"}"
-            echo "Created tag ${TAG} at ${{ github.sha }}."
-          elif [ "$existing_sha" = "${{ github.sha }}" ]; then
-            echo "Tag ${TAG} already points at ${{ github.sha }}."
+              "https://api.github.com/repos/${REPO_SLUG}/git/refs" \
+              -d "{\"ref\":\"refs/tags/${TAG}\",\"sha\":\"${SHA}\"}"
+            echo "Created tag ${TAG} at ${SHA}."
+          elif [ "$existing_sha" = "$SHA" ]; then
+            echo "Tag ${TAG} already points at ${SHA}."
           else
-            echo "::error::${TAG} already points at ${existing_sha}, not at ${{ github.sha }}. Release tags are immutable: bump the version and release that, rather than moving a published tag."
+            echo "::error::${TAG} already points at ${existing_sha}, not at ${SHA}. Release tags are immutable: bump the version and release that, rather than moving a published tag."
             exit 1
           fi
 
   promote:
     needs: [prep]
+    permissions:
+      contents: read
+      packages: write
     runs-on: ubuntu-26.04
     env:
       REPO: ghcr.io/${{ github.repository }}
       SRC: ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
     steps:
-      - uses: docker/setup-buildx-action@v4
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
 
-      - uses: docker/login-action@v4
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Wait for the sha-<sha> image published by CI
+        env:
+          SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           # A tag can be pushed seconds after the commit, while its CI run
@@ -130,7 +171,7 @@ jobs:
             echo "waiting for CI to publish $SRC (${i}/60)"
             sleep 10
           done
-          echo "::error::$SRC was never published. Did the CI run for ${{ github.sha }} finish, and did every gate pass?"
+          echo "::error::$SRC was never published. Did the CI run for ${SHA} finish, and did every gate pass?"
           exit 1
 
       # The tag side of the same rule. `imagetools create` happily
@@ -158,8 +199,8 @@ jobs:
           exit 1
 
       # Re-tag the digest CI already built. `imagetools create` copies the
-      # whole index - both platform manifests and their attestations - so
-      # the release keeps the provenance of the tested build.
+      # whole index - both platform manifests, their attestations and the
+      # SBOM - so the release keeps the provenance of the tested build.
       - name: Promote the digest to the release tags
         env:
           VERSION: ${{ needs.prep.outputs.version }}
@@ -177,15 +218,22 @@ jobs:
 
   helm:
     needs: [prep, promote]
+    permissions:
+      contents: read
+      packages: write
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: azure/setup-helm@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
 
       - name: Set chart & app version
+        env:
+          VERSION: ${{ needs.prep.outputs.version }}
         run: |
           set -euo pipefail
-          VERSION="${{ needs.prep.outputs.version }}"
           sed -i "s/^version:.*/version: ${VERSION}/" charts/jmap2telegram/Chart.yaml
           # appVersion keeps the leading v: the promote job publishes only
           # vX.Y.Z / X.Y / X / latest, and the chart resolves an empty
@@ -198,18 +246,80 @@ jobs:
       - run: helm lint charts/jmap2telegram
       - run: helm package charts/jmap2telegram --destination /tmp/chart-out
 
-      - name: Push chart to GHCR (OCI)
+      - name: Log in to GHCR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
         run: |
           set -euo pipefail
-          echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u "${{ github.actor }}" --password-stdin
-          helm push /tmp/chart-out/jmap2telegram-*.tgz "oci://ghcr.io/${{ github.repository_owner }}/charts"
+          printf '%s' "$GH_TOKEN" | helm registry login ghcr.io -u "$ACTOR" --password-stdin
+
+      # The chart's half of the immutability rule, and the reason it has to
+      # be checked here rather than left to the registry: GHCR has no
+      # per-tag protection for OCI artifacts (the ruleset mechanism is a git
+      # feature), so `helm push` would happily rewrite a published version.
+      # The digest cannot be compared the way the image's is - `helm package`
+      # stamps file mtimes into the tarball, so the same chart packaged twice
+      # has two different digests - but its *content* is comparable, and a
+      # byte-identical republish is exactly the case a retried run hits.
+      - name: Refuse to republish a chart version with different content
+        id: chart
+        env:
+          VERSION: ${{ needs.prep.outputs.version }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          oci_chart="oci://ghcr.io/${OWNER}/charts/jmap2telegram"
+          oci_ref="ghcr.io/${OWNER}/charts/jmap2telegram:${VERSION}"
+          echo "publish=true" >> "$GITHUB_OUTPUT"
+          if ! docker buildx imagetools inspect "$oci_ref" > /dev/null 2>&1; then
+            echo "chart ${VERSION} is not published yet - publishing it."
+            exit 0
+          fi
+          # Published, so it must be identical. Every step past this point
+          # is allowed to fail but not to fall through to the push below:
+          # `set -e` plus the explicit diff keeps a transient failure from
+          # turning into a silent overwrite.
+          tmp="$(mktemp -d)"
+          helm pull "$oci_chart" --version "$VERSION" --destination "$tmp" > /dev/null
+          mkdir -p "${tmp}/published" "${tmp}/local"
+          tar -xzf "${tmp}"/jmap2telegram-"${VERSION}".tgz -C "${tmp}/published"
+          tar -xzf /tmp/chart-out/jmap2telegram-"${VERSION}".tgz -C "${tmp}/local"
+          if diff -r --brief "${tmp}/local/jmap2telegram" "${tmp}/published/jmap2telegram"; then
+            echo "chart ${VERSION} is already published with identical content - nothing to push."
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "::error::chart ${VERSION} is already published with different content. Chart versions are immutable: bump the version and release that."
+          exit 1
+
+      - name: Push chart to GHCR (OCI)
+        if: steps.chart.outputs.publish == 'true'
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          helm push /tmp/chart-out/jmap2telegram-*.tgz "oci://ghcr.io/${OWNER}/charts"
 
   github-release:
     needs: [prep, promote, helm]
+    permissions:
+      contents: write
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: softprops/action-gh-release@v3
-        with:
-          tag_name: v${{ needs.prep.outputs.version }}
-          generate_release_notes: true
+      # No checkout: `gh` is told the repository explicitly, so the job needs
+      # neither a working tree nor the git credentials a checkout would leave
+      # behind. `--verify-tag` fails rather than creating a release for a tag
+      # that isn't there.
+      - name: Cut the GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO_SLUG: ${{ github.repository }}
+          VERSION: ${{ needs.prep.outputs.version }}
+        run: |
+          set -euo pipefail
+          gh release create "v${VERSION}" \
+            --repo "$REPO_SLUG" \
+            --title "v${VERSION}" \
+            --generate-notes \
+            --verify-tag
