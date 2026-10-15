@@ -98,23 +98,40 @@ jobs:
 
   docker:
     needs: [prep, test]
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # One native runner per arch. Emulating arm64 under QEMU cost ~26x
+          # a native compile (49m38s of the v0.7.0 release); buildx picks the
+          # native instruction set here, so no QEMU is set up at all.
+          # ubuntu-26.04* are standard GitHub-hosted images, free for public
+          # repos.
+          - runner: ubuntu-26.04
+            platform: linux/amd64
+            arch: amd64
+          - runner: ubuntu-26.04-arm
+            platform: linux/arm64
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
 
-      - uses: docker/setup-qemu-action@v4
       - uses: docker/setup-buildx-action@v4
         id: buildx
 
-      # See ci.yml's docker-build job for why this is needed alongside
-      # cache-from/cache-to: type=gha below (which only covers image
-      # layers, not the Dockerfile's RUN --mount=type=cache dirs).
+      # Per-arch cache key: the two legs' cargo target dirs are arch-specific
+      # and must not clobber each other. The amd64 key/scope are deliberately
+      # identical to ci.yml's docker-build so a release reuses its warm
+      # layers. See ci.yml's docker-build job for why cache-dance is needed
+      # alongside cache-from/cache-to (which only cover image layers, not the
+      # Dockerfile's RUN --mount=type=cache dirs).
       - uses: actions/cache@v4
         id: cache
         with:
           path: cache-mount
-          key: docker-cache-mount-${{ hashFiles('Dockerfile', 'Cargo.lock') }}
-          restore-keys: docker-cache-mount-
+          key: docker-cache-mount-${{ matrix.arch }}-${{ hashFiles('Dockerfile', 'Cargo.lock') }}
+          restore-keys: docker-cache-mount-${{ matrix.arch }}-
 
       - uses: reproducible-containers/buildkit-cache-dance@v3
         with:
@@ -139,18 +156,81 @@ jobs:
             type=semver,pattern={{major}},value=v${{ needs.prep.outputs.version }}
             type=raw,value=latest
 
+      # Build this arch natively and push it *by digest only*: the human-facing
+      # tags are attached once, in `merge`, to the combined manifest list, so
+      # the two legs never race to publish the same tag.
       - uses: docker/build-push-action@v7
+        id: build
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
+          platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          outputs: type=image,name=ghcr.io/${{ github.repository }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+
+      - name: Export digest
+        run: |
+          set -euo pipefail
+          mkdir -p "${{ runner.temp }}/digests"
+          digest="${{ steps.build.outputs.digest }}"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    needs: [prep, docker]
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=v${{ needs.prep.outputs.version }}
+            type=semver,pattern={{major}}.{{minor}},value=v${{ needs.prep.outputs.version }}
+            type=semver,pattern={{major}},value=v${{ needs.prep.outputs.version }}
+            type=raw,value=latest
+
+      # Stitch the two per-arch digests into one multi-arch manifest list and
+      # attach every publishable tag in a single atomic write.
+      - name: Create the multi-arch manifest list and push
+        working-directory: ${{ runner.temp }}/digests
+        env:
+          REPO: ghcr.io/${{ github.repository }}
+        run: |
+          set -euo pipefail
+          tag_args=()
+          while IFS= read -r tag; do tag_args+=(-t "$tag"); done \
+            < <(jq -r '.tags[]' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          digest_args=()
+          for d in *; do digest_args+=("${REPO}@sha256:${d}"); done
+          docker buildx imagetools create "${tag_args[@]}" "${digest_args[@]}"
+
+      - name: Inspect the published manifest list
+        run: docker buildx imagetools inspect ghcr.io/${{ github.repository }}:v${{ needs.prep.outputs.version }}
 
   helm:
-    needs: [prep, docker]
+    needs: [prep, merge]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -179,7 +259,7 @@ jobs:
           helm push /tmp/chart-out/jmap2telegram-*.tgz "oci://ghcr.io/${{ github.repository_owner }}/charts"
 
   github-release:
-    needs: [prep, docker, helm]
+    needs: [prep, merge, helm]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
