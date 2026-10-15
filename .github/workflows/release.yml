@@ -118,10 +118,23 @@ jobs:
           # but only if that version has not been published yet. Moving an
           # existing tag would rewrite history for anyone who already
           # pinned it, so the collision is reported instead of resolved.
-          existing_sha=$(curl -s \
+          ref=$(curl -s \
             -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${REPO_SLUG}/git/refs/tags/${TAG}" \
-            | jq -r '.object.sha // empty')
+            "https://api.github.com/repos/${REPO_SLUG}/git/refs/tags/${TAG}")
+          existing_sha=$(echo "$ref" | jq -r '.object.sha // empty')
+          # An *annotated* tag's ref points at the tag object, not at the
+          # commit it names, so follow it before comparing: without this,
+          # re-running a release whose tag was cut with `git tag -a` looks
+          # exactly like a tag that was moved, and prep refuses a legitimate
+          # retry. Lightweight tags - which is what the branch below creates,
+          # and what every tag in this repository's history is - need no
+          # dereference.
+          if [ "$(echo "$ref" | jq -r '.object.type // empty')" = "tag" ]; then
+            existing_sha=$(curl -s \
+              -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO_SLUG}/git/tags/${existing_sha}" \
+              | jq -r '.object.sha // empty')
+          fi
 
           if [ -z "$existing_sha" ]; then
             curl -sS -f -X POST \
