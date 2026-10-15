@@ -1354,7 +1354,7 @@ dependencies = [
 
 [[package]]
 name = "jmap2telegram"
-version = "0.5.2"
+version = "0.7.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
