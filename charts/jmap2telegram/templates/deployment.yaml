@@ -59,6 +59,8 @@ spec:
               value: {{ .Values.logLevel | quote }}
             - name: TIMEZONE
               value: {{ .Values.timezone | quote }}
+            - name: BOT_LANGUAGE
+              value: {{ .Values.language | quote }}
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

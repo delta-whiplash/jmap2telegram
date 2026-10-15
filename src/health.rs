@@ -48,6 +48,15 @@
 //!   watcher is neither receiving events nor completing fallback syncs -
 //!   alert material, not restart material.
 //!
+//!   Alongside those come the [`Metrics`] the request handlers maintain:
+//!   `jmap2telegram_build_info`, `_start_time_seconds`, `_accounts`,
+//!   `_pending_undos`, `process_resident_memory_bytes`, and the
+//!   `_notifications_delivered_total` / `_notification_send_errors_total`
+//!   / `_triage_actions_total` / `_mark_read_total` / `_undo_total` /
+//!   `_watcher_reconnects_total` / `_watcher_syncs_total` counters. No
+//!   label ever carries a chat id or any user-supplied value, so a
+//!   scrape's cardinality is bounded by construction.
+//!
 //! Two hardening rules apply to the wire path itself:
 //!
 //! - **Request reads are deadline-bounded** (see [`REQUEST_DEADLINE`]). A
@@ -63,7 +72,8 @@
 //!   lines.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -174,11 +184,238 @@ impl Health {
     }
 }
 
+/// Application-level counters and gauges, rendered alongside the watcher
+/// registry's metrics. Unlike [`Health`] - a live view the watcher tasks
+/// own - this is a plain registry the request handlers bump as things
+/// happen, so a scrape can answer "how much mail are we delivering, and
+/// what is failing" without anyone log-scraping.
+///
+/// Cardinality is bounded by construction: no label ever carries a chat id
+/// or any other user-supplied value, so a scrape can't grow without bound
+/// no matter how many chats the deployment serves.
+pub struct Metrics {
+    /// Process start as Unix epoch seconds (`jmap2telegram_start_time_seconds`).
+    start_time_seconds: u64,
+    /// Counter families keyed by metric name, each holding its samples
+    /// keyed by the rendered label set.
+    counters: Mutex<BTreeMap<&'static str, Family>>,
+    /// `jmap2telegram_accounts`: chats currently holding a JMAP account.
+    accounts: AtomicU64,
+    /// `jmap2telegram_pending_undos`: undo slots currently open.
+    pending_undos: AtomicU64,
+}
+
+/// One metric family: its HELP text plus the samples seen so far. Named
+/// families exist so the HELP/TYPE preamble is emitted once even when a
+/// counter only ever gets bumped with one label combination.
+struct Family {
+    help: &'static str,
+    samples: BTreeMap<String, u64>,
+}
+
+impl Metrics {
+    pub fn new() -> Self {
+        Self {
+            start_time_seconds: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            counters: Mutex::new(BTreeMap::new()),
+            accounts: AtomicU64::new(0),
+            pending_undos: AtomicU64::new(0),
+        }
+    }
+
+    /// Increments a labeled counter sample, creating its family on first use.
+    fn inc(&self, name: &'static str, help: &'static str, labels: &[(&str, &str)]) {
+        let sample = render_labels(labels);
+        let mut counters = self.counters.lock().unwrap();
+        let family = counters.entry(name).or_insert_with(|| Family {
+            help,
+            samples: BTreeMap::new(),
+        });
+        *family.samples.entry(sample).or_insert(0) += 1;
+    }
+
+    /// A notification was successfully delivered, by account kind.
+    pub fn notification_delivered(&self, kind: &str) {
+        self.inc(
+            "jmap2telegram_notifications_delivered_total",
+            "Notifications successfully delivered to Telegram.",
+            &[("kind", kind)],
+        );
+    }
+
+    /// A notification failed to send (Telegram error, flood limit, ...).
+    pub fn notification_send_error(&self, kind: &str) {
+        self.inc(
+            "jmap2telegram_notification_send_errors_total",
+            "Notifications that failed to send to Telegram.",
+            &[("kind", kind)],
+        );
+    }
+
+    /// A triage action (archive/spam/delete) finished, by action and outcome.
+    pub fn triage_action(&self, action: &str, outcome: &str) {
+        self.inc(
+            "jmap2telegram_triage_actions_total",
+            "Triage actions taken from notification buttons.",
+            &[("action", action), ("outcome", outcome)],
+        );
+    }
+
+    /// A mark-as-read attempt finished.
+    pub fn mark_read(&self, outcome: &str) {
+        self.inc(
+            "jmap2telegram_mark_read_total",
+            "Mark-as-read attempts from notification buttons.",
+            &[("outcome", outcome)],
+        );
+    }
+
+    /// An undo attempt finished (`restored`, `expired` or `error`).
+    pub fn undo(&self, outcome: &str) {
+        self.inc(
+            "jmap2telegram_undo_total",
+            "Undo attempts on triage actions, by outcome.",
+            &[("outcome", outcome)],
+        );
+    }
+
+    /// A watcher had to reconnect (its EventSource dropped or never opened).
+    pub fn watcher_reconnect(&self) {
+        self.inc(
+            "jmap2telegram_watcher_reconnects_total",
+            "Watcher EventSource reconnection attempts.",
+            &[],
+        );
+    }
+
+    /// A watcher completed a JMAP sync (event-driven or fallback poll).
+    pub fn watcher_sync(&self) {
+        self.inc(
+            "jmap2telegram_watcher_syncs_total",
+            "Successful watcher JMAP syncs.",
+            &[],
+        );
+    }
+
+    pub fn set_accounts(&self, n: u64) {
+        self.accounts.store(n, Ordering::Relaxed);
+    }
+
+    pub fn set_pending_undos(&self, n: u64) {
+        self.pending_undos.store(n, Ordering::Relaxed);
+    }
+
+    /// Renders every counter family plus the atomic gauges.
+    fn render(&self, out: &mut String) {
+        // Constant 1, version in the label: the conventional build-info
+        // shape, so a dashboard can join on it.
+        out.push_str(
+            "# HELP jmap2telegram_build_info Build information as a constant 1, labeled with the crate version.\n\
+             # TYPE jmap2telegram_build_info gauge\n",
+        );
+        out.push_str(&format!(
+            "jmap2telegram_build_info{{version=\"{}\"}} 1\n",
+            escape_prometheus_label(env!("CARGO_PKG_VERSION"))
+        ));
+
+        let uptime_gauge = |out: &mut String, name: &str, help: &str, value: u64| {
+            push_metric(out, name, help, "gauge", &value.to_string());
+        };
+        uptime_gauge(
+            out,
+            "jmap2telegram_start_time_seconds",
+            "Start time of the process since unix epoch in seconds.",
+            self.start_time_seconds,
+        );
+        uptime_gauge(
+            out,
+            "jmap2telegram_accounts",
+            "Number of chats currently holding a JMAP account.",
+            self.accounts.load(Ordering::Relaxed),
+        );
+        uptime_gauge(
+            out,
+            "jmap2telegram_pending_undos",
+            "Undo slots currently open (triage actions still reversible).",
+            self.pending_undos.load(Ordering::Relaxed),
+        );
+        if let Some(rss) = process_resident_memory_bytes() {
+            push_metric(
+                out,
+                "process_resident_memory_bytes",
+                "Resident memory size in bytes.",
+                "gauge",
+                &rss.to_string(),
+            );
+        }
+
+        let counters = self.counters.lock().unwrap();
+        for (name, family) in counters.iter() {
+            push_metric_header(out, name, family.help, "counter");
+            for (labels, value) in &family.samples {
+                if labels.is_empty() {
+                    out.push_str(&format!("{name} {value}\n"));
+                } else {
+                    out.push_str(&format!("{name}{{{labels}}} {value}\n"));
+                }
+            }
+        }
+    }
+}
+
+impl Default for Metrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Renders a label set for the text format, escaping each value with the
+/// same rules as [`escape_prometheus_label`].
+fn render_labels(labels: &[(&str, &str)]) -> String {
+    labels
+        .iter()
+        .map(|(k, v)| format!("{k}=\"{}\"", escape_prometheus_label(v)))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Appends one `# HELP` / `# TYPE` preamble plus a single unlabeled sample.
+fn push_metric(out: &mut String, name: &str, help: &str, kind: &str, value: &str) {
+    push_metric_header(out, name, help, kind);
+    out.push_str(&format!("{name} {value}\n"));
+}
+
+fn push_metric_header(out: &mut String, name: &str, help: &str, kind: &str) {
+    out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} {kind}\n"));
+}
+
+/// Resident set size of this process, read from `/proc/self/status`, or
+/// `None` where `/proc` isn't available (non-Linux). Best-effort: a
+/// metrics endpoint that omits one line is strictly better than one that
+/// fails or panics over a file it couldn't read.
+fn process_resident_memory_bytes() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    status.lines().find_map(|line| {
+        let rest = line.strip_prefix("VmRSS:")?;
+        let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
+        Some(kb * 1024)
+    })
+}
+
 /// Binds the probe listener. Called from `main` rather than inside the
 /// spawned task so a bind failure (port already taken, misconfigured
 /// environment) is a startup error, not a silently missing probe.
+///
+/// Address defaults to `0.0.0.0:8080` and can be overridden with
+/// `HEALTH_ADDR` (e.g. `127.0.0.1:9090`), since a self-hoster may already
+/// be running something else on 8080 - the README's scrape configuration
+/// must simply match whichever address is chosen.
 pub async fn bind() -> std::io::Result<TcpListener> {
-    let listener = TcpListener::bind("0.0.0.0:8080").await?;
+    let addr = std::env::var("HEALTH_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
+    let listener = TcpListener::bind(&addr).await?;
     tracing::info!(addr = %listener.local_addr()?, "health endpoint listening");
     Ok(listener)
 }
@@ -193,8 +430,8 @@ const REQUEST_DEADLINE: Duration = Duration::from_secs(5);
 
 /// Serves probe and metrics requests until the process exits. Never
 /// returns on its own; run it in a spawned task.
-pub async fn serve(listener: TcpListener, health: Arc<Health>) {
-    serve_with_request_deadline(listener, health, REQUEST_DEADLINE).await
+pub async fn serve(listener: TcpListener, health: Arc<Health>, metrics: Arc<Metrics>) {
+    serve_with_request_deadline(listener, health, metrics, REQUEST_DEADLINE).await
 }
 
 /// Same as [`serve`], with the per-connection request deadline injectable
@@ -203,14 +440,16 @@ pub async fn serve(listener: TcpListener, health: Arc<Health>) {
 async fn serve_with_request_deadline(
     listener: TcpListener,
     health: Arc<Health>,
+    metrics: Arc<Metrics>,
     request_deadline: Duration,
 ) {
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
                 let health = health.clone();
+                let metrics = metrics.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = respond(stream, &health, request_deadline).await {
+                    if let Err(e) = respond(stream, &health, &metrics, request_deadline).await {
                         // A client hanging up mid-request lands here; not
                         // worth more than a trace line.
                         tracing::trace!(error = %e, "health connection error");
@@ -230,6 +469,7 @@ async fn serve_with_request_deadline(
 async fn respond(
     mut stream: TcpStream,
     health: &Health,
+    metrics: &Metrics,
     request_deadline: Duration,
 ) -> std::io::Result<()> {
     // Probes and scrapers send a fixed, tiny request line + headers; one
@@ -268,7 +508,7 @@ async fn respond(
                 ),
             ),
         },
-        "/metrics" => ("200 OK", render_metrics(health)),
+        "/metrics" => ("200 OK", render_metrics(health, metrics)),
         _ => ("404 Not Found", String::new()),
     };
     let response = format!(
@@ -279,7 +519,7 @@ async fn respond(
     stream.flush().await
 }
 
-fn render_metrics(health: &Health) -> String {
+fn render_metrics(health: &Health, metrics: &Metrics) -> String {
     let snapshot = health.snapshot();
     let connected = snapshot.values().filter(|s| s.connected).count();
     let mut out = String::with_capacity(256 + 64 * snapshot.len());
@@ -317,6 +557,7 @@ fn render_metrics(health: &Health) -> String {
             escape_prometheus_label(key)
         ));
     }
+    metrics.render(&mut out);
     out
 }
 
@@ -353,11 +594,18 @@ mod tests {
     use std::time::Duration;
 
     async fn spawn_ephemeral(health: Arc<Health>) -> std::net::SocketAddr {
+        spawn_ephemeral_with(health, Arc::new(Metrics::new())).await
+    }
+
+    async fn spawn_ephemeral_with(
+        health: Arc<Health>,
+        metrics: Arc<Metrics>,
+    ) -> std::net::SocketAddr {
         // Port 0 lets the OS pick a free port, so tests never race each
         // other or a concurrently running dev instance on 8080.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(serve(listener, health));
+        tokio::spawn(serve(listener, health, metrics));
         addr
     }
 
@@ -598,6 +846,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn metrics_include_build_info_and_application_metrics() {
+        let health = Arc::new(Health::default());
+        let metrics = Arc::new(Metrics::new());
+        metrics.notification_delivered("primary");
+        metrics.notification_delivered("primary");
+        metrics.notification_send_error("shared");
+        metrics.triage_action("archive", "ok");
+        metrics.mark_read("ok");
+        metrics.undo("restored");
+        metrics.watcher_reconnect();
+        metrics.watcher_sync();
+        metrics.set_accounts(3);
+        metrics.set_pending_undos(1);
+        let addr = spawn_ephemeral_with(health, metrics).await;
+        let (status, body) = get(addr, "/metrics").await;
+        assert_eq!(status, 200);
+        assert!(
+            body.contains(&format!(
+                "jmap2telegram_build_info{{version=\"{}\"}} 1",
+                env!("CARGO_PKG_VERSION")
+            )),
+            "body: {body}"
+        );
+        assert!(
+            body.contains("jmap2telegram_start_time_seconds "),
+            "body: {body}"
+        );
+        assert!(body.contains("jmap2telegram_accounts 3"), "body: {body}");
+        assert!(
+            body.contains("jmap2telegram_pending_undos 1"),
+            "body: {body}"
+        );
+        assert!(
+            body.contains("jmap2telegram_notifications_delivered_total{kind=\"primary\"} 2"),
+            "body: {body}"
+        );
+        assert!(
+            body.contains("jmap2telegram_notification_send_errors_total{kind=\"shared\"} 1"),
+            "body: {body}"
+        );
+        assert!(
+            body.contains(
+                "jmap2telegram_triage_actions_total{action=\"archive\",outcome=\"ok\"} 1"
+            ),
+            "body: {body}"
+        );
+        assert!(
+            body.contains("jmap2telegram_mark_read_total{outcome=\"ok\"} 1"),
+            "body: {body}"
+        );
+        assert!(
+            body.contains("jmap2telegram_undo_total{outcome=\"restored\"} 1"),
+            "body: {body}"
+        );
+        assert!(
+            body.contains("jmap2telegram_watcher_reconnects_total 1"),
+            "body: {body}"
+        );
+        assert!(
+            body.contains("jmap2telegram_watcher_syncs_total 1"),
+            "body: {body}"
+        );
+        // Each family's HELP/TYPE preamble is emitted exactly once.
+        assert_eq!(
+            body.matches("# TYPE jmap2telegram_notifications_delivered_total counter")
+                .count(),
+            1,
+            "body: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn metrics_separate_samples_of_the_same_counter_family() {
+        let health = Arc::new(Health::default());
+        let metrics = Arc::new(Metrics::new());
+        metrics.triage_action("archive", "ok");
+        metrics.triage_action("delete", "error");
+        let addr = spawn_ephemeral_with(health, metrics).await;
+        let (_, body) = get(addr, "/metrics").await;
+        assert!(
+            body.contains(
+                "jmap2telegram_triage_actions_total{action=\"archive\",outcome=\"ok\"} 1"
+            ),
+            "body: {body}"
+        );
+        assert!(
+            body.contains(
+                "jmap2telegram_triage_actions_total{action=\"delete\",outcome=\"error\"} 1"
+            ),
+            "body: {body}"
+        );
+    }
+
+    #[test]
+    fn process_resident_memory_bytes_is_plausible_where_proc_exists() {
+        #[cfg(target_os = "linux")]
+        {
+            let rss = process_resident_memory_bytes().expect("VmRSS must be readable on Linux");
+            assert!(rss > 0);
+        }
+    }
+
+    #[tokio::test]
     async fn silent_connection_is_closed_at_the_read_deadline() {
         // A peer that connects and then never sends a byte must not pin
         // the accept-spawned task and its socket for the life of the
@@ -612,6 +963,7 @@ mod tests {
         tokio::spawn(serve_with_request_deadline(
             listener,
             health,
+            Arc::new(Metrics::new()),
             Duration::from_millis(150),
         ));
         let mut silent = TcpStream::connect(addr).await.unwrap();

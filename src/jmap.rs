@@ -1,6 +1,6 @@
+use std::fmt;
 use std::net::{IpAddr, Ipv4Addr};
 
-use anyhow::{Context, Result, anyhow, bail};
 use jmap_client::DataType;
 use jmap_client::client::{Client, Credentials};
 use jmap_client::core::response::EmailGetResponse;
@@ -13,19 +13,109 @@ use jmap_client::mailbox::{self, Role};
 /// lookups and produce an unusably long Telegram reply.
 const SEARCH_RESULT_LIMIT: usize = 10;
 
-/// The single fixed message the chat gets for *any* network-level JMAP
-/// failure (DNS resolution, TCP/TLS connect, autodiscovery, session
-/// negotiation, authentication). The raw transport error, by contrast,
-/// fingerprints exactly one port state ("connection refused" vs "timed
-/// out" vs a TLS/HTTP error, each rendered by reqwest with the full URL
-/// and OS-level TCP cause), so echoing it back to the chat would turn
-/// `/login` against an attacker-chosen hostname - or a watcher reconnect
-/// after a DNS-rebounding TOCTOU - into an internal-port-reachability
-/// oracle (see SECURITY.md). The real cause is logged server-side instead;
-/// callers must never attach it back to the error they return, or the
-/// chain becomes one `{:?}` format away from the same leak.
-const UNREACHABLE_SERVER_MSG: &str =
-    "serveur JMAP injoignable ou invalide (détail dans les logs serveur)";
+/// Result type for every public function in this module.
+type Result<T> = std::result::Result<T, JmapError>;
+
+/// The fixed English message behind [`JmapError::Unreachable`]'s `Display`.
+/// The raw transport error, by contrast, fingerprints exactly one port
+/// state ("connection refused" vs "timed out" vs a TLS/HTTP error, each
+/// rendered by reqwest with the full URL and OS-level TCP cause), so it must
+/// never travel past the server-side log (see [`JmapError::Unreachable`]).
+/// The chat-facing (localized) wording lives in [`JmapError::localized`].
+const UNREACHABLE_SERVER_MSG: &str = "JMAP server unreachable or invalid (details in server logs)";
+
+/// Typed, user-facing JMAP failure categories.
+///
+/// The `Display` impl is the English, log-facing rendering - greppable in
+/// one language no matter who's chatting - while [`JmapError::localized`]
+/// produces the chat rendering in the reader's own locale. Every variant is
+/// deliberately coarse: none carries transport detail (URL, OS error, port
+/// state), so an error returned to a chat can never become a
+/// reachability oracle (see `UNREACHABLE_SERVER_MSG` and SECURITY.md).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JmapError {
+    /// The server URL didn't start with `https://`.
+    InsecureUrl,
+    /// The server URL couldn't be parsed as an absolute URL.
+    InvalidUrl,
+    /// The parsed URL had no host component.
+    NoHost,
+    /// The host resolved to a private/loopback/link-local address and the
+    /// SSRF guard refused it (`ALLOW_PRIVATE_JMAP_HOSTS` off).
+    PrivateHost { host: String, ip: String },
+    /// Any network-level failure (DNS, connect, TLS, autodiscovery, session
+    /// negotiation, authentication) - with no transport detail attached.
+    Unreachable,
+    /// A JMAP protocol call failed; `operation` names it for the logs only.
+    Protocol { operation: &'static str },
+    /// The message no longer exists server-side.
+    MessageNotFound,
+    /// The account exposes no mailbox with the Archive role.
+    NoArchiveMailbox,
+    /// The account exposes no mailbox with the Junk role.
+    NoJunkMailbox,
+    /// The account exposes no mailbox with the Trash role.
+    NoTrashMailbox,
+}
+
+impl fmt::Display for JmapError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            JmapError::InsecureUrl => write!(f, "the JMAP server URL must start with https://"),
+            JmapError::InvalidUrl => write!(f, "invalid JMAP server URL"),
+            JmapError::NoHost => write!(f, "JMAP server URL without a host name"),
+            JmapError::PrivateHost { host, ip } => {
+                write!(
+                    f,
+                    "refused non-public address {ip} for host '{host}' (SSRF guard)"
+                )
+            }
+            JmapError::Unreachable => write!(f, "{UNREACHABLE_SERVER_MSG}"),
+            JmapError::Protocol { operation } => write!(f, "JMAP call failed: {operation}"),
+            JmapError::MessageNotFound => write!(f, "message not found (maybe already deleted)"),
+            JmapError::NoArchiveMailbox => write!(f, "this account has no JMAP Archive folder"),
+            JmapError::NoJunkMailbox => write!(f, "this account has no JMAP Spam/Junk folder"),
+            JmapError::NoTrashMailbox => write!(f, "this account has no JMAP Trash folder"),
+        }
+    }
+}
+
+impl std::error::Error for JmapError {}
+
+impl JmapError {
+    /// The chat-facing rendering, in the reader's locale.
+    pub fn localized(&self, lang: &str) -> String {
+        match self {
+            JmapError::Unreachable => t!("jmap.unreachable", locale = lang).to_string(),
+            JmapError::InsecureUrl => t!("jmap.insecure_url", locale = lang).to_string(),
+            JmapError::InvalidUrl => t!("jmap.invalid_url", locale = lang).to_string(),
+            JmapError::NoHost => t!("jmap.no_host", locale = lang).to_string(),
+            JmapError::PrivateHost { host, ip } => {
+                // The host/ip here describe the input the user themselves
+                // supplied and the address it resolved to - not a probe
+                // result - so they're safe to show (unlike a transport error).
+                t!("jmap.private_host", locale = lang, host = host, ip = ip).to_string()
+            }
+            // The operation name is an internal tag for the logs; the chat
+            // only needs to know the server refused the call.
+            JmapError::Protocol { .. } => t!("jmap.protocol", locale = lang).to_string(),
+            JmapError::MessageNotFound => t!("jmap.message_not_found", locale = lang).to_string(),
+            JmapError::NoArchiveMailbox => t!("jmap.no_archive", locale = lang).to_string(),
+            JmapError::NoJunkMailbox => t!("jmap.no_junk", locale = lang).to_string(),
+            JmapError::NoTrashMailbox => t!("jmap.no_trash", locale = lang).to_string(),
+        }
+    }
+}
+
+/// Renders an [`anyhow::Error`] for the chat: the localized [`JmapError`]
+/// when one is at the top of the chain (the common case, since every
+/// `jmap::*` call returns one), otherwise the English chain as-is.
+pub fn localized_error(err: &anyhow::Error, lang: &str) -> String {
+    match err.downcast_ref::<JmapError>() {
+        Some(e) => e.localized(lang),
+        None => err.to_string(),
+    }
+}
 
 pub struct EmailSummary {
     pub id: String,
@@ -45,7 +135,7 @@ fn attachments_of(email: &jmap_client::email::Email) -> Vec<(String, usize)> {
         .attachments()
         .unwrap_or_default()
         .iter()
-        .map(|a| (a.name().unwrap_or("(sans nom)").to_string(), a.size()))
+        .map(|a| (a.name().unwrap_or_default().to_string(), a.size()))
         .collect()
 }
 
@@ -76,13 +166,13 @@ fn attachments_of(email: &jmap_client::email::Email) -> Vec<(String, usize)> {
 /// see that constant for why.
 pub async fn connect(server_url: &str, token: &str, allow_private_hosts: bool) -> Result<Client> {
     if !server_url.starts_with("https://") {
-        bail!("l'URL du serveur JMAP doit commencer par https://");
+        return Err(JmapError::InsecureUrl);
     }
 
     let host = url::Url::parse(server_url)
-        .context("URL de serveur JMAP invalide")?
+        .map_err(|_| JmapError::InvalidUrl)?
         .host_str()
-        .context("URL de serveur JMAP sans nom d'hôte")?
+        .ok_or(JmapError::NoHost)?
         .to_string();
 
     if !allow_private_hosts {
@@ -110,14 +200,14 @@ pub async fn connect(server_url: &str, token: &str, allow_private_hosts: bool) -
             // whatever the hostname resolves to by the time *this*
             // request re-resolves it (see the residual TOCTOU in
             // SECURITY.md). Log the cause server-side and return a bare
-            // generic error - bare, so the dropped cause can't be
+            // generic variant - bare, so the dropped cause can't be
             // resurrected from the error chain either.
             tracing::warn!(
                 host = %host,
                 error = %e,
                 "JMAP session negotiation failed (details kept out of the chat)"
             );
-            anyhow!(UNREACHABLE_SERVER_MSG)
+            JmapError::Unreachable
         })?;
 
     Ok(client)
@@ -163,7 +253,7 @@ pub fn list_shared_accounts(client: &Client) -> Vec<(String, String)> {
 }
 
 async fn assert_public_host(host: &str, server_url: &str) -> Result<()> {
-    let parsed = url::Url::parse(server_url).context("URL de serveur JMAP invalide")?;
+    let parsed = url::Url::parse(server_url).map_err(|_| JmapError::InvalidUrl)?;
     let port = parsed.port_or_known_default().unwrap_or(443);
 
     // Same error-oracle neutralization as the session handshake in
@@ -179,7 +269,7 @@ async fn assert_public_host(host: &str, server_url: &str) -> Result<()> {
                 error = %e,
                 "DNS resolution of the JMAP server failed (details kept out of the chat)"
             );
-            bail!(UNREACHABLE_SERVER_MSG);
+            return Err(JmapError::Unreachable);
         }
     };
 
@@ -193,13 +283,10 @@ async fn assert_public_host(host: &str, server_url: &str) -> Result<()> {
             // whether anything is listening anywhere - which is why,
             // unlike every transport error above and below, it stays
             // detailed enough to be actionable in the chat.
-            bail!(
-                "le serveur JMAP '{host}' se résout vers une adresse non publique ({}) : \
-                 refusé pour éviter une attaque SSRF contre le réseau interne du déploiement. \
-                 Si c'est un serveur auto-hébergé volontairement sur un réseau privé, active \
-                 ALLOW_PRIVATE_JMAP_HOSTS=1.",
-                addr.ip()
-            );
+            return Err(JmapError::PrivateHost {
+                host: host.to_string(),
+                ip: addr.ip().to_string(),
+            });
         }
     }
     if !resolved_any {
@@ -207,7 +294,7 @@ async fn assert_public_host(host: &str, server_url: &str) -> Result<()> {
             host = %host,
             "DNS resolution of the JMAP server returned no addresses (details kept out of the chat)"
         );
-        bail!(UNREACHABLE_SERVER_MSG);
+        return Err(JmapError::Unreachable);
     }
     Ok(())
 }
@@ -260,7 +347,9 @@ pub async fn current_email_state(client: &Client) -> Result<String> {
     let response = request
         .send_single::<EmailGetResponse>()
         .await
-        .context("échec de l'initialisation de l'état JMAP")?;
+        .map_err(|_| JmapError::Protocol {
+            operation: "Email/get (state baseline)",
+        })?;
     Ok(response.state().to_string())
 }
 
@@ -275,7 +364,9 @@ pub async fn fetch_changed_emails(
     let changes = client
         .email_changes(since_state, Some(50))
         .await
-        .context("Email/changes a échoué")?;
+        .map_err(|_| JmapError::Protocol {
+            operation: "Email/changes",
+        })?;
     let new_state = changes.new_state().to_string();
     let created = changes.created().to_vec();
 
@@ -293,7 +384,9 @@ pub async fn fetch_changed_emails(
                 ]),
             )
             .await
-            .context("Email/get a échoué")?
+            .map_err(|_| JmapError::Protocol {
+                operation: "Email/get",
+            })?
         {
             let (from_name, from_addr) = email
                 .from()
@@ -303,7 +396,7 @@ pub async fn fetch_changed_emails(
 
             summaries.push(EmailSummary {
                 id,
-                subject: email.subject().unwrap_or("(sans objet)").to_string(),
+                subject: email.subject().unwrap_or_default().to_string(),
                 from_name,
                 from_addr,
                 preview: email.preview().unwrap_or_default().to_string(),
@@ -332,7 +425,9 @@ pub async fn search(client: &Client, query: &str) -> Result<Vec<EmailSummary>> {
     let query_response = request
         .send_query_email()
         .await
-        .context("Email/query a échoué")?;
+        .map_err(|_| JmapError::Protocol {
+            operation: "Email/query",
+        })?;
     let ids = query_response.ids().to_vec();
     if ids.is_empty() {
         return Ok(Vec::new());
@@ -349,7 +444,9 @@ pub async fn search(client: &Client, query: &str) -> Result<Vec<EmailSummary>> {
     let mut response = request
         .send_get_email()
         .await
-        .context("Email/get (recherche) a échoué")?;
+        .map_err(|_| JmapError::Protocol {
+            operation: "Email/get (search)",
+        })?;
 
     Ok(response
         .take_list()
@@ -364,7 +461,7 @@ pub async fn search(client: &Client, query: &str) -> Result<Vec<EmailSummary>> {
             let attachments = attachments_of(&email);
             Some(EmailSummary {
                 id,
-                subject: email.subject().unwrap_or("(sans objet)").to_string(),
+                subject: email.subject().unwrap_or_default().to_string(),
                 from_name,
                 from_addr,
                 preview: email.preview().unwrap_or_default().to_string(),
@@ -392,10 +489,12 @@ pub async fn fetch_full_text(client: &Client, id: &str) -> Result<String> {
     let mut response = request
         .send_single::<EmailGetResponse>()
         .await
-        .context("Email/get (corps complet) a échoué")?;
+        .map_err(|_| JmapError::Protocol {
+            operation: "Email/get (full body)",
+        })?;
 
     let Some(email) = response.take_list().pop() else {
-        bail!("message introuvable (peut-être déjà supprimé)");
+        return Err(JmapError::MessageNotFound);
     };
 
     let mut text = String::new();
@@ -409,7 +508,9 @@ pub async fn fetch_full_text(client: &Client, id: &str) -> Result<String> {
         }
     }
     if text.trim().is_empty() {
-        text = email.preview().unwrap_or("(message vide)").to_string();
+        // Left empty on purpose: the placeholder for "nothing to show" is
+        // localized at the presentation layer (the bot), not here.
+        text = email.preview().unwrap_or_default().to_string();
     }
     Ok(text)
 }
@@ -418,7 +519,9 @@ async fn mailbox_with_role(client: &Client, role: Role) -> Result<Option<String>
     let response = client
         .mailbox_query(Some(mailbox::query::Filter::role(role)), None::<Vec<_>>)
         .await
-        .context("Mailbox/query a échoué")?;
+        .map_err(|_| JmapError::Protocol {
+            operation: "Mailbox/query",
+        })?;
     Ok(response.ids().first().cloned())
 }
 
@@ -426,7 +529,9 @@ pub async fn mark_read(client: &Client, id: &str) -> Result<()> {
     client
         .email_set_keyword(id, "$seen", true)
         .await
-        .context("échec du marquage comme lu")?;
+        .map_err(|_| JmapError::Protocol {
+            operation: "Email/set keyword",
+        })?;
     Ok(())
 }
 
@@ -436,8 +541,10 @@ pub async fn mailbox_ids_of(client: &Client, id: &str) -> Result<Vec<String>> {
     let email = client
         .email_get(id, Some([Property::MailboxIds]))
         .await
-        .context("Email/get (snapshot pour /undo) a échoué")?
-        .context("message introuvable (peut-être déjà supprimé)")?;
+        .map_err(|_| JmapError::Protocol {
+            operation: "Email/get (undo snapshot)",
+        })?
+        .ok_or(JmapError::MessageNotFound)?;
     Ok(email
         .mailbox_ids()
         .into_iter()
@@ -453,29 +560,35 @@ pub async fn restore_mailboxes(client: &Client, id: &str, mailbox_ids: Vec<Strin
     client
         .email_set_mailboxes(id, mailbox_ids)
         .await
-        .context("échec de la restauration")?;
+        .map_err(|_| JmapError::Protocol {
+            operation: "Email/set mailboxes (undo)",
+        })?;
     Ok(())
 }
 
 pub async fn archive(client: &Client, id: &str) -> Result<()> {
     let Some(archive_id) = mailbox_with_role(client, Role::Archive).await? else {
-        bail!("ce compte n'a pas de dossier Archive JMAP");
+        return Err(JmapError::NoArchiveMailbox);
     };
     client
         .email_set_mailboxes(id, [archive_id])
         .await
-        .context("échec de l'archivage")?;
+        .map_err(|_| JmapError::Protocol {
+            operation: "Email/set mailboxes (archive)",
+        })?;
     Ok(())
 }
 
 pub async fn junk(client: &Client, id: &str) -> Result<()> {
     let Some(junk_id) = mailbox_with_role(client, Role::Junk).await? else {
-        bail!("ce compte n'a pas de dossier Spam/Junk JMAP");
+        return Err(JmapError::NoJunkMailbox);
     };
     client
         .email_set_mailboxes(id, [junk_id])
         .await
-        .context("échec du marquage comme spam")?;
+        .map_err(|_| JmapError::Protocol {
+            operation: "Email/set mailboxes (junk)",
+        })?;
     Ok(())
 }
 
@@ -485,12 +598,14 @@ pub async fn junk(client: &Client, id: &str) -> Result<()> {
 /// destroy would make /undo meaningless for this action specifically.
 pub async fn delete(client: &Client, id: &str) -> Result<()> {
     let Some(trash_id) = mailbox_with_role(client, Role::Trash).await? else {
-        bail!("ce compte n'a pas de dossier Corbeille JMAP");
+        return Err(JmapError::NoTrashMailbox);
     };
     client
         .email_set_mailboxes(id, [trash_id])
         .await
-        .context("échec de la mise à la corbeille")?;
+        .map_err(|_| JmapError::Protocol {
+            operation: "Email/set mailboxes (trash)",
+        })?;
     Ok(())
 }
 
@@ -513,6 +628,100 @@ mod tests {
         assert!(err.to_string().contains("https://"));
     }
 
+    #[test]
+    fn jmap_errors_render_english_for_logs_and_localized_for_the_chat() {
+        let err = JmapError::NoArchiveMailbox;
+        // Log-facing Display stays English whichever language the chat uses.
+        assert_eq!(err.to_string(), "this account has no JMAP Archive folder");
+        assert_eq!(
+            err.localized("en"),
+            "this account has no JMAP Archive folder"
+        );
+        assert_eq!(
+            err.localized("fr"),
+            "ce compte n'a pas de dossier Archive JMAP"
+        );
+
+        // The network failure stays generic in both locales (no transport
+        // detail) while still being translated.
+        let unreachable = JmapError::Unreachable;
+        assert!(unreachable.localized("en").contains("unreachable"));
+        assert!(unreachable.localized("fr").contains("injoignable"));
+    }
+
+    #[test]
+    fn private_host_error_names_the_input_and_the_opt_in() {
+        let err = JmapError::PrivateHost {
+            host: "mail.internal".to_string(),
+            ip: "10.0.0.5".to_string(),
+        };
+        let fr = err.localized("fr");
+        // Actionable on purpose: it describes the user's own input, not a
+        // probe result, so host/ip and the escape hatch are worth showing.
+        assert!(fr.contains("mail.internal"));
+        assert!(fr.contains("10.0.0.5"));
+        assert!(fr.contains("ALLOW_PRIVATE_JMAP_HOSTS"));
+    }
+
+    #[test]
+    fn localized_error_recovers_the_typed_error_through_an_anyhow_wrapper() {
+        // The presentation path wraps `jmap::*` errors in `anyhow` (e.g.
+        // `state.client_for`); the localized rendering must still apply and
+        // stay generic - a transport leak must not reappear via the
+        // fallback `Display`.
+        let wrapped: anyhow::Error = JmapError::Unreachable.into();
+        assert_eq!(
+            localized_error(&wrapped, "fr"),
+            "serveur JMAP injoignable ou invalide (détail dans les logs serveur)"
+        );
+
+        // A non-`JmapError` anyhow error falls back to its English message.
+        let other = anyhow::anyhow!("store unavailable");
+        assert_eq!(localized_error(&other, "fr"), "store unavailable");
+    }
+
+    #[test]
+    fn every_jmap_error_variant_renders_in_english_and_french() {
+        // Covers the whole `Display`/`localized` match surface: every
+        // variant must have a stable English rendering (for logs) and a
+        // translated one for chat, with no raw catalog key leaking out.
+        let variants = [
+            JmapError::InsecureUrl,
+            JmapError::InvalidUrl,
+            JmapError::NoHost,
+            JmapError::PrivateHost {
+                host: "mail.internal".to_string(),
+                ip: "10.0.0.5".to_string(),
+            },
+            JmapError::Unreachable,
+            JmapError::Protocol {
+                operation: "Email/get",
+            },
+            JmapError::MessageNotFound,
+            JmapError::NoArchiveMailbox,
+            JmapError::NoJunkMailbox,
+            JmapError::NoTrashMailbox,
+        ];
+
+        for err in &variants {
+            assert!(
+                !err.to_string().is_empty(),
+                "no English Display for {err:?}"
+            );
+            let en = err.localized("en");
+            let fr = err.localized("fr");
+            assert!(
+                !en.is_empty() && !fr.is_empty(),
+                "empty rendering for {err:?}"
+            );
+            assert!(!en.starts_with("jmap."), "raw key leaked: {en}");
+            assert!(!fr.starts_with("jmap."), "raw key leaked: {fr}");
+            // The two locales are genuinely different catalog entries, never
+            // a silent English fallback.
+            assert_ne!(en, fr, "untranslated variant: {err:?}");
+        }
+    }
+
     #[tokio::test]
     async fn connect_rejects_loopback_host_by_default() {
         let err = connect("https://127.0.0.1", "tok", false)
@@ -530,7 +739,7 @@ mod tests {
             .await
             .err()
             .expect("link-local/metadata address must be rejected by default");
-        assert!(err.to_string().contains("non publique"));
+        assert!(err.to_string().contains("SSRF"));
     }
 
     #[tokio::test]
@@ -539,7 +748,7 @@ mod tests {
             .await
             .err()
             .expect("RFC1918 address must be rejected by default");
-        assert!(err.to_string().contains("non publique"));
+        assert!(err.to_string().contains("SSRF"));
     }
 
     #[tokio::test]
@@ -552,7 +761,7 @@ mod tests {
             .await
             .err()
             .expect("nothing listens on port 1, connection should still fail");
-        assert!(!err.to_string().contains("non publique"));
+        assert!(!err.to_string().contains("SSRF"));
     }
 
     /// The chat-facing error for a network-level connect failure must be
@@ -577,7 +786,7 @@ mod tests {
             .expect("nothing listens on port 1, connect must fail");
         let msg = err.to_string();
         assert!(
-            msg.contains("injoignable") && msg.contains("logs serveur"),
+            msg.contains("unreachable") && msg.contains("server logs"),
             "expected the fixed generic message, got: {msg}"
         );
         // Nothing that could fingerprint the host, port, URL or
@@ -595,7 +804,12 @@ mod tests {
         ] {
             assert!(!msg.contains(fragment), "error-oracle leak in: {msg}");
         }
-        let chain: Vec<String> = err.chain().map(|e| e.to_string()).collect();
+        let mut chain: Vec<String> = Vec::new();
+        let mut current: Option<&dyn std::error::Error> = Some(&err);
+        while let Some(e) = current {
+            chain.push(e.to_string());
+            current = std::error::Error::source(e);
+        }
         for fragment in ["Connection refused", "Transport error", "os error"] {
             assert!(
                 !chain.iter().any(|c| c.contains(fragment)),
@@ -842,5 +1056,456 @@ mod tests {
 
         client.set_default_account_id("shared1");
         assert_eq!(client.default_account_id(), "shared1");
+    }
+
+    #[test]
+    fn is_disallowed_v4_flags_every_internal_range_and_only_those() {
+        // Each of these is a policy refusal the SSRF guard must make:
+        // RFC1918 private, loopback, link-local (incl. the
+        // 169.254.169.254 metadata endpoint), unspecified, multicast,
+        // broadcast, documentation, and RFC6598 CGNAT space.
+        for addr in [
+            "10.0.0.1",
+            "172.16.0.1",
+            "192.168.1.1",
+            "127.0.0.1",
+            "169.254.169.254",
+            "0.0.0.0",
+            "224.0.0.1",
+            "255.255.255.255",
+            "192.0.2.1",
+            "100.64.0.1",
+            "100.127.255.254",
+        ] {
+            assert!(
+                is_disallowed_v4(addr.parse().unwrap()),
+                "{addr} must be refused"
+            );
+        }
+        // ...and these are ordinary public addresses, allowed. The two
+        // 100.x rows straddle the CGNAT range on purpose.
+        for addr in [
+            "8.8.8.8",
+            "1.1.1.1",
+            "93.184.216.34",
+            "100.63.255.255",
+            "100.128.0.1",
+        ] {
+            assert!(
+                !is_disallowed_v4(addr.parse().unwrap()),
+                "{addr} must be allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn is_disallowed_host_flags_every_internal_ipv6_range() {
+        for addr in [
+            "::1",              // loopback
+            "::",               // unspecified
+            "ff02::1",          // multicast
+            "fd00::1",          // unique local fc00::/7
+            "fe80::1",          // link-local unicast fe80::/10
+            "::ffff:10.0.0.1",  // IPv4-mapped private
+            "::ffff:127.0.0.1", // IPv4-mapped loopback
+        ] {
+            let ip: IpAddr = addr.parse().unwrap();
+            assert!(is_disallowed_host(ip), "{addr} must be refused");
+        }
+        assert!(!is_disallowed_host("2606:4700:4700::1111".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn assert_public_host_accepts_a_literal_public_address() {
+        // A numeric host resolves without any DNS round-trip, so this
+        // reaches the "resolved, and nothing disallowed" branch and
+        // succeeds - a guard against it ever returning the wrong verdict
+        // for a genuinely public, already-resolved host.
+        assert_public_host("8.8.8.8", "https://8.8.8.8")
+            .await
+            .expect("a public literal address must pass the guard");
+    }
+
+    #[tokio::test]
+    async fn assert_public_host_refuses_a_literal_private_address() {
+        let err = assert_public_host("127.0.0.1", "https://127.0.0.1")
+            .await
+            .expect_err("a loopback literal must be refused");
+        assert!(matches!(err, JmapError::PrivateHost { .. }), "got {err:?}");
+    }
+
+    /// Answers a JMAP API POST with a canned response per method name,
+    /// echoing the request's call id back as the protocol requires.
+    /// jmap-client sends one method per POST here, so keying on the method
+    /// name (rather than on call ordering) is enough.
+    struct JmapApi {
+        by_method: serde_json::Map<String, serde_json::Value>,
+    }
+
+    impl wiremock::Respond for JmapApi {
+        fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+            let body: serde_json::Value =
+                serde_json::from_slice(&request.body).unwrap_or_else(|_| json!({}));
+            let call = &body["methodCalls"][0];
+            let method = call[0].as_str().unwrap_or_default();
+            let call_id = call[2].clone();
+            let args = self
+                .by_method
+                .get(method)
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            // jmap-client's API envelope requires `sessionState`
+            // (RFC 8620 §3.4) alongside `methodResponses`.
+            ResponseTemplate::new(200).set_body_json(json!({
+                "methodResponses": [[method, args, call_id]],
+                "sessionState": "session-state-1"
+            }))
+        }
+    }
+
+    /// A client connected to `server`, whose API calls are answered from
+    /// `responses` (a JSON object mapping method name to response
+    /// arguments). Bypasses this module's https-only guard on purpose,
+    /// same as the other mock-server tests.
+    async fn mock_client(server: &MockServer, responses: serde_json::Value) -> Client {
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jmap"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(session_body(&server.uri())))
+            .mount(server)
+            .await;
+
+        let by_method = responses
+            .as_object()
+            .expect("responses must be a JSON object")
+            .clone();
+        Mock::given(method("POST"))
+            .and(path("/jmap/api"))
+            .respond_with(JmapApi { by_method })
+            .mount(server)
+            .await;
+
+        Client::new()
+            .credentials(Credentials::bearer("tok"))
+            .connect(&server.uri())
+            .await
+            .expect("mock session should connect")
+    }
+
+    /// The arguments of the last `Email/set` call the server received.
+    async fn last_email_set(server: &MockServer) -> serde_json::Value {
+        server
+            .received_requests()
+            .await
+            .expect("requests should be recorded")
+            .into_iter()
+            .filter_map(|r| serde_json::from_slice::<serde_json::Value>(&r.body).ok())
+            .filter(|b| b["methodCalls"][0][0] == "Email/set")
+            .next_back()
+            .expect("an Email/set call should have been sent")["methodCalls"][0][1]
+            .clone()
+    }
+
+    fn email_summary_json() -> serde_json::Value {
+        json!({
+            "id": "m1",
+            "subject": "Invoice",
+            "preview": "Please find attached...",
+            "receivedAt": "2024-01-02T03:04:05Z",
+            "from": [{"name": "Alice", "email": "alice@example.org"}],
+            "attachments": [
+                {"name": "invoice.pdf", "size": 12345},
+                {"name": "notes.txt", "size": 67}
+            ]
+        })
+    }
+
+    #[tokio::test]
+    async fn search_returns_summaries_with_their_attachments() {
+        let server = MockServer::start().await;
+        let client = mock_client(
+            &server,
+            json!({
+                "Email/query": {
+                    "accountId": "acc1", "queryState": "q1",
+                    "canCalculateChanges": false, "position": 0,
+                    "ids": ["m1"], "total": 1
+                },
+                "Email/get": {
+                    "accountId": "acc1", "state": "s", "notFound": [],
+                    "list": [email_summary_json()]
+                }
+            }),
+        )
+        .await;
+
+        let results = search(&client, "invoice").await.unwrap();
+        assert_eq!(results.len(), 1, "the query hit must come back");
+        let summary = &results[0];
+        assert_eq!(summary.id, "m1");
+        assert_eq!(summary.subject, "Invoice");
+        assert_eq!(summary.from_name.as_deref(), Some("Alice"));
+        assert_eq!(summary.from_addr.as_deref(), Some("alice@example.org"));
+        assert_eq!(
+            summary.attachments,
+            vec![
+                ("invoice.pdf".to_string(), 12345),
+                ("notes.txt".to_string(), 67)
+            ],
+            "attachment names and sizes must survive the mapping"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_changed_emails_returns_summaries_and_the_new_cursor() {
+        let server = MockServer::start().await;
+        let client = mock_client(
+            &server,
+            json!({
+                "Email/changes": {
+                    "accountId": "acc1", "oldState": "s1", "newState": "s2",
+                    "hasMoreChanges": false, "created": ["m1"],
+                    "updated": [], "destroyed": []
+                },
+                "Email/get": {
+                    "accountId": "acc1", "state": "s2", "notFound": [],
+                    "list": [email_summary_json()]
+                }
+            }),
+        )
+        .await;
+
+        let (summaries, new_state) = fetch_changed_emails(&client, "s1").await.unwrap();
+        assert_eq!(new_state, "s2", "the new cursor must be persisted as-is");
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].id, "m1");
+        assert_eq!(summaries[0].subject, "Invoice");
+        assert_eq!(summaries[0].attachments.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn fetch_full_text_reads_the_body_then_falls_back_to_the_preview() {
+        let server = MockServer::start().await;
+        let client = mock_client(
+            &server,
+            json!({
+                "Email/get": {
+                    "accountId": "acc1", "state": "s", "notFound": [],
+                    "list": [{
+                        "id": "m1",
+                        "preview": "snippet only",
+                        "textBody": [{"partId": "1"}],
+                        "bodyValues": {"1": {"value": "Hello, world."}}
+                    }]
+                }
+            }),
+        )
+        .await;
+        assert_eq!(
+            fetch_full_text(&client, "m1").await.unwrap(),
+            "Hello, world."
+        );
+
+        // No body parts at all: the preview is the fallback.
+        let preview_server = MockServer::start().await;
+        let preview_client = mock_client(
+            &preview_server,
+            json!({
+                "Email/get": {
+                    "accountId": "acc1", "state": "s", "notFound": [],
+                    "list": [{"id": "m1", "preview": "snippet only"}]
+                }
+            }),
+        )
+        .await;
+        assert_eq!(
+            fetch_full_text(&preview_client, "m1").await.unwrap(),
+            "snippet only"
+        );
+
+        // An empty list means the message is gone.
+        let empty_server = MockServer::start().await;
+        let empty_client = mock_client(
+            &empty_server,
+            json!({
+                "Email/get": {
+                    "accountId": "acc1", "state": "s", "notFound": [], "list": []
+                }
+            }),
+        )
+        .await;
+        assert!(matches!(
+            fetch_full_text(&empty_client, "m1").await.unwrap_err(),
+            JmapError::MessageNotFound
+        ));
+    }
+
+    #[tokio::test]
+    async fn archive_moves_the_message_to_the_archive_mailbox() {
+        let server = MockServer::start().await;
+        let client = mock_client(
+            &server,
+            json!({
+                "Mailbox/query": {
+                    "accountId": "acc1", "queryState": "q1",
+                    "canCalculateChanges": false, "position": 0,
+                    "ids": ["arch"], "total": 1
+                },
+                "Email/set": {
+                    "accountId": "acc1", "oldState": "s", "newState": "s2",
+                    "updated": {"m1": null}
+                }
+            }),
+        )
+        .await;
+
+        archive(&client, "m1").await.unwrap();
+        let set = last_email_set(&server).await;
+        assert_eq!(
+            set["update"]["m1"]["mailboxIds"],
+            json!({"arch": true}),
+            "the message must land in the resolved Archive mailbox"
+        );
+    }
+
+    #[tokio::test]
+    async fn junk_and_delete_resolve_their_own_role_mailboxes() {
+        for (role_id, verb) in [("junkbox", "junk"), ("trashbox", "delete")] {
+            let server = MockServer::start().await;
+            let client = mock_client(
+                &server,
+                json!({
+                    "Mailbox/query": {
+                        "accountId": "acc1", "queryState": "q1",
+                        "canCalculateChanges": false, "position": 0,
+                        "ids": [role_id], "total": 1
+                    },
+                    "Email/set": {
+                        "accountId": "acc1", "oldState": "s", "newState": "s2",
+                        "updated": {"m1": null}
+                    }
+                }),
+            )
+            .await;
+
+            match verb {
+                "junk" => junk(&client, "m1").await.unwrap(),
+                _ => delete(&client, "m1").await.unwrap(),
+            }
+            let set = last_email_set(&server).await;
+            assert_eq!(
+                set["update"]["m1"]["mailboxIds"],
+                json!({ role_id: true }),
+                "{verb} must use its resolved mailbox"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_missing_role_mailbox_is_reported_rather_than_silently_ignored() {
+        // No Mailbox/query hit for the role: the verb must surface its
+        // typed "no such folder" error instead of appearing to succeed.
+        for responses in [
+            ("Mailbox/query", Role::Archive, JmapError::NoArchiveMailbox),
+            ("Mailbox/query", Role::Junk, JmapError::NoJunkMailbox),
+            ("Mailbox/query", Role::Trash, JmapError::NoTrashMailbox),
+        ] {
+            let (_method, role, expected) = responses;
+            let server = MockServer::start().await;
+            let client = mock_client(
+                &server,
+                json!({
+                    "Mailbox/query": {
+                        "accountId": "acc1", "queryState": "q1",
+                        "canCalculateChanges": false, "position": 0,
+                        "ids": [], "total": 0
+                    }
+                }),
+            )
+            .await;
+
+            let err = match role {
+                Role::Archive => archive(&client, "m1").await.unwrap_err(),
+                Role::Junk => junk(&client, "m1").await.unwrap_err(),
+                _ => delete(&client, "m1").await.unwrap_err(),
+            };
+            assert_eq!(
+                std::mem::discriminant(&err),
+                std::mem::discriminant(&expected),
+                "wrong error for {role:?}: {err:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mark_read_sets_the_seen_keyword() {
+        let server = MockServer::start().await;
+        let client = mock_client(
+            &server,
+            json!({
+                "Email/set": {
+                    "accountId": "acc1", "oldState": "s", "newState": "s2",
+                    "updated": {"m1": null}
+                }
+            }),
+        )
+        .await;
+
+        mark_read(&client, "m1").await.unwrap();
+        let update = serde_json::to_string(&last_email_set(&server).await["update"]).unwrap();
+        assert!(
+            update.contains("$seen"),
+            "the seen keyword must be set: {update}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mailbox_ids_of_snapshots_every_mailbox_the_message_is_in() {
+        let server = MockServer::start().await;
+        let client = mock_client(
+            &server,
+            json!({
+                "Email/get": {
+                    "accountId": "acc1", "state": "s", "notFound": [],
+                    "list": [{
+                        "id": "m1",
+                        "mailboxIds": {"inbox": true, "archive": true, "hidden": false}
+                    }]
+                }
+            }),
+        )
+        .await;
+
+        let mut ids = mailbox_ids_of(&client, "m1").await.unwrap();
+        ids.sort();
+        assert_eq!(ids, vec!["archive".to_string(), "inbox".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn restore_mailboxes_puts_the_snapshot_back_exactly() {
+        let server = MockServer::start().await;
+        let client = mock_client(
+            &server,
+            json!({
+                "Email/set": {
+                    "accountId": "acc1", "oldState": "s", "newState": "s2",
+                    "updated": {"m1": null}
+                }
+            }),
+        )
+        .await;
+
+        restore_mailboxes(
+            &client,
+            "m1",
+            vec!["inbox".to_string(), "archive".to_string()],
+        )
+        .await
+        .unwrap();
+        let set = last_email_set(&server).await;
+        assert_eq!(
+            set["update"]["m1"]["mailboxIds"],
+            json!({"inbox": true, "archive": true}),
+            "undo must restore the exact mailbox set"
+        );
     }
 }

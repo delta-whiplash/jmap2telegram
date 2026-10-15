@@ -31,6 +31,13 @@ pub struct Config {
     /// (the distroless runtime image has none), so this works the same
     /// regardless of deployment target.
     pub timezone: Tz,
+    /// Language used when neither a stored preference nor the Telegram
+    /// `language_code` resolves to a shipped locale. Backed by
+    /// `BOT_LANGUAGE`; must be one of the locales in `locales/` (see
+    /// `i18n::canonical`), and an unknown value is rejected at startup
+    /// rather than silently falling back, so a typo in a deployment
+    /// manifest is loud. Defaults to `en`.
+    pub default_language: String,
 }
 
 impl Config {
@@ -41,6 +48,7 @@ impl Config {
             std::env::var("DATA_DIR").ok(),
             std::env::var("ALLOW_PRIVATE_JMAP_HOSTS").ok(),
             std::env::var("TIMEZONE").ok(),
+            std::env::var("BOT_LANGUAGE").ok(),
         )
     }
 
@@ -54,6 +62,7 @@ impl Config {
         data_dir: Option<String>,
         allow_private_jmap_hosts: Option<String>,
         timezone: Option<String>,
+        default_language: Option<String>,
     ) -> Result<Self> {
         let telegram_token = telegram_token.context("TELEGRAM_BOT_TOKEN is not set")?;
         if telegram_token.trim().is_empty() {
@@ -88,12 +97,22 @@ impl Config {
 
         let timezone = parse_timezone(timezone.as_deref())?;
 
+        let default_language = match default_language.as_deref() {
+            None | Some("") => "en".to_string(),
+            Some(name) => crate::i18n::canonical(name)
+                .with_context(|| {
+                    format!("unsupported BOT_LANGUAGE '{name}' (expected one of: en, fr)")
+                })?
+                .to_string(),
+        };
+
         Ok(Self {
             telegram_token,
             authorized_chat_ids,
             data_dir,
             allow_private_jmap_hosts,
             timezone,
+            default_language,
         })
     }
 }
@@ -125,12 +144,13 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
     }
 
     #[test]
     fn rejects_missing_token() {
-        let err = Config::parse(None, Some("123".to_string()), None, None, None).unwrap_err();
+        let err = Config::parse(None, Some("123".to_string()), None, None, None, None).unwrap_err();
         assert!(err.to_string().contains("TELEGRAM_BOT_TOKEN"));
     }
 
@@ -142,7 +162,7 @@ mod tests {
 
     #[test]
     fn rejects_missing_chat_ids() {
-        let err = Config::parse(Some("tok".to_string()), None, None, None, None).unwrap_err();
+        let err = Config::parse(Some("tok".to_string()), None, None, None, None, None).unwrap_err();
         assert!(err.to_string().contains("AUTHORIZED_CHAT_IDS"));
     }
 
@@ -181,6 +201,7 @@ mod tests {
             Some("/custom".to_string()),
             None,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(cfg.data_dir, PathBuf::from("/custom"));
@@ -200,6 +221,7 @@ mod tests {
             None,
             Some("true".to_string()),
             None,
+            None,
         )
         .unwrap();
         assert!(cfg.allow_private_jmap_hosts);
@@ -212,6 +234,7 @@ mod tests {
             Some("1".to_string()),
             None,
             Some("maybe".to_string()),
+            None,
             None,
         )
         .unwrap();
@@ -232,6 +255,7 @@ mod tests {
             None,
             None,
             Some("Europe/Paris".to_string()),
+            None,
         )
         .unwrap();
         assert_eq!(cfg.timezone, Tz::Europe__Paris);
@@ -245,9 +269,44 @@ mod tests {
             None,
             None,
             Some("Not/AZone".to_string()),
+            None,
         )
         .unwrap_err();
         assert!(err.to_string().contains("TIMEZONE"));
+    }
+
+    #[test]
+    fn language_defaults_to_english() {
+        let cfg = minimal("tok", "1").unwrap();
+        assert_eq!(cfg.default_language, "en");
+    }
+
+    #[test]
+    fn language_accepts_a_shipped_locale_case_insensitively() {
+        let cfg = Config::parse(
+            Some("tok".to_string()),
+            Some("1".to_string()),
+            None,
+            None,
+            None,
+            Some("FR".to_string()),
+        )
+        .unwrap();
+        assert_eq!(cfg.default_language, "fr");
+    }
+
+    #[test]
+    fn language_rejects_an_unsupported_locale() {
+        let err = Config::parse(
+            Some("tok".to_string()),
+            Some("1".to_string()),
+            None,
+            None,
+            None,
+            Some("de".to_string()),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("BOT_LANGUAGE"));
     }
 
     #[test]

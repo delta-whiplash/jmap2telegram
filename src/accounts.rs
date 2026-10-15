@@ -339,23 +339,24 @@ async fn adopt_target(
 /// kind.
 async fn connect_target(config: &Config, target: &ResumeTarget) -> anyhow::Result<JmapClient> {
     match &target.target {
-        WatchTarget::Primary | WatchTarget::Extra { .. } => {
-            jmap::connect(
-                &target.server_url,
-                &target.token,
-                config.allow_private_jmap_hosts,
-            )
-            .await
-        }
-        WatchTarget::Shared { account_id, .. } => {
-            jmap::connect_shared(
-                &target.server_url,
-                &target.token,
-                config.allow_private_jmap_hosts,
-                account_id,
-            )
-            .await
-        }
+        // `jmap::*` returns the typed `JmapError`; converting to `anyhow`
+        // here preserves the concrete type in the chain, so presentation
+        // code can still downcast it back (see `jmap::localized_error`).
+        WatchTarget::Primary | WatchTarget::Extra { .. } => jmap::connect(
+            &target.server_url,
+            &target.token,
+            config.allow_private_jmap_hosts,
+        )
+        .await
+        .map_err(anyhow::Error::from),
+        WatchTarget::Shared { account_id, .. } => jmap::connect_shared(
+            &target.server_url,
+            &target.token,
+            config.allow_private_jmap_hosts,
+            account_id,
+        )
+        .await
+        .map_err(anyhow::Error::from),
     }
 }
 
@@ -420,6 +421,7 @@ mod tests {
             // the way of what's being observed.
             allow_private_jmap_hosts: true,
             timezone: chrono_tz::Tz::UTC,
+            default_language: "en".to_string(),
         });
         let store = Arc::new(crate::store::Store::open(dir.path()).unwrap());
         store.set(42, account).unwrap();
@@ -436,6 +438,7 @@ mod tests {
             token: "tok".to_string(),
             email: "a@b.c".to_string(),
             last_state: Some("primary-state".to_string()),
+            language: None,
             shared_accounts: HashMap::from([(
                 "acc7".to_string(),
                 crate::store::SharedAccount {
@@ -874,5 +877,53 @@ mod tests {
             ],
             "{snapshot:?}"
         );
+    }
+
+    /// The resume path's connect step must keep the concrete `JmapError`
+    /// inside the `anyhow` wrapper, so presentation code can still
+    /// downcast it back and render a localized message (see
+    /// `jmap::localized_error`). Exercises all three target kinds.
+    #[tokio::test]
+    async fn connect_target_preserves_the_typed_jmap_error_through_anyhow() {
+        let (state, _dir) = state_with_account(unreachable_account()).await;
+        let config = Arc::clone(&state.config);
+
+        for target in [
+            ResumeTarget {
+                target: WatchTarget::Primary,
+                server_url: "https://127.0.0.1:9".to_string(),
+                token: "tok".to_string(),
+            },
+            ResumeTarget {
+                target: WatchTarget::Extra {
+                    slot_id: "slot1".to_string(),
+                    label: "second@other.example".to_string(),
+                },
+                server_url: "https://127.0.0.1:9".to_string(),
+                token: "tok".to_string(),
+            },
+            ResumeTarget {
+                target: WatchTarget::Shared {
+                    account_id: "acc7".to_string(),
+                    label: "shared@b.c".to_string(),
+                },
+                server_url: "https://127.0.0.1:9".to_string(),
+                token: "tok".to_string(),
+            },
+        ] {
+            let err = connect_target(&config, &target)
+                .await
+                .err()
+                .expect("nothing listens on 127.0.0.1:9");
+            assert!(
+                err.downcast_ref::<crate::jmap::JmapError>().is_some(),
+                "the concrete JmapError must survive the anyhow wrap: {err:?}"
+            );
+            // The downcast is what makes the chat-facing text localized.
+            assert!(
+                crate::jmap::localized_error(&err, "fr").contains("injoignable"),
+                "expected the localized generic message, got: {err:?}"
+            );
+        }
     }
 }

@@ -53,6 +53,8 @@ pub struct AppState {
     pub store: Arc<Store>,
     /// Live watcher registry backing /readyz and /metrics (see health.rs).
     pub health: Arc<crate::health::Health>,
+    /// Application counters/gauges rendered by /metrics (see health.rs).
+    pub metrics: Arc<crate::health::Metrics>,
     /// Live JMAP clients for each chat's own mailbox, keyed by chat id,
     /// shared between the watcher tasks and the inline-button handlers so
     /// an action doesn't need a fresh session negotiation every time.
@@ -83,6 +85,7 @@ impl AppState {
             config,
             store,
             health: Arc::new(crate::health::Health::default()),
+            metrics: Arc::new(crate::health::Metrics::new()),
             clients: Arc::new(RwLock::new(HashMap::new())),
             watchers: Arc::new(RwLock::new(HashMap::new())),
             shared_clients: Arc::new(RwLock::new(HashMap::new())),
@@ -91,6 +94,33 @@ impl AppState {
             extra_watchers: Arc::new(RwLock::new(HashMap::new())),
             pending_undo: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Recomputes the `pending_undos` gauge from the source of truth.
+    /// Called after every mutation of `pending_undo` so the gauge can never
+    /// drift from the map it reports on.
+    pub async fn refresh_undo_gauge(&self) {
+        self.metrics
+            .set_pending_undos(self.pending_undo.read().await.len() as u64);
+    }
+
+    /// Recomputes the `accounts` gauge from the store (the number of chats
+    /// with a connected JMAP account). Called after every login/logout.
+    pub fn refresh_accounts_gauge(&self) {
+        self.metrics.set_accounts(self.store.count() as u64);
+    }
+
+    /// The locale to render this chat's user-facing text in: the stored
+    /// preference (`/lang`, or the `language_code` seeded at login), then
+    /// the current message's Telegram `language_code`, then the operator's
+    /// `BOT_LANGUAGE` (see [`crate::i18n::resolve`]).
+    pub fn language_for(&self, chat_id: i64, telegram_language_code: Option<&str>) -> &'static str {
+        let stored = self.store.get(chat_id).and_then(|account| account.language);
+        crate::i18n::resolve(
+            stored.as_deref(),
+            telegram_language_code,
+            &self.config.default_language,
+        )
     }
 
     /// Shared cache-lookup step for every `client_for*` method below: all
@@ -215,6 +245,7 @@ impl AppState {
             handle.abort();
         }
         self.pending_undo.write().await.remove(&chat_id);
+        self.refresh_undo_gauge().await;
 
         // `abort()` cancels a watcher task at its next await point, so it
         // never gets to run its own registry cleanup (the deregister on
@@ -305,6 +336,7 @@ mod tests {
             data_dir: dir.path().to_path_buf(),
             allow_private_jmap_hosts: true,
             timezone: chrono_tz::Tz::UTC,
+            default_language: "en".to_string(),
         });
         let store = Arc::new(Store::open(dir.path()).unwrap());
         (AppState::new(config, store), dir)

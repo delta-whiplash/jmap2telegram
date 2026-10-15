@@ -96,6 +96,10 @@ extraEnv: []
 # always overrides logLevel below:
 # - name: RUST_LOG
 #   value: jmap2telegram=debug,teloxide=info
+# To move the health/metrics listener off 8080 (then update the probes and
+# the metrics Service port to match):
+# - name: HEALTH_ADDR
+#   value: 127.0.0.1:9090
 
 # Simple level knob: trace, debug, info, warn, or error.
 logLevel: info
@@ -103,3 +107,8 @@ logLevel: info
 # IANA zone name (e.g. "Europe/Paris"), used to render notification and
 # log timestamps. Defaults to UTC.
 timezone: UTC
+
+# Default language ("en" or "fr") for chats that haven't chosen one with
+# /lang and whose Telegram client doesn't advertise a shipped
+# language_code. An unsupported value refuses to start.
+language: en

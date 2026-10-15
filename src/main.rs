@@ -1,8 +1,19 @@
+// `t!` is used across modules (bot, watcher, format, jmap); this
+// `#[macro_use] extern crate` brings it into textual scope crate-wide, before
+// any `mod` declaration below refers to it.
+#[macro_use]
+extern crate rust_i18n;
+
+// Embeds `locales/*.toml` into the binary at compile time. "en" is the
+// fallback for any key missing from another locale.
+rust_i18n::i18n!("locales", fallback = "en");
+
 mod accounts;
 mod bot;
 mod config;
 mod format;
 mod health;
+mod i18n;
 mod jmap;
 mod logging;
 mod state;
@@ -46,16 +57,30 @@ async fn main() -> anyhow::Result<()> {
     // Bound here rather than in the spawned task so a bind failure is a
     // loud startup error instead of a silently absent probe endpoint.
     let probe_listener = health::bind().await?;
-    tokio::spawn(health::serve(probe_listener, state.health.clone()));
+    tokio::spawn(health::serve(
+        probe_listener,
+        state.health.clone(),
+        state.metrics.clone(),
+    ));
 
     // Registers the command list with Telegram itself, so the client's "/"
     // menu autocompletes every command with its description instead of the
-    // user having to remember them or run /help. Best-effort: a failure
-    // here (e.g. a transient Telegram API hiccup) shouldn't block startup.
-    {
-        use teloxide::utils::command::BotCommands;
-        if let Err(e) = bot.set_my_commands(bot::Command::bot_commands()).await {
-            tracing::warn!(error = %e, "failed to register bot commands with Telegram");
+    // user having to remember them or run /help. Registered once per shipped
+    // locale: Telegram serves the list matching each client's own language,
+    // so a French user sees French descriptions with no per-chat work.
+    // Best-effort throughout: a failure here (e.g. a transient Telegram API
+    // hiccup) shouldn't block startup.
+    for lang in ["en", "fr"] {
+        if let Err(e) = bot
+            .set_my_commands(i18n::bot_commands(lang))
+            .language_code(lang)
+            .await
+        {
+            tracing::warn!(
+                error = %e,
+                language = lang,
+                "failed to register bot commands with Telegram"
+            );
         }
     }
 
@@ -72,7 +97,10 @@ async fn main() -> anyhow::Result<()> {
     for (chat_id, account) in store.all() {
         accounts::spawn_boot_resume(&bot, &state, chat_id, &account);
     }
-    tracing::info!("jmap2telegram starting");
+    // Seed the `accounts` gauge to what boot just resumed; the login/logout
+    // paths keep it current from here on.
+    state.refresh_accounts_gauge();
+    tracing::info!("jmap2telegram started");
 
     Dispatcher::builder(bot, bot::schema())
         .dependencies(dptree::deps![state])

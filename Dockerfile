@@ -35,6 +35,10 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     && rm -rf src
 
 COPY src ./src
+# The `i18n!` macro in src/main.rs embeds these at compile time, resolved
+# relative to the crate root - so they must sit next to Cargo.toml in the
+# builder, not just in the final image.
+COPY locales ./locales
 # The compiled binary must be copied out of the cache-mounted target/
 # before the mount is torn down at the end of this RUN: anything left
 # inside a cache mount does not become part of the image layer.

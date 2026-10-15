@@ -25,6 +25,14 @@ pub struct Account {
     pub token: String,
     pub email: String,
     pub last_state: Option<String>,
+    /// The chat's preferred language (`en`/`fr`), set by `/lang` or seeded
+    /// from Telegram's `language_code` at login. `None` means "never
+    /// chosen": language resolution then falls through to the current
+    /// message's `language_code`, then `BOT_LANGUAGE`. `#[serde(default)]`
+    /// keeps this backward compatible with state files written before this
+    /// field existed.
+    #[serde(default)]
+    pub language: Option<String>,
     /// JMAP delegated/shared accounts (e.g. a shared team mailbox) the user
     /// has opted into notifications for, keyed by JMAP account id.
     /// `#[serde(default)]` keeps this backward compatible with state files
@@ -151,6 +159,12 @@ impl Store {
             .collect()
     }
 
+    /// Number of chats with a stored account - backs the `accounts` gauge
+    /// without cloning every account (unlike [`all`](Store::all)).
+    pub fn count(&self) -> usize {
+        self.data.read().unwrap().accounts.len()
+    }
+
     pub fn set(&self, chat_id: i64, account: Account) -> Result<()> {
         {
             let mut data = self.data.write().unwrap();
@@ -168,6 +182,21 @@ impl Store {
             }
         }
         self.persist()
+    }
+
+    /// Records the chat's language preference (`/lang`). No-ops - returning
+    /// `false` - for a chat with no account, since the preference lives on
+    /// the account record and the caller reports that to the user.
+    pub fn set_language(&self, chat_id: i64, language: &str) -> Result<bool> {
+        {
+            let mut data = self.data.write().unwrap();
+            match data.accounts.get_mut(&chat_id) {
+                Some(acc) => acc.language = Some(language.to_string()),
+                None => return Ok(false),
+            }
+        }
+        self.persist()?;
+        Ok(true)
     }
 
     /// Opts a chat into notifications for a shared JMAP account, or updates
@@ -511,6 +540,7 @@ mod tests {
             token: "s3cr3t-token".to_string(),
             email: email.to_string(),
             last_state: None,
+            language: None,
             shared_accounts: HashMap::new(),
             extra_accounts: HashMap::new(),
             muted: Vec::new(),
@@ -770,6 +800,29 @@ mod tests {
         assert!(acc.shared_accounts.is_empty());
         assert!(acc.muted.is_empty());
         assert!(acc.extra_accounts.is_empty());
+        assert!(acc.language.is_none());
+    }
+
+    #[test]
+    fn set_language_records_the_preference_and_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.set(1, account("a@b.c")).unwrap();
+
+        assert!(store.set_language(1, "fr").unwrap());
+        assert_eq!(store.get(1).unwrap().language.as_deref(), Some("fr"));
+
+        // Survives a reopen, like every other account field.
+        drop(store);
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(store.get(1).unwrap().language.as_deref(), Some("fr"));
+    }
+
+    #[test]
+    fn set_language_is_a_noop_without_an_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        assert!(!store.set_language(999, "fr").unwrap());
     }
 
     #[test]

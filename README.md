@@ -46,7 +46,7 @@ Stalwart was designed around, not an add-on. So instead of choosing
 between "the bot I like" and "the privacy I want", I built the bot I
 wanted: one binary, my server, my data, the same GmailBot-style chat
 experience. Stalwart users get the deepest integration - delegated/shared
-mailboxes (`/partages`), instant push via JMAP `EventSource`, and
+mailboxes (`/shared`), instant push via JMAP `EventSource`, and
 autodiscovery with zero manual endpoints - see
 [Running with Stalwart](#running-with-stalwart).
 
@@ -64,7 +64,9 @@ works the same way; the privacy pitch just changes from *your* server to
 - [Commands](#commands)
 - [Shared mailboxes](#shared-mailboxes)
 - [Extra personal accounts](#extra-personal-accounts)
+- [Languages](#languages)
 - [Environment variables](#environment-variables)
+- [Observability](#observability)
 - [Kubernetes (Helm, OCI)](#kubernetes-helm-oci)
 - [Building from source](#building-from-source)
 - [Releases](#releases)
@@ -117,7 +119,7 @@ What you get on Stalwart specifically:
 - **Instant push.** New mail arrives via JMAP `EventSource` (RFC 8620
   §7.3) - no polling delay, exactly the immediacy GmailBot users expect.
 - **Delegated/shared mailboxes.** Stalwart can grant a token access to
-  other mailboxes (team inboxes, shared addresses). `/partages` lists
+  other mailboxes (team inboxes, shared addresses). `/shared` lists
   them live and toggles notifications per mailbox - see
   [Shared mailboxes](#shared-mailboxes).
 - **Same server, same data.** Run the bot next to Stalwart (Docker
@@ -235,32 +237,38 @@ ways out:
 | `/start`       | Onboarding, or current status if already connected                     |
 | `/login`       | `/login <server_url> <token>` - connect a JMAP account                 |
 | `/status`      | Show the connected account and watcher health                          |
-| `/partages`    | Toggle notifications for shared/delegated JMAP accounts                |
-| `/comptes`     | `/comptes <server_url> <token>` - connect an extra, independent JMAP account; no argument lists connected accounts |
+| `/shared`      | Toggle notifications for shared/delegated JMAP accounts (alias `/partages`) |
+| `/accounts`    | `/accounts <server_url> <token>` - connect an extra, independent JMAP account; no argument lists connected accounts (alias `/comptes`) |
 | `/mute`        | `/mute <term>` - filter future notifications by sender/keyword; no argument lists active filters |
 | `/unmute`      | Remove a filter added with `/mute`                                     |
-| `/rechercher`  | `/rechercher <text>` - full-text search of the connected mailbox        |
+| `/search`      | `/search <text>` - full-text search of the connected mailbox (alias `/rechercher`) |
+| `/lang`        | `/lang <en\|fr>` - choose the bot's language (alias `/langue`)         |
 | `/logout`      | Erase stored credentials immediately (GDPR right to erasure)           |
 | `/help`        | List commands                                                          |
 
-The command list is also registered with Telegram itself, so it
-autocompletes from the client's own "/" menu.
+Command names are English throughout (they're also the ids the client's
+autocomplete keys off); the original French names still work as hidden
+aliases, so nothing typed before the rename breaks. The command list is
+registered with Telegram itself in each shipped language, so the "/" menu
+autocompletes in French or English to match the app.
 
-Each new-mail notification comes with inline buttons: **Lire tout** (full
-body), **Lu** (mark read, shown in place afterward as a checkmark),
-**Archiver**, **Spam**, **Supprimer** (moves to Trash, not a permanent
-delete). The sender is a tappable `mailto:` link, the preview renders as
-a native quoted block, and any attachment is named with its size. Every
-triage action (Archiver/Spam/Supprimer) leaves a 30-second **↩️ Annuler**
-button that restores the message to exactly the mailboxes it was in
-before - an in-memory, non-persisted safety net for an accidental tap,
-not a second trash bin.
+Each new-mail notification carries a deliberately small action menu:
+`[ 📥 Archive ] [ 🗑 Delete ] [ ⋯ More ]` as it arrives, expanding on
+`⋯ More` to the full set - **📖 Read all**, **✅ Read** (becoming an inert
+✔️ once read), **🚫 Spam**, and **⌃ Less** to collapse again. Every label,
+and the notification text itself, follows the reader's language. The
+sender is a tappable `mailto:` link, the preview renders as a native
+quoted block, and any attachment is named with its size. Every triage
+action (Archive/Spam/Delete) leaves a 30-second **↩️ Undo** button that
+restores the message to exactly the mailboxes it was in before - an
+in-memory, non-persisted safety net for an accidental tap, not a second
+trash bin.
 
 ### Shared mailboxes
 
 Some JMAP servers (Stalwart in particular) can grant a token delegated
 access to other mailboxes - team/shared inboxes distinct from your own
-personal account. `/partages` lists whatever shared accounts your token
+personal account. `/shared` lists whatever shared accounts your token
 currently has access to (fetched live from the server each time, not
 cached) with a toggle button per account. Enabling one starts its own
 background watcher and notifications for it, labeled with the shared
@@ -272,14 +280,30 @@ single connected chat follows.
 
 ### Extra personal accounts
 
-Unlike `/partages` (delegated access under one token), `/comptes` connects
+Unlike `/shared` (delegated access under one token), `/accounts` connects
 a second, fully independent JMAP account - its own server and token,
-e.g. a work mailbox alongside a personal one. `/comptes <server_url>
+e.g. a work mailbox alongside a personal one. `/accounts <server_url>
 <token>` connects one (the message is deleted right after, same as
-`/login`); `/comptes` with no argument lists everything connected, with a
+`/login`); `/accounts` with no argument lists everything connected, with a
 disconnect button per extra account. Disconnecting one only forgets that
-account - reconnecting means running `/comptes` again with its
+account - reconnecting means running `/accounts` again with its
 credentials.
+
+### Languages
+
+The bot ships English (`en`) and French (`fr`). A chat's language is
+resolved in this order:
+
+1. an explicit choice made with `/lang en|fr` (persisted per chat);
+2. the Telegram client's own `language_code` when it names a shipped
+   language (`fr-FR` selects `fr`) - also persisted at `/login` time;
+3. the operator's `BOT_LANGUAGE`;
+4. English.
+
+Command descriptions are registered with Telegram per language, so the
+"/" menu is localized to each client automatically. Only the bot's own
+wording is translated - email content (subjects, senders, bodies) is
+never rewritten.
 
 ### Environment variables
 
@@ -290,8 +314,35 @@ credentials.
 | `DATA_DIR`                 | no       | `/data` | Where the encrypted credential store lives                            |
 | `ALLOW_PRIVATE_JMAP_HOSTS` | no       | `0`     | Set to `1` to allow `/login` to a private/internal JMAP server (SSRF guard bypass) |
 | `TIMEZONE`                 | no       | `UTC`   | IANA zone name (e.g. `Europe/Paris`) for notification and log timestamps |
+| `BOT_LANGUAGE`             | no       | `en`    | Default language (`en` or `fr`) for chats that haven't chosen one with `/lang`; an unsupported value refuses to start |
+| `HEALTH_ADDR`              | no       | `0.0.0.0:8080` | Address the `/healthz`, `/readyz` and `/metrics` listener binds to |
 | `LOG_LEVEL`                | no       | `info`  | `trace`, `debug`, `info`, `warn`, or `error`                           |
 | `RUST_LOG`                 | no       | -       | Advanced per-module filter (tracing's `EnvFilter` syntax); overrides `LOG_LEVEL` when set |
+
+## Observability
+
+The listener above also serves a Prometheus `/metrics` endpoint (text
+format) on the same address:
+
+```bash
+curl -s http://localhost:8080/metrics
+```
+
+Alongside the liveness/readiness probes (`/healthz`, `/readyz`), it
+exposes process gauges (`process_resident_memory_bytes`,
+`jmap2telegram_build_info{version=…}`, `jmap2telegram_start_time_seconds`,
+`jmap2telegram_accounts`, `jmap2telegram_pending_undos`), the watcher's
+connection/sync gauges (`jmap2telegram_watchers_registered`,
+`jmap2telegram_watchers_connected`,
+`jmap2telegram_last_activity_age_seconds{watcher=…}`), and counters for
+delivered notifications, send errors, triage actions, mark-as-read and
+undos. Every label is bounded and bot-generated - no email address,
+subject or message id ever becomes a metric label, so cardinality stays
+flat regardless of traffic.
+
+This is a plain endpoint by design: wiring it into Prometheus (a
+`ServiceMonitor`, scrape annotations, a `PodMonitor`, …) is the scraper's
+concern, so the Helm chart intentionally ships no scrape template.
 
 ## Kubernetes (Helm, OCI)
 

@@ -111,6 +111,18 @@ impl WatchTarget {
         }
     }
 
+    /// Short, bounded account-kind label for the notification metrics.
+    /// Deliberately *not* the account id or label, either of which is
+    /// server- or user-chosen and would make the metric's cardinality
+    /// unbounded.
+    fn kind(&self) -> &'static str {
+        match self {
+            WatchTarget::Primary => "primary",
+            WatchTarget::Shared { .. } => "shared",
+            WatchTarget::Extra { .. } => "extra",
+        }
+    }
+
     /// Registry key for the health endpoint: stable, unique per watched
     /// account within a chat, and readable in `kubectl` output and metric
     /// labels. Embeds the chat id and the account slot - internal
@@ -123,12 +135,17 @@ impl WatchTarget {
         }
     }
 
-    /// How this target is referred to in a connection-health notification.
-    fn scope_label(&self) -> String {
+    /// How this target is referred to in a connection-health notification,
+    /// in the reader's locale.
+    fn scope_label(&self, lang: &str) -> String {
         match self {
-            WatchTarget::Primary => "ta boîte JMAP".to_string(),
-            WatchTarget::Shared { label, .. } => format!("la boîte partagée « {label} »"),
-            WatchTarget::Extra { label, .. } => format!("le compte « {label} »"),
+            WatchTarget::Primary => t!("watcher.scope_primary", locale = lang).to_string(),
+            WatchTarget::Shared { label, .. } => {
+                t!("watcher.scope_shared", locale = lang, label = label).to_string()
+            }
+            WatchTarget::Extra { label, .. } => {
+                t!("watcher.scope_extra", locale = lang, label = label).to_string()
+            }
         }
     }
 }
@@ -167,23 +184,22 @@ pub(crate) fn extra_health_key(chat_id: i64, slot_id: &str) -> String {
 /// attacker's chat. Every failure is already traced server-side by the
 /// reconnect loop below, so the notice points at the logs instead of
 /// quoting the error. Keep it that way: no `{}` of an error, ever.
-fn connection_broken_text(target: &WatchTarget) -> String {
-    format!(
-        "⚠️ La connexion à {scope} échoue depuis plusieurs tentatives : le jeton a peut-être \
-         été révoqué, ou le serveur est injoignable. Les notifications sont en pause pour ce \
-         compte jusqu'à ce que la connexion reprenne d'elle-même.\n\n\
-         Le détail technique de chaque échec est consigné dans les logs serveur.\n\n\
-         Si le jeton a été révoqué, reconnecte-toi avec /login (ou /partages pour une boîte \
-         partagée).",
-        scope = target.scope_label(),
+fn connection_broken_text(target: &WatchTarget, lang: &str) -> String {
+    t!(
+        "watcher.broken",
+        locale = lang,
+        scope = target.scope_label(lang)
     )
+    .to_string()
 }
 
-fn connection_recovered_text(target: &WatchTarget) -> String {
-    format!(
-        "✅ La connexion à {} est rétablie, les notifications reprennent.",
-        target.scope_label(),
+fn connection_recovered_text(target: &WatchTarget, lang: &str) -> String {
+    t!(
+        "watcher.recovered",
+        locale = lang,
+        scope = target.scope_label(lang)
     )
+    .to_string()
 }
 
 /// Spawns the long-running per-account watcher: an EventSource connection
@@ -224,6 +240,7 @@ pub fn spawn(
                 }
                 Err(e) => {
                     tracing::warn!(chat_id, error = %e, "watcher JMAP EventSource error, reconnecting");
+                    state.metrics.watcher_reconnect();
                     // Le stream vient de tomber (ou n'a jamais ouvert) : le
                     // registre health doit le refléter dès maintenant, sinon
                     // /readyz reste 200 pendant tout le backoff - exactement
@@ -235,7 +252,14 @@ pub fn spawn(
                         backoff = INITIAL_BACKOFF;
                         if notified_broken {
                             notified_broken = false;
-                            notify(&bot, &state, chat_id, connection_recovered_text(&target)).await;
+                            let lang = state.language_for(chat_id, None);
+                            notify(
+                                &bot,
+                                &state,
+                                chat_id,
+                                connection_recovered_text(&target, lang),
+                            )
+                            .await;
                         }
                     } else {
                         consecutive_connect_failures += 1;
@@ -248,7 +272,9 @@ pub fn spawn(
                             // traced it server-side (see
                             // connection_broken_text for why the chat
                             // must never see it).
-                            notify(&bot, &state, chat_id, connection_broken_text(&target)).await;
+                            let lang = state.language_for(chat_id, None);
+                            notify(&bot, &state, chat_id, connection_broken_text(&target, lang))
+                                .await;
                         }
                     }
                 }
@@ -344,23 +370,30 @@ async fn sync_and_notify(
         }
     };
     // Successful sync (event-driven or fallback poll): advance the health
-    // activity clock behind jmap2telegram_last_activity_age_seconds.
+    // activity clock behind jmap2telegram_last_activity_age_seconds, and
+    // count the sync itself.
     state.health.touch(&target.health_key(chat_id));
+    state.metrics.watcher_sync();
 
     for summary in &summaries {
         if is_muted(summary, &account.muted) {
             continue;
         }
 
-        let text = notification_text(summary, state.config.timezone, target.label());
-        let keyboard = notification_keyboard(&summary.id, target.account_id(), false);
-        if let Err(e) = bot
+        let lang = state.language_for(chat_id, None);
+        let text = notification_text(summary, state.config.timezone, target.label(), lang);
+        let keyboard = notification_keyboard(&summary.id, target.account_id(), false, false, lang);
+        match bot
             .send_message(ChatId(chat_id), text)
             .parse_mode(ParseMode::MarkdownV2)
             .reply_markup(keyboard)
             .await
         {
-            tracing::warn!(chat_id, error = %e, "failed to deliver notification");
+            Ok(_) => state.metrics.notification_delivered(target.kind()),
+            Err(e) => {
+                state.metrics.notification_send_error(target.kind());
+                tracing::warn!(chat_id, error = %e, "failed to deliver notification");
+            }
         }
     }
 
@@ -410,6 +443,7 @@ mod tests {
             token: "tok".to_string(),
             email: "a@b.c".to_string(),
             last_state: Some("primary-state".to_string()),
+            language: None,
             shared_accounts: HashMap::from([(
                 "acc7".to_string(),
                 SharedAccount {
@@ -483,6 +517,55 @@ mod tests {
         assert!(target.still_active(&account()));
         assert_eq!(target.account_id(), Some("slot1"));
         assert_eq!(target.label(), Some("second@other.example"));
+    }
+
+    #[test]
+    fn target_kind_is_bounded_and_distinct_per_variant() {
+        // The metric label must be one of three constants - never the
+        // account id or label, which are server/user-chosen and would make
+        // the counter's cardinality unbounded.
+        assert_eq!(WatchTarget::Primary.kind(), "primary");
+        assert_eq!(
+            WatchTarget::Shared {
+                account_id: "acc7".to_string(),
+                label: "shared@b.c".to_string(),
+            }
+            .kind(),
+            "shared"
+        );
+        assert_eq!(
+            WatchTarget::Extra {
+                slot_id: "slot1".to_string(),
+                label: "second@other.example".to_string(),
+            }
+            .kind(),
+            "extra"
+        );
+    }
+
+    #[test]
+    fn scope_labels_follow_the_locale_and_name_the_mailbox() {
+        let shared = WatchTarget::Shared {
+            account_id: "acc7".to_string(),
+            label: "shared@b.c".to_string(),
+        };
+        // The mailbox itself is named in both languages, but the sentence
+        // around it is translated.
+        assert!(shared.scope_label("en").contains("shared@b.c"));
+        assert!(shared.scope_label("fr").contains("shared@b.c"));
+        assert_ne!(shared.scope_label("en"), shared.scope_label("fr"));
+
+        assert_ne!(
+            WatchTarget::Primary.scope_label("en"),
+            WatchTarget::Primary.scope_label("fr")
+        );
+
+        let extra = WatchTarget::Extra {
+            slot_id: "slot1".to_string(),
+            label: "second@other.example".to_string(),
+        };
+        assert!(extra.scope_label("en").contains("second@other.example"));
+        assert!(extra.scope_label("fr").contains("second@other.example"));
     }
 
     #[test]
@@ -572,7 +655,7 @@ mod tests {
 
     #[test]
     fn connection_broken_text_names_the_primary_mailbox_and_points_at_the_logs() {
-        let text = connection_broken_text(&WatchTarget::Primary);
+        let text = connection_broken_text(&WatchTarget::Primary, "fr");
         assert!(text.contains("ta boîte JMAP"));
         assert!(text.contains("logs serveur"));
         assert!(text.contains("/login"));
@@ -584,7 +667,7 @@ mod tests {
             account_id: "acc7".to_string(),
             label: "contact@delta-net.ovh".to_string(),
         };
-        let text = connection_broken_text(&target);
+        let text = connection_broken_text(&target, "fr");
         assert!(text.contains("contact@delta-net.ovh"));
         assert!(text.contains("logs serveur"));
     }
@@ -600,7 +683,7 @@ mod tests {
     /// server-side tracing::warn of the reconnect loop.
     #[test]
     fn connection_broken_text_never_interpolates_the_transport_error() {
-        let text = connection_broken_text(&WatchTarget::Primary);
+        let text = connection_broken_text(&WatchTarget::Primary, "fr");
         // Fragments of a plausible raw transport error, exactly what the
         // notice used to quote, plus the old quoting line itself.
         for fragment in [
@@ -622,20 +705,31 @@ mod tests {
 
     #[test]
     fn connection_recovered_text_names_the_target() {
-        let primary = connection_recovered_text(&WatchTarget::Primary);
+        let primary = connection_recovered_text(&WatchTarget::Primary, "fr");
         assert!(primary.contains("ta boîte JMAP"));
 
-        let shared = connection_recovered_text(&WatchTarget::Shared {
-            account_id: "acc7".to_string(),
-            label: "contact@delta-net.ovh".to_string(),
-        });
+        let shared = connection_recovered_text(
+            &WatchTarget::Shared {
+                account_id: "acc7".to_string(),
+                label: "contact@delta-net.ovh".to_string(),
+            },
+            "fr",
+        );
         assert!(shared.contains("contact@delta-net.ovh"));
 
-        let extra = connection_recovered_text(&WatchTarget::Extra {
-            slot_id: "slot1".to_string(),
-            label: "second@other.example".to_string(),
-        });
+        let extra = connection_recovered_text(
+            &WatchTarget::Extra {
+                slot_id: "slot1".to_string(),
+                label: "second@other.example".to_string(),
+            },
+            "fr",
+        );
         assert!(extra.contains("second@other.example"));
+
+        // The notice follows the reader's locale.
+        let english = connection_recovered_text(&WatchTarget::Primary, "en");
+        assert!(english.contains("your JMAP mailbox"));
+        assert!(!english.contains("ta boîte"));
     }
 
     fn summary(
