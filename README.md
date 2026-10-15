@@ -420,16 +420,21 @@ different commit, and its digest is never overwritten: both would change
 what someone who already pinned that version gets. Releasing a version
 that is already out therefore fails loudly - the fix is a new patch
 version, not a moved tag. A manual dispatch that lands on the very same
-commit is a no-op, so retrying a failed run stays safe.
+commit is a no-op, so retrying a failed run stays safe. The comparison is
+between *commits*, following the tag object when the ref is annotated, so a
+tag cut by hand reads exactly like the lightweight tag the workflow creates
+itself.
 
 The chart is held to the same rule, for the same reason. GHCR has no
 per-tag protection for OCI artifacts (the ruleset mechanism is a git
 feature), so `helm push` would rewrite a published version without
 complaining. The chart is therefore compared by *content* rather than by
 digest - `helm package` stamps file mtimes into the tarball, so the same
-chart packaged twice has two different digests - and an already-published
-version is only re-pushed when its content is byte-identical, which makes
-retrying a half-finished release a no-op instead of a silent rewrite.
+chart packaged twice has two different digests. A published version is
+never re-pushed: byte-identical content is skipped, which makes retrying a
+half-finished release a no-op instead of a silent rewrite, and content
+that differs is refused outright - the fix there is a new version, not an
+artifact rewritten under someone who already pinned it.
 
 The tag ruleset cannot cover everything, though: it stops a *published*
 tag from being moved, not a tag whose version disagrees with the code it
