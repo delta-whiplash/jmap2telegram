@@ -4,21 +4,16 @@ on:
   push:
     branches: [main]
   pull_request:
-  workflow_call:
-    inputs:
-      # The release workflow builds both arches natively itself, so it tells
-      # CI to skip the redundant amd64-only docker build. Modelled as an
-      # input (not `github.event_name`) because the caller's event name, not
-      # `workflow_call`, is what a called workflow sees. Unset (direct
-      # push/PR runs) the negation below evaluates true, so the job runs.
-      skip_image:
-        description: "Skip the amd64 docker-build job (the caller builds the image)."
-        type: boolean
-        default: false
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
+
+permissions:
+  contents: read
+  # The image job publishes the per-commit `sha-<sha>` image the release
+  # promotes; image-retention prunes old ones.
+  packages: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -62,47 +57,6 @@ jobs:
       - uses: taiki-e/install-action@cargo-audit
       - run: cargo audit
 
-  docker-build:
-    if: ${{ !inputs.skip_image }}
-    runs-on: ubuntu-26.04
-    steps:
-      - uses: actions/checkout@v7
-      - uses: docker/setup-buildx-action@v4
-        id: buildx
-
-      # type=gha (below) only caches image layers, not the Dockerfile's
-      # RUN --mount=type=cache dirs (cargo registry + target): those are
-      # builder-local state that a fresh-per-job GHA runner never has.
-      # buildkit-cache-dance extracts/injects them through actions/cache
-      # instead, so a Cargo.lock bump only recompiles what changed rather
-      # than the whole dependency tree.
-      - uses: actions/cache@v4
-        id: cache
-        with:
-          path: cache-mount
-          # Scope the key AND the gha cache below to amd64: the release
-          # workflow's arm64 leg carries its own cache, and the two must not
-          # clobber each other's per-arch cargo target dir. amd64 is named so
-          # the release amd64 leg reuses exactly these warm layers.
-          key: docker-cache-mount-amd64-${{ hashFiles('Dockerfile', 'Cargo.lock') }}
-          restore-keys: docker-cache-mount-amd64-
-
-      - uses: reproducible-containers/buildkit-cache-dance@v3
-        with:
-          builder: ${{ steps.buildx.outputs.name }}
-          cache-dir: cache-mount
-          dockerfile: Dockerfile
-          skip-extraction: ${{ steps.cache.outputs.cache-hit }}
-
-      - uses: docker/build-push-action@v7
-        with:
-          context: .
-          push: false
-          load: true
-          tags: jmap2telegram:ci
-          cache-from: type=gha,scope=amd64
-          cache-to: type=gha,mode=max,scope=amd64
-
   helm-lint:
     runs-on: ubuntu-latest
     steps:
@@ -128,3 +82,168 @@ jobs:
           gitleaks version
       - name: Scan full git history
         run: gitleaks git . --redact --exit-code 1 -v
+
+  # --- build once --------------------------------------------------------
+  #
+  # The image is built here, on every merge to main, and published under a
+  # commit-addressed tag `sha-<sha>`. Doing it here rather than at release
+  # time is what lets the release be a pure *promotion* (release.yml): the
+  # artifact that ships is byte-for-byte the one this run built and tested.
+  #
+  # `needs` names *every* gate on purpose: the existence of `sha-<sha>` is
+  # then proof that the whole CI suite passed for that commit, which is the
+  # only check the release needs to make.
+  image:
+    if: github.event_name == 'push'
+    needs: [fmt, clippy, test, audit, helm-lint, gitleaks]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Native runner per arch: emulating arm64 under QEMU cost ~26x a
+          # native compile. ubuntu-26.04* are standard GitHub-hosted images,
+          # free for public repos.
+          - runner: ubuntu-26.04
+            platform: linux/amd64
+            arch: amd64
+          - runner: ubuntu-26.04-arm
+            platform: linux/arm64
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+        id: buildx
+
+      # type=gha (below) only caches image layers, not the Dockerfile's
+      # RUN --mount=type=cache dirs (cargo registry + target): those are
+      # builder-local state that a fresh-per-job GHA runner never has.
+      # buildkit-cache-dance extracts/injects them through actions/cache
+      # instead, so a Cargo.lock bump only recompiles what changed rather
+      # than the whole dependency tree. Keys are per-arch: each leg's cargo
+      # target dir is arch-specific and the two must not clobber each other.
+      - uses: actions/cache@v4
+        id: cache
+        with:
+          path: cache-mount
+          key: docker-cache-mount-${{ matrix.arch }}-${{ hashFiles('Dockerfile', 'Cargo.lock') }}
+          restore-keys: docker-cache-mount-${{ matrix.arch }}-
+
+      - uses: reproducible-containers/buildkit-cache-dance@v3
+        with:
+          builder: ${{ steps.buildx.outputs.name }}
+          cache-dir: cache-mount
+          dockerfile: Dockerfile
+          skip-extraction: ${{ steps.cache.outputs.cache-hit }}
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Push by digest only: the arch-agnostic index is created once, in
+      # image-merge below, so the two legs never race to publish a tag.
+      - uses: docker/build-push-action@v7
+        id: build
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          outputs: type=image,name=ghcr.io/${{ github.repository }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+
+      - name: Export digest
+        run: |
+          set -euo pipefail
+          mkdir -p "${{ runner.temp }}/digests"
+          digest="${{ steps.build.outputs.digest }}"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  image-merge:
+    if: github.event_name == 'push'
+    needs: [image]
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Publish the multi-arch index as sha-<sha>
+        working-directory: ${{ runner.temp }}/digests
+        env:
+          REPO: ghcr.io/${{ github.repository }}
+          TAG: sha-${{ github.sha }}
+        run: |
+          set -euo pipefail
+          digest_args=()
+          for d in *; do digest_args+=("${REPO}@sha256:${d}"); done
+          docker buildx imagetools create -t "${REPO}:${TAG}" "${digest_args[@]}"
+          docker buildx imagetools inspect "${REPO}:${TAG}"
+
+  # One tag per merge is unbounded, so keep the newest KEEP and drop the
+  # rest. Deliberately conservative, because a wrong prune here would delete
+  # something users pull:
+  #   * only versions whose tags are *all* sha-* are eligible, so a vX.Y.Z /
+  #     X.Y / X / latest version can never be selected;
+  #   * a sha that carries any v* tag is never pruned, so a released image
+  #     can always be re-promoted from its digest.
+  image-retention:
+    if: github.event_name == 'push'
+    needs: [image-merge]
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      OWNER: ${{ github.repository_owner }}
+      REPO: ${{ github.repository }}
+      PKG: jmap2telegram
+      KEEP: "20"
+    steps:
+      - name: Prune old sha-* image versions
+        run: |
+          set -euo pipefail
+          gh api --paginate "/users/${OWNER}/packages/container/${PKG}/versions?per_page=100" \
+            --jq '.[] | select((.metadata.container.tags | length) > 0)
+                       | select(.metadata.container.tags | all(startswith("sha-")))
+                       | [.created_at, .id, (.metadata.container.tags[0] | sub("^sha-"; ""))] | @tsv' \
+            | sort -r > /tmp/sha-versions.tsv
+
+          gh api --paginate "/repos/${REPO}/tags?per_page=100" --jq '.[].commit.sha' \
+            | sort -u > /tmp/released-shas.txt
+
+          kept=0
+          while IFS=$'\t' read -r created id sha; do
+            [ -z "${id:-}" ] && continue
+            if grep -qx "$sha" /tmp/released-shas.txt; then
+              echo "keep  ${sha} (released, ${created})"
+              continue
+            fi
+            kept=$((kept + 1))
+            if [ "$kept" -le "$KEEP" ]; then
+              echo "keep  ${sha} (newest #${kept}, ${created})"
+              continue
+            fi
+            echo "prune ${sha} (${created}, version ${id})"
+            gh api -X DELETE "/users/${OWNER}/packages/container/${PKG}/versions/${id}"
+          done < /tmp/sha-versions.tsv
