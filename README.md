@@ -411,6 +411,13 @@ already has a `sha-<sha>` image - i.e. a commit on `main` whose CI passed.
 A tag anywhere else fails loudly rather than publishing an untested
 build.
 
+Release tags are immutable. A published `vX.Y.Z` is never re-pointed at a
+different commit, and its digest is never overwritten: both would change
+what someone who already pinned that version gets. Releasing a version
+that is already out therefore fails loudly - the fix is a new patch
+version, not a moved tag. A manual dispatch that lands on the very same
+commit is a no-op, so retrying a failed run stays safe.
+
 ### Keeping the registry tidy
 
 An immutable `sha-<commit>` image per merge would grow without bound, so
