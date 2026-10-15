@@ -1199,8 +1199,7 @@ mod tests {
             .expect("requests should be recorded")
             .into_iter()
             .filter_map(|r| serde_json::from_slice::<serde_json::Value>(&r.body).ok())
-            .filter(|b| b["methodCalls"][0][0] == "Email/set")
-            .next_back()
+            .rfind(|b| b["methodCalls"][0][0] == "Email/set")
             .expect("an Email/set call should have been sent")["methodCalls"][0][1]
             .clone()
     }
