@@ -418,6 +418,13 @@ that is already out therefore fails loudly - the fix is a new patch
 version, not a moved tag. A manual dispatch that lands on the very same
 commit is a no-op, so retrying a failed run stays safe.
 
+The rule is enforced in two places rather than merely intended: the
+workflows above refuse the collision, and a repository ruleset
+(`immutable release tags`, targeting `refs/tags/v*`) blocks updates and
+deletions outright - so a forced `git push` cannot rewrite a published tag
+either. Tag *creation* is deliberately left open: that is how a release is
+cut.
+
 ### Keeping the registry tidy
 
 An immutable `sha-<commit>` image per merge would grow without bound, so
