@@ -331,6 +331,16 @@ jobs:
           VERSION: ${{ needs.prep.outputs.version }}
         run: |
           set -euo pipefail
+          # A published release is left exactly as it is, like the tag and the
+          # chart: that is what makes a retried run a no-op end to end, and it
+          # is why notes someone may have already read cannot be rewritten
+          # underneath them. (`gh release create` refuses outright when the tag
+          # already has a release, which would turn a harmless retry into a
+          # red run for no reason.)
+          if gh release view "v${VERSION}" --repo "$REPO_SLUG" > /dev/null 2>&1; then
+            echo "release v${VERSION} is already published - leaving it as it is."
+            exit 0
+          fi
           gh release create "v${VERSION}" \
             --repo "$REPO_SLUG" \
             --title "v${VERSION}" \
