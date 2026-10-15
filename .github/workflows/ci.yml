@@ -202,13 +202,9 @@ jobs:
           docker buildx imagetools create -t "${REPO}:${TAG}" "${digest_args[@]}"
           docker buildx imagetools inspect "${REPO}:${TAG}"
 
-  # One tag per merge is unbounded, so keep the newest KEEP and drop the
-  # rest. Deliberately conservative, because a wrong prune here would delete
-  # something users pull:
-  #   * only versions whose tags are *all* sha-* are eligible, so a vX.Y.Z /
-  #     X.Y / X / latest version can never be selected;
-  #   * a sha that carries any v* tag is never pruned, so a released image
-  #     can always be re-promoted from its digest.
+  # Version pruning lives in .github/scripts/prune-package-versions.sh so it
+  # can be run (in dry-run) on every pull request rather than only reasoned
+  # about here. See that file for the rules and their safety arguments.
   image-retention:
     if: github.event_name == 'push'
     needs: [image-merge]
@@ -220,30 +216,40 @@ jobs:
       PKG: jmap2telegram
       KEEP: "20"
     steps:
-      - name: Prune old sha-* image versions
-        run: |
-          set -euo pipefail
-          gh api --paginate "/users/${OWNER}/packages/container/${PKG}/versions?per_page=100" \
-            --jq '.[] | select((.metadata.container.tags | length) > 0)
-                       | select(.metadata.container.tags | all(startswith("sha-")))
-                       | [.created_at, .id, (.metadata.container.tags[0] | sub("^sha-"; ""))] | @tsv' \
-            | sort -r > /tmp/sha-versions.tsv
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Prune old image versions
+        run: bash .github/scripts/prune-package-versions.sh
 
-          gh api --paginate "/repos/${REPO}/tags?per_page=100" --jq '.[].commit.sha' \
-            | sort -u > /tmp/released-shas.txt
-
-          kept=0
-          while IFS=$'\t' read -r created id sha; do
-            [ -z "${id:-}" ] && continue
-            if grep -qx "$sha" /tmp/released-shas.txt; then
-              echo "keep  ${sha} (released, ${created})"
-              continue
-            fi
-            kept=$((kept + 1))
-            if [ "$kept" -le "$KEEP" ]; then
-              echo "keep  ${sha} (newest #${kept}, ${created})"
-              continue
-            fi
-            echo "prune ${sha} (${created}, version ${id})"
-            gh api -X DELETE "/users/${OWNER}/packages/container/${PKG}/versions/${id}"
-          done < /tmp/sha-versions.tsv
+  # The same script in dry-run on every pull request opened from this
+  # repository, so the pruning rules are exercised continuously instead of
+  # being trusted. Forks are excluded: they get a read-only token and could
+  # not describe the package anyway. A pull request never mutates the
+  # registry.
+  image-retention-check:
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      OWNER: ${{ github.repository_owner }}
+      REPO: ${{ github.repository }}
+      PKG: jmap2telegram
+      KEEP: "20"
+      DRY_RUN: "true"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Report what pruning would delete
+        run: bash .github/scripts/prune-package-versions.sh
