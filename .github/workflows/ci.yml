@@ -247,3 +247,43 @@ jobs:
             echo "prune ${sha} (${created}, version ${id})"
             gh api -X DELETE "/users/${OWNER}/packages/container/${PKG}/versions/${id}"
           done < /tmp/sha-versions.tsv
+
+  # TEMPORARY (throwaway branch only): prove GITHUB_TOKEN can DELETE a
+  # package version through the API the retention job uses, and dump the
+  # real version-list shape. Never merged.
+  retention-probe:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Dump every version of the container package
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          gh api --paginate "/users/${OWNER}/packages/container/jmap2telegram/versions?per_page=100" \
+            --jq '.[] | [.id, .created_at, .name, ((.metadata.container.tags // []) | join("|"))] | @tsv' | sort -k2,2
+
+      - name: Create a disposable version
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/probe
+          printf 'FROM scratch\nLABEL probe=retention-delete-test\n' > /tmp/probe/Dockerfile
+          echo "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker buildx build --push --provenance=false \
+            -t "ghcr.io/${{ github.repository }}:sha-probe-delete-test" /tmp/probe
+
+      - name: Delete that version through the package API
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          id=$(gh api --paginate "/users/${OWNER}/packages/container/jmap2telegram/versions?per_page=100" \
+            --jq '.[] | select((.metadata.container.tags // []) | index("sha-probe-delete-test")) | .id')
+          echo "probe version id = ${id}"
+          gh api -X DELETE "/users/${OWNER}/packages/container/jmap2telegram/versions/${id}"
+          echo "DELETE ok"
