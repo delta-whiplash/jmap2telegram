@@ -41,9 +41,9 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      # --locked: fail loudly if Cargo.lock drifts from Cargo.toml, and skip
-      # cargo's crates.io index refresh (a needless network round-trip when
-      # the lock already pins everything).
+      # --locked: fail loudly if Cargo.lock has drifted from Cargo.toml
+      # instead of silently re-resolving it in CI. (It does not, as I first
+      # assumed, suppress cargo's "Updating crates.io index" step.)
       - run: cargo clippy --all-targets --locked -- -D warnings
 
   test:
