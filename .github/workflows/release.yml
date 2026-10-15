@@ -101,8 +101,13 @@ jobs:
       # release's critical path.
       skip_image: true
 
+  # Builds concurrently with the lint/test phase rather than after it: the
+  # per-arch manifests are pushed by digest (untagged, not consumable), and
+  # the tags are only attached in `merge`, which still waits for `test`. A
+  # commit that fails the gates can therefore never reach a published tag,
+  # but the ~45s CI phase no longer sits on the release's critical path.
   docker:
-    needs: [prep, test]
+    needs: [prep]
     strategy:
       fail-fast: false
       matrix:
@@ -189,7 +194,7 @@ jobs:
           retention-days: 1
 
   merge:
-    needs: [prep, docker]
+    needs: [prep, test, docker]
     runs-on: ubuntu-26.04
     steps:
       - uses: docker/setup-buildx-action@v4
