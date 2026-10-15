@@ -15,6 +15,12 @@ name: Release
 # credential that's allowed to push branches but not tags/refs): the
 # `prep` job then creates the vX.Y.Z tag itself via the API, using this
 # workflow's own GITHUB_TOKEN rather than the caller's git credentials.
+#
+# Release tags are immutable. A published `vX.Y.Z` is never re-pointed at a
+# different commit, and its image digest is never overwritten: either would
+# silently change what someone who already pinned or pulled that version
+# gets. A dispatch that lands on an already-published version fails loudly -
+# bump the version and release that.
 on:
   push:
     tags:
@@ -22,7 +28,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Version to release, without the leading v (e.g. 0.1.0). Creates the vX.Y.Z tag if it doesn't exist yet."
+        description: "Version to release, without the leading v (e.g. 0.1.0). Creates the vX.Y.Z tag if it doesn't exist yet; an already-published tag is never moved."
         required: true
 
 permissions:
@@ -65,18 +71,17 @@ jobs:
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
-      - name: Create or move release tag (manual dispatch only)
+      - name: Create the release tag (manual dispatch only)
         if: github.event_name == 'workflow_dispatch'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: v${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
-          # A manual dispatch always means "release what's at this ref
-          # right now" - so an existing tag for this version gets moved
-          # to the dispatched commit rather than silently reused, or a
-          # stale digest would be promoted while the release pointed at
-          # a different commit.
+          # A manual dispatch means "release what's at this ref right now",
+          # but only if that version has not been published yet. Moving an
+          # existing tag would rewrite history for anyone who already
+          # pinned it, so the collision is reported instead of resolved.
           existing_sha=$(curl -s \
             -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${{ github.repository }}/git/refs/tags/${TAG}" \
@@ -88,14 +93,11 @@ jobs:
               "https://api.github.com/repos/${{ github.repository }}/git/refs" \
               -d "{\"ref\":\"refs/tags/${TAG}\",\"sha\":\"${{ github.sha }}\"}"
             echo "Created tag ${TAG} at ${{ github.sha }}."
-          elif [ "$existing_sha" != "${{ github.sha }}" ]; then
-            curl -sS -f -X PATCH \
-              -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${{ github.repository }}/git/refs/tags/${TAG}" \
-              -d "{\"sha\":\"${{ github.sha }}\",\"force\":true}"
-            echo "Moved tag ${TAG} from ${existing_sha} to ${{ github.sha }}."
-          else
+          elif [ "$existing_sha" = "${{ github.sha }}" ]; then
             echo "Tag ${TAG} already points at ${{ github.sha }}."
+          else
+            echo "::error::${TAG} already points at ${existing_sha}, not at ${{ github.sha }}. Release tags are immutable: bump the version and release that, rather than moving a published tag."
+            exit 1
           fi
 
   promote:
@@ -129,6 +131,30 @@ jobs:
             sleep 10
           done
           echo "::error::$SRC was never published. Did the CI run for ${{ github.sha }} finish, and did every gate pass?"
+          exit 1
+
+      # The tag side of the same rule. `imagetools create` happily
+      # overwrites an existing tag, which would leave `vX.Y.Z` pointing at
+      # a digest other than the one it published - so refuse before
+      # touching it. Re-running a release for the same digest stays a
+      # no-op, which keeps retrying a failed run safe.
+      - name: Refuse to overwrite an already-published release tag
+        env:
+          VERSION: ${{ needs.prep.outputs.version }}
+        run: |
+          set -euo pipefail
+          published="$(docker buildx imagetools inspect "${REPO}:v${VERSION}" \
+            --format '{{.Manifest.Digest}}' 2>/dev/null || true)"
+          if [ -z "$published" ]; then
+            echo "v${VERSION} is not published yet - nothing to refuse."
+            exit 0
+          fi
+          built="$(docker buildx imagetools inspect "$SRC" --format '{{.Manifest.Digest}}')"
+          if [ "$published" = "$built" ]; then
+            echo "v${VERSION} already points at ${built}; promoting it again is a no-op."
+            exit 0
+          fi
+          echo "::error::v${VERSION} already exists at ${published}, but this build is ${built}. Release tags are immutable: bump the version and release that, rather than republishing a published tag."
           exit 1
 
       # Re-tag the digest CI already built. `imagetools create` copies the
