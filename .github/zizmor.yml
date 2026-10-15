@@ -1,0 +1,24 @@
+# zizmor configuration. Exactly one exemption so far, and it is written down
+# here rather than inline because an inline `# zizmor: ignore[...]` on the
+# `uses:` line it belongs to would collide with the `# v4` version comment
+# Renovate maintains there (zizmor's own ref-version-mismatch audit then
+# stops recognising the comment).
+rules:
+  # The cache-poisoning audit pairs a cache with a step that publishes an
+  # artifact, and warns that a poisoned cache could be compiled into what
+  # gets published. In ci.yml the pair is `actions/cache` (the cargo
+  # cache-mount the Docker build reads) and `docker/build-push-action`, and
+  # the audit cannot see the guard that makes it unreachable there: the
+  # publishing job is `if: github.event_name == 'push'`, so it never runs on
+  # a pull request and no PR can write those keys. GitHub scopes a cache
+  # written on a pull request's merge ref to that ref alone on top of that,
+  # so the default branch never reads one either.
+  #
+  # Exempted by file because the argument is about the shape of the job, not
+  # about a line of it - and because a line-numbered entry is not reported
+  # when the line moves, which would turn a stale exemption into a quiet one.
+  # A genuine cache-poisoning finding in any *other* workflow still fails the
+  # build; the exemption is only as wide as the workflow it is about.
+  cache-poisoning:
+    ignore:
+      - ci.yml
