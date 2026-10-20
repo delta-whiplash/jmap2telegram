@@ -426,6 +426,17 @@ jobs:
             | tar -xJ -C /tmp
           /tmp/shellcheck-v0.11.0/shellcheck -S style .github/scripts/*.sh
 
+      # A job that runs a script from this repository needs the tree: a
+      # job's workspace is empty until it checks out, so the step would
+      # die on a missing file (exit 127) instead of on the script's own
+      # logic. That is how v0.9.0's release failed - the promote job
+      # called the image-tag guard, which had just been extracted out of
+      # inline shell into .github/scripts/, and the job had no checkout
+      # to find it in. The guard is otherwise only exercised by a real
+      # release, so its absence is invisible until a release dies.
+      - name: Every job that runs a repository script checks the tree out
+        run: bash .github/scripts/check-workflow-checkouts.sh
+
       - name: Version guard accepts Cargo.toml's version and refuses another
         run: |
           set -euo pipefail
