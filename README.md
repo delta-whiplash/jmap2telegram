@@ -62,6 +62,7 @@ works the same way; the privacy pitch just changes from *your* server to
 - [Security & privacy by design](#security--privacy-by-design)
 - [Quickstart (Docker)](#quickstart-docker)
 - [Commands](#commands)
+- [What gets notified](#what-gets-notified)
 - [Shared mailboxes](#shared-mailboxes)
 - [Extra personal accounts](#extra-personal-accounts)
 - [Languages](#languages)
@@ -267,6 +268,32 @@ restores the message to exactly the mailboxes it was in before - an
 in-memory, non-persisted safety net for an accidental tap, not a second
 trash bin.
 
+### What gets notified
+
+The bot reports **what arrived**, not what the mailbox contains. Every
+message the JMAP account gains is classified first, and only the ones
+that are genuinely news reach the chat:
+
+| Message | Notified? | Why |
+|---------|-----------|-----|
+| A mail that arrived, unread | yes | the case the bot exists for |
+| A draft being written | no | it is a message *you* are composing, not one you received - and a webmail client saves a new draft on every auto-save, so this used to produce one notification per keystroke-batch |
+| A copy of a mail you sent | no | it is filed in the Sent folder, or sent from your own address |
+| A mail you already read elsewhere | no | you have seen it; announcing it again is noise |
+
+The classification reads the server's own truth - the mailbox roles
+(`Drafts`, `Sent`, ...), the RFC 8621 `$draft`/`$seen` keywords, and the
+sender - so it does not depend on the folder a provider happens to use.
+A filing rule that moves your incoming mail out of the Inbox does not
+silence it: the filter only removes what you wrote, or what you have
+already seen.
+
+`/mute` still applies on top of that, per sender or keyword, and the
+sync cursor moves past a skipped message either way - it is never
+re-announced later. The
+[`jmap2telegram_notifications_skipped_total`](#observability) counter
+counts what was filtered and why, so a quiet bot is explainable.
+
 ### Shared mailboxes
 
 Some JMAP servers (Stalwart in particular) can grant a token delegated
@@ -339,9 +366,12 @@ connection/sync gauges (`jmap2telegram_watchers_registered`,
 `jmap2telegram_watchers_connected`,
 `jmap2telegram_last_activity_age_seconds{watcher=…}`), and counters for
 delivered notifications, send errors, triage actions, mark-as-read and
-undos. Every label is bounded and bot-generated - no email address,
-subject or message id ever becomes a metric label, so cardinality stays
-flat regardless of traffic.
+undos. One more counter, `jmap2telegram_notifications_skipped_total{kind=…,reason=…}`,
+counts the new messages that were *not* announced - `reason` being one of
+`draft`, `sent`, `own` or `seen` (see
+[What gets notified](#what-gets-notified)). Every label is bounded and
+bot-generated - no email address, subject or message id ever becomes a
+metric label, so cardinality stays flat regardless of traffic.
 
 This is a plain endpoint by design: wiring it into Prometheus (a
 `ServiceMonitor`, scrape annotations, a `PodMonitor`, …) is the scraper's

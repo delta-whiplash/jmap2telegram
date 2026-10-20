@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr};
 
@@ -128,6 +129,27 @@ pub struct EmailSummary {
     /// memory - this is metadata only, so the notification can at least
     /// say "there's a 4 MB file here" without silently hiding it.
     pub attachments: Vec<(String, usize)>,
+}
+
+/// A message the account gained, with the facts a notification decision
+/// needs on top of the summary.
+///
+/// The summary alone cannot tell an incoming message from a draft the
+/// user is still writing: both are Email objects the account just
+/// gained, and both arrive with a subject, a sender and a preview. What
+/// separates them is *where the message sits* and *which keywords it
+/// carries* - so those travel with it, and the policy that decides what
+/// is worth announcing lives with the policy, not here.
+pub struct ChangedEmail {
+    /// The message itself, as the notification is built from it.
+    pub summary: EmailSummary,
+    /// The roles of the mailboxes the message currently sits in
+    /// (RFC 8621): `Drafts`, `Sent`, `Inbox`, ... A folder the account
+    /// gave no role to shows up as `Role::None` - a filing rule's
+    /// folder, for instance, which is neither a draft nor a sent copy.
+    pub mailbox_roles: Vec<Role>,
+    /// The keywords the message carries (`$draft`, `$seen`, `$junk`, ...).
+    pub keywords: Vec<String>,
 }
 
 fn attachments_of(email: &jmap_client::email::Email) -> Vec<(String, usize)> {
@@ -357,10 +379,16 @@ pub async fn current_email_state(client: &Client) -> Result<String> {
 /// the new cursor to persist. The JMAP `state` string is the single source
 /// of truth for what has already been seen; EventSource pushes are only a
 /// wake-up signal, never trusted on their own.
+///
+/// Every message the account gained comes back, with the mailbox roles and
+/// keywords that let the caller tell an incoming message from a draft the
+/// user is still writing or a copy of one they sent. Deciding what to
+/// announce is the caller's business (see `watcher::skip_reason`); this
+/// function only reports what is there.
 pub async fn fetch_changed_emails(
     client: &Client,
     since_state: &str,
-) -> Result<(Vec<EmailSummary>, String)> {
+) -> Result<(Vec<ChangedEmail>, String)> {
     let changes = client
         .email_changes(since_state, Some(50))
         .await
@@ -369,8 +397,14 @@ pub async fn fetch_changed_emails(
         })?;
     let new_state = changes.new_state().to_string();
     let created = changes.created().to_vec();
+    if created.is_empty() {
+        // Nothing to classify, so the mailbox lookup below would be a
+        // wasted round trip on every idle sync.
+        return Ok((Vec::new(), new_state));
+    }
+    let roles = mailbox_roles(client).await?;
 
-    let mut summaries = Vec::with_capacity(created.len());
+    let mut changed = Vec::with_capacity(created.len());
     for id in created {
         if let Some(email) = client
             .email_get(
@@ -381,6 +415,11 @@ pub async fn fetch_changed_emails(
                     Property::From,
                     Property::ReceivedAt,
                     Property::Attachments,
+                    // The two properties that say what the message *is*,
+                    // not what it contains: which folder it sits in, and
+                    // which keywords it carries ($draft, $seen, ...).
+                    Property::MailboxIds,
+                    Property::Keywords,
                 ]),
             )
             .await
@@ -394,19 +433,56 @@ pub async fn fetch_changed_emails(
                 .map(|a| (a.name().map(str::to_string), Some(a.email().to_string())))
                 .unwrap_or((None, None));
 
-            summaries.push(EmailSummary {
-                id,
-                subject: email.subject().unwrap_or_default().to_string(),
-                from_name,
-                from_addr,
-                preview: email.preview().unwrap_or_default().to_string(),
-                received_at: email.received_at(),
-                attachments: attachments_of(&email),
+            // A mailbox the account deleted between the changes call and
+            // this one simply contributes no role - the message is still
+            // reported, just without a folder to place it in.
+            let mailbox_roles: Vec<Role> = email
+                .mailbox_ids()
+                .into_iter()
+                .filter_map(|mailbox_id| roles.get(mailbox_id).cloned())
+                .collect();
+
+            changed.push(ChangedEmail {
+                summary: EmailSummary {
+                    id,
+                    subject: email.subject().unwrap_or_default().to_string(),
+                    from_name,
+                    from_addr,
+                    preview: email.preview().unwrap_or_default().to_string(),
+                    received_at: email.received_at(),
+                    attachments: attachments_of(&email),
+                },
+                mailbox_roles,
+                keywords: email.keywords().into_iter().map(str::to_string).collect(),
             });
         }
     }
 
-    Ok((summaries, new_state))
+    Ok((changed, new_state))
+}
+
+/// The role of every mailbox in the account, by mailbox id.
+///
+/// One round trip for the whole list: a `Mailbox/get` with no ids
+/// returns every mailbox the account has. The roles are what tell a
+/// draft from a message that arrived - without them, "the user is
+/// writing a mail" and "a mail arrived" look exactly the same.
+async fn mailbox_roles(client: &Client) -> Result<HashMap<String, Role>> {
+    let mut request = client.build();
+    request
+        .get_mailbox()
+        .properties([mailbox::Property::Role, mailbox::Property::Name]);
+    let mut response = request
+        .send_get_mailbox()
+        .await
+        .map_err(|_| JmapError::Protocol {
+            operation: "Mailbox/get (roles)",
+        })?;
+    Ok(response
+        .take_list()
+        .into_iter()
+        .filter_map(|mailbox| Some((mailbox.id()?.to_string(), mailbox.role())))
+        .collect())
 }
 
 /// Full-text search across the account (`Email/query` with a `text`
@@ -1149,11 +1225,32 @@ mod tests {
             let call = &body["methodCalls"][0];
             let method = call[0].as_str().unwrap_or_default();
             let call_id = call[2].clone();
-            let args = self
+            let mut args = self
                 .by_method
                 .get(method)
                 .cloned()
                 .unwrap_or_else(|| json!({}));
+            // An `Email/get` answers for the ids it was asked about: the
+            // fixture holds every message of the scenario, so the list
+            // has to be narrowed to the request. Without this, every
+            // get would answer with the same first message and a sync
+            // that gained three messages would report the same one
+            // three times.
+            if method == "Email/get"
+                && let Some(ids) = call[1]["ids"].as_array().cloned()
+            {
+                let list = args["list"].as_array().cloned().unwrap_or_default();
+                let picked: Vec<serde_json::Value> = ids
+                    .iter()
+                    .filter_map(|id| {
+                        let id = id.as_str()?;
+                        list.iter()
+                            .find(|email| email["id"].as_str() == Some(id))
+                            .cloned()
+                    })
+                    .collect();
+                args["list"] = json!(picked);
+            }
             // jmap-client's API envelope requires `sessionState`
             // (RFC 8620 §3.4) alongside `methodResponses`.
             ResponseTemplate::new(200).set_body_json(json!({
@@ -1218,6 +1315,61 @@ mod tests {
         })
     }
 
+    /// The mailboxes a test account has, as `Mailbox/get` returns them:
+    /// the roles the notification decision reads, plus one folder the
+    /// account gave no role to (the kind a filing rule creates).
+    fn mailboxes_json() -> serde_json::Value {
+        json!({
+            "accountId": "acc1", "state": "s", "notFound": [],
+            "list": [
+                {"id": "inbox", "role": "inbox", "name": "Inbox"},
+                {"id": "drafts", "role": "drafts", "name": "Drafts"},
+                {"id": "sent", "role": "sent", "name": "Sent"},
+                {"id": "sante", "role": null, "name": "Sante"}
+            ]
+        })
+    }
+
+    /// A message as `Email/get` returns it, with the properties the
+    /// notification decision reads next to the summary. The server
+    /// answers `mailboxIds` and `keywords` as maps of id/keyword to a
+    /// boolean, which is the shape jmap-client deserializes.
+    fn changed_email_json(
+        id: &str,
+        mailboxes: &[&str],
+        keywords: &[&str],
+        from: &str,
+    ) -> serde_json::Value {
+        let mut email = email_summary_json();
+        email["id"] = json!(id);
+        email["mailboxIds"] = serde_json::Value::Object(
+            mailboxes
+                .iter()
+                .map(|m| (m.to_string(), json!(true)))
+                .collect(),
+        );
+        email["keywords"] = serde_json::Value::Object(
+            keywords
+                .iter()
+                .map(|k| (k.to_string(), json!(true)))
+                .collect(),
+        );
+        email["from"] = json!([{"name": "Someone", "email": from}]);
+        email
+    }
+
+    /// The methods the mock server was asked to run, in order.
+    async fn called_methods(server: &MockServer) -> Vec<String> {
+        server
+            .received_requests()
+            .await
+            .expect("requests should be recorded")
+            .into_iter()
+            .filter_map(|r| serde_json::from_slice::<serde_json::Value>(&r.body).ok())
+            .filter_map(|b| b["methodCalls"][0][0].as_str().map(str::to_string))
+            .collect()
+    }
+
     #[tokio::test]
     async fn search_returns_summaries_with_their_attachments() {
         let server = MockServer::start().await;
@@ -1267,18 +1419,178 @@ mod tests {
                 },
                 "Email/get": {
                     "accountId": "acc1", "state": "s2", "notFound": [],
-                    "list": [email_summary_json()]
-                }
+                    "list": [changed_email_json("m1", &["inbox"], &[], "alice@example.org")]
+                },
+                "Mailbox/get": mailboxes_json()
             }),
         )
         .await;
 
-        let (summaries, new_state) = fetch_changed_emails(&client, "s1").await.unwrap();
+        let (changed, new_state) = fetch_changed_emails(&client, "s1").await.unwrap();
         assert_eq!(new_state, "s2", "the new cursor must be persisted as-is");
-        assert_eq!(summaries.len(), 1);
-        assert_eq!(summaries[0].id, "m1");
-        assert_eq!(summaries[0].subject, "Invoice");
-        assert_eq!(summaries[0].attachments.len(), 2);
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].summary.id, "m1");
+        assert_eq!(changed[0].summary.subject, "Invoice");
+        assert_eq!(changed[0].summary.attachments.len(), 2);
+    }
+
+    /// The mailbox a message sits in is what tells a draft from a
+    /// message that arrived, so the roles have to come back with it -
+    /// otherwise the bot cannot tell "the user is writing a mail" from
+    /// "a mail arrived".
+    #[tokio::test]
+    async fn fetch_changed_emails_reports_the_roles_of_the_mailboxes_a_message_sits_in() {
+        let server = MockServer::start().await;
+        let client = mock_client(
+            &server,
+            json!({
+                "Email/changes": {
+                    "accountId": "acc1", "oldState": "s1", "newState": "s2",
+                    "hasMoreChanges": false, "created": ["m1"],
+                    "updated": [], "destroyed": []
+                },
+                "Email/get": {
+                    "accountId": "acc1", "state": "s2", "notFound": [],
+                    "list": [changed_email_json("m1", &["drafts"], &["$draft"], "me@example.org")]
+                },
+                "Mailbox/get": mailboxes_json()
+            }),
+        )
+        .await;
+
+        let (changed, _) = fetch_changed_emails(&client, "s1").await.unwrap();
+        assert_eq!(changed.len(), 1);
+        assert!(
+            changed[0].mailbox_roles.contains(&Role::Drafts),
+            "the Drafts folder must be recognizable: {:?}",
+            changed[0].mailbox_roles
+        );
+        assert!(
+            changed[0].keywords.iter().any(|k| k == "$draft"),
+            "the $draft keyword must be reported: {:?}",
+            changed[0].keywords
+        );
+    }
+
+    /// A folder the account gave no role to is not the Drafts folder
+    /// and not the Sent folder - it must not be mistaken for either.
+    #[tokio::test]
+    async fn fetch_changed_emails_reports_a_role_less_folder_as_no_role() {
+        let server = MockServer::start().await;
+        let client = mock_client(
+            &server,
+            json!({
+                "Email/changes": {
+                    "accountId": "acc1", "oldState": "s1", "newState": "s2",
+                    "hasMoreChanges": false, "created": ["m1"],
+                    "updated": [], "destroyed": []
+                },
+                "Email/get": {
+                    "accountId": "acc1", "state": "s2", "notFound": [],
+                    "list": [changed_email_json("m1", &["sante"], &[], "alice@example.org")]
+                },
+                "Mailbox/get": mailboxes_json()
+            }),
+        )
+        .await;
+
+        let (changed, _) = fetch_changed_emails(&client, "s1").await.unwrap();
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].mailbox_roles, vec![Role::None]);
+        assert!(!changed[0].mailbox_roles.contains(&Role::Drafts));
+        assert!(!changed[0].mailbox_roles.contains(&Role::Sent));
+    }
+
+    /// The mailbox roles are only worth asking for when there is
+    /// something to classify: a sync that found no new message must
+    /// not spend a round trip on them.
+    #[tokio::test]
+    async fn fetch_changed_emails_does_not_ask_for_the_mailboxes_when_nothing_changed() {
+        let server = MockServer::start().await;
+        let client = mock_client(
+            &server,
+            json!({
+                "Email/changes": {
+                    "accountId": "acc1", "oldState": "s1", "newState": "s2",
+                    "hasMoreChanges": false, "created": [],
+                    "updated": [], "destroyed": []
+                },
+                "Email/get": {
+                    "accountId": "acc1", "state": "s2", "notFound": [], "list": []
+                },
+                "Mailbox/get": mailboxes_json()
+            }),
+        )
+        .await;
+
+        let (changed, new_state) = fetch_changed_emails(&client, "s1").await.unwrap();
+        assert!(changed.is_empty());
+        // The cursor still advances - a sync that found nothing is not
+        // a reason to keep re-reading the same state.
+        assert_eq!(new_state, "s2");
+        let called = called_methods(&server).await;
+        assert!(
+            !called.iter().any(|m| m == "Mailbox/get"),
+            "no mailbox lookup was needed: {called:?}"
+        );
+    }
+
+    /// The seam between the two layers, and where the bug lived: what
+    /// the server reports as a new message, put through the policy that
+    /// decides what is worth a notification. A draft the user is
+    /// writing and a copy of a mail they sent must not come out of
+    /// this as something to announce; a message that arrived must.
+    #[tokio::test]
+    async fn a_draft_the_account_gained_is_not_something_to_notify_about() {
+        let server = MockServer::start().await;
+        let client = mock_client(
+            &server,
+            json!({
+                "Email/changes": {
+                    "accountId": "acc1", "oldState": "s1", "newState": "s2",
+                    "hasMoreChanges": false,
+                    "created": ["draft1", "sent1", "incoming1"],
+                    "updated": [], "destroyed": []
+                },
+                "Email/get": {
+                    "accountId": "acc1", "state": "s2", "notFound": [],
+                    "list": [
+                        changed_email_json("draft1", &["drafts"], &["$draft"], "me@example.org"),
+                        changed_email_json("sent1", &["sent"], &[], "me@example.org"),
+                        changed_email_json("incoming1", &["inbox"], &[], "alice@example.org")
+                    ]
+                },
+                "Mailbox/get": mailboxes_json()
+            }),
+        )
+        .await;
+
+        let (changed, _) = fetch_changed_emails(&client, "s1").await.unwrap();
+        assert_eq!(changed.len(), 3, "all three are new messages");
+
+        let notified: Vec<&str> = changed
+            .iter()
+            .filter(|email| crate::watcher::skip_reason(email, "me@example.org").is_none())
+            .map(|email| email.summary.id.as_str())
+            .collect();
+        assert_eq!(
+            notified,
+            vec!["incoming1"],
+            "only the incoming message is worth a notification"
+        );
+        // And the reasons are the ones the policy names, so the metric
+        // can tell them apart.
+        let reasons: Vec<crate::watcher::SkipReason> = changed
+            .iter()
+            .filter_map(|email| crate::watcher::skip_reason(email, "me@example.org"))
+            .collect();
+        assert_eq!(
+            reasons,
+            vec![
+                crate::watcher::SkipReason::Draft,
+                crate::watcher::SkipReason::Sent
+            ]
+        );
     }
 
     #[tokio::test]
