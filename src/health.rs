@@ -255,19 +255,6 @@ impl Metrics {
         );
     }
 
-    /// A new message that was not worth a notification, by account kind
-    /// and by the reason it was skipped (a draft, a copy of a sent
-    /// message, a message the account wrote itself, a message already
-    /// read). Both labels are bounded: the kind is one of three
-    /// constants, the reason one of four.
-    pub fn notification_skipped(&self, kind: &str, reason: &str) {
-        self.inc(
-            "jmap2telegram_notifications_skipped_total",
-            "New messages that were not notified about, by the reason they were skipped.",
-            &[("kind", kind), ("reason", reason)],
-        );
-    }
-
     /// A triage action (archive/spam/delete) finished, by action and outcome.
     pub fn triage_action(&self, action: &str, outcome: &str) {
         self.inc(

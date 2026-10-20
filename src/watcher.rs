@@ -5,7 +5,6 @@ use std::time::Duration;
 use futures_util::StreamExt;
 use jmap_client::client::Client as JmapClient;
 use jmap_client::event_source::PushNotification;
-use jmap_client::mailbox::Role;
 use teloxide::prelude::*;
 use teloxide::types::ParseMode;
 
@@ -147,33 +146,6 @@ impl WatchTarget {
             WatchTarget::Extra { label, .. } => {
                 t!("watcher.scope_extra", locale = lang, label = label).to_string()
             }
-        }
-    }
-
-    /// The address this watched account writes from: the one the user
-    /// logged in with for their own mailbox, the shared mailbox's own
-    /// address for a delegated account, the extra account's address
-    /// otherwise.
-    ///
-    /// A message whose sender is this address is one the user wrote
-    /// themselves - so it is not incoming mail, whatever folder it ended
-    /// up in. Deliberately narrow: the account's own address and
-    /// nothing else, so a message that merely comes *from* one of the
-    /// user's aliases is still reported (it is addressed to them, so
-    /// they may not have seen it).
-    pub(crate) fn self_address<'a>(&self, account: &'a crate::store::Account) -> &'a str {
-        match self {
-            WatchTarget::Primary => account.email.as_str(),
-            WatchTarget::Shared { account_id, .. } => account
-                .shared_accounts
-                .get(account_id)
-                .map(|shared| shared.name.as_str())
-                .unwrap_or_default(),
-            WatchTarget::Extra { slot_id, .. } => account
-                .extra_accounts
-                .get(slot_id)
-                .map(|extra| extra.email.as_str())
-                .unwrap_or_default(),
         }
     }
 }
@@ -390,7 +362,7 @@ async fn sync_and_notify(
         return;
     };
 
-    let (changed, new_state) = match jmap::fetch_changed_emails(client, &since_state).await {
+    let (summaries, new_state) = match jmap::fetch_changed_emails(client, &since_state).await {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!(chat_id, error = %e, "failed to sync new emails");
@@ -403,32 +375,14 @@ async fn sync_and_notify(
     state.health.touch(&target.health_key(chat_id));
     state.metrics.watcher_sync();
 
-    let self_address = target.self_address(&account);
-    for email in &changed {
-        // Not every message the account gained is news: a draft the
-        // user is still writing, a copy of a mail they sent, a message
-        // they have already read elsewhere. Announcing those is noise -
-        // the bot reports what arrived, it does not mirror the mailbox.
-        if let Some(reason) = skip_reason(email, self_address) {
-            state
-                .metrics
-                .notification_skipped(target.kind(), reason.label());
-            tracing::debug!(
-                chat_id,
-                reason = reason.label(),
-                "new message skipped, not worth a notification"
-            );
-            continue;
-        }
-
-        if is_muted(&email.summary, &account.muted) {
+    for summary in &summaries {
+        if is_muted(summary, &account.muted) {
             continue;
         }
 
         let lang = state.language_for(chat_id, None);
-        let text = notification_text(&email.summary, state.config.timezone, target.label(), lang);
-        let keyboard =
-            notification_keyboard(&email.summary.id, target.account_id(), false, false, lang);
+        let text = notification_text(summary, state.config.timezone, target.label(), lang);
+        let keyboard = notification_keyboard(&summary.id, target.account_id(), false, false, lang);
         match bot
             .send_message(ChatId(chat_id), text)
             .parse_mode(ParseMode::MarkdownV2)
@@ -446,79 +400,6 @@ async fn sync_and_notify(
     if new_state != since_state {
         target.update_state(&state.store, chat_id, new_state);
     }
-}
-
-/// Why a new message is not worth a notification.
-///
-/// The bot exists to report what arrived, not to mirror the mailbox. A
-/// draft being written, a copy of a message already sent, a message the
-/// user has read in another client - none of that is news, and all of it
-/// used to produce a notification.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SkipReason {
-    /// A draft: a message being composed, either sitting in the Drafts
-    /// folder or carrying RFC 8621's `$draft` keyword.
-    Draft,
-    /// A copy of a message this account sent, in the Sent folder.
-    Sent,
-    /// A message this account wrote: the sender is its own address.
-    OwnMessage,
-    /// A message the user has already read.
-    AlreadyRead,
-}
-
-impl SkipReason {
-    /// The label the skip counter carries. Bounded by construction: one
-    /// of four fixed words, never anything server- or user-chosen (an
-    /// address, a subject or a message id would make the metric's
-    /// cardinality unbounded).
-    fn label(&self) -> &'static str {
-        match self {
-            SkipReason::Draft => "draft",
-            SkipReason::Sent => "sent",
-            SkipReason::OwnMessage => "own",
-            SkipReason::AlreadyRead => "seen",
-        }
-    }
-}
-
-/// Whether a new message deserves a notification, and why not when it
-/// doesn't.
-///
-/// `self_address` is the address the watched account writes from (see
-/// [`WatchTarget::self_address`]): a message whose sender is that
-/// address is one the user wrote themselves.
-pub(crate) fn skip_reason(changed: &jmap::ChangedEmail, self_address: &str) -> Option<SkipReason> {
-    // A draft is never incoming mail. Both signals are checked because
-    // servers differ: the folder role says where the message is, the
-    // keyword says what it is - a client may file a draft outside the
-    // Drafts folder, and a server may leave the keyword off.
-    if changed.mailbox_roles.contains(&Role::Drafts)
-        || changed.keywords.iter().any(|keyword| keyword == "$draft")
-    {
-        return Some(SkipReason::Draft);
-    }
-    // The copy a client files when a message goes out.
-    if changed.mailbox_roles.contains(&Role::Sent) {
-        return Some(SkipReason::Sent);
-    }
-    // A message the user wrote, wherever the client filed its outgoing
-    // copy (a Sent folder the account gave no role to, an archive, ...).
-    if !self_address.is_empty()
-        && changed
-            .summary
-            .from_addr
-            .as_deref()
-            .is_some_and(|from| from.eq_ignore_ascii_case(self_address))
-    {
-        return Some(SkipReason::OwnMessage);
-    }
-    // Already read: the user has seen it in another client, so
-    // announcing it now would be noise.
-    if changed.keywords.iter().any(|keyword| keyword == "$seen") {
-        return Some(SkipReason::AlreadyRead);
-    }
-    None
 }
 
 /// Whether a `/mute`d term (already lowercased) appears in this message's
@@ -865,189 +746,6 @@ mod tests {
             received_at: None,
             attachments: Vec::new(),
         }
-    }
-
-    /// A message the account gained, as `jmap::fetch_changed_emails`
-    /// hands it over: the summary plus the facts the notification
-    /// decision reads.
-    fn changed(
-        from_addr: Option<&str>,
-        roles: Vec<Role>,
-        keywords: Vec<&str>,
-    ) -> jmap::ChangedEmail {
-        jmap::ChangedEmail {
-            summary: summary("Hello", None, from_addr),
-            mailbox_roles: roles,
-            keywords: keywords.into_iter().map(str::to_string).collect(),
-        }
-    }
-
-    #[test]
-    fn a_draft_is_never_notified() {
-        // The bug this whole policy exists for: the user is writing a
-        // mail, the client saves it as a draft, and the draft is a new
-        // Email object - indistinguishable from an incoming message
-        // unless the folder and the keyword are looked at.
-        assert_eq!(
-            skip_reason(
-                &changed(Some("me@example.org"), vec![Role::Drafts], vec!["$draft"]),
-                "me@example.org"
-            ),
-            Some(SkipReason::Draft)
-        );
-    }
-
-    #[test]
-    fn the_draft_keyword_alone_is_enough() {
-        // Servers differ: some file drafts outside the Drafts folder,
-        // but RFC 8621's $draft keyword marks them either way.
-        assert_eq!(
-            skip_reason(
-                &changed(Some("me@example.org"), vec![Role::None], vec!["$draft"]),
-                "me@example.org"
-            ),
-            Some(SkipReason::Draft)
-        );
-    }
-
-    #[test]
-    fn a_copy_of_a_sent_message_is_not_notified() {
-        // Sending a mail files a copy of it in the Sent folder: a new
-        // Email object, and one the user has already seen.
-        assert_eq!(
-            skip_reason(
-                &changed(Some("me@example.org"), vec![Role::Sent], vec![]),
-                "me@example.org"
-            ),
-            Some(SkipReason::Sent)
-        );
-    }
-
-    #[test]
-    fn a_message_the_account_sent_itself_is_not_notified() {
-        // Wherever a client files its own outgoing copy - a Sent
-        // folder the account gave no role to, an archive, anything -
-        // the sender is the account's own address.
-        assert_eq!(
-            skip_reason(
-                &changed(Some("me@example.org"), vec![Role::None], vec![]),
-                "me@example.org"
-            ),
-            Some(SkipReason::OwnMessage)
-        );
-    }
-
-    #[test]
-    fn the_own_address_comparison_ignores_case() {
-        // Addresses are case-insensitive in practice; a server or
-        // client that capitalizes them must not smuggle a notification
-        // through.
-        assert_eq!(
-            skip_reason(
-                &changed(Some("Me@Example.ORG"), vec![Role::None], vec![]),
-                "me@example.org"
-            ),
-            Some(SkipReason::OwnMessage)
-        );
-    }
-
-    #[test]
-    fn an_already_read_message_is_not_notified() {
-        // The user has seen it - in another client, while the bot was
-        // reconnecting. Telling them about it now is noise.
-        assert_eq!(
-            skip_reason(
-                &changed(Some("alice@example.org"), vec![Role::Inbox], vec!["$seen"]),
-                "me@example.org"
-            ),
-            Some(SkipReason::AlreadyRead)
-        );
-    }
-
-    #[test]
-    fn incoming_unread_mail_is_notified() {
-        assert_eq!(
-            skip_reason(
-                &changed(Some("alice@example.org"), vec![Role::Inbox], vec![]),
-                "me@example.org"
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn a_message_from_someone_else_in_a_role_less_folder_is_notified() {
-        // A filing rule moved it out of the Inbox: it is still incoming
-        // mail, and the user never saw it.
-        assert_eq!(
-            skip_reason(
-                &changed(Some("alice@example.org"), vec![Role::None], vec![]),
-                "me@example.org"
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn an_unknown_sender_is_not_mistaken_for_the_account_itself() {
-        // No sender at all (a malformed message) must not trip the
-        // "written by me" rule.
-        assert_eq!(
-            skip_reason(&changed(None, vec![Role::Inbox], vec![]), "me@example.org"),
-            None
-        );
-    }
-
-    #[test]
-    fn the_self_address_follows_the_watched_target() {
-        let acc = account();
-        assert_eq!(WatchTarget::Primary.self_address(&acc), "a@b.c");
-        assert_eq!(
-            WatchTarget::Shared {
-                account_id: "acc7".to_string(),
-                label: "shared@b.c".to_string(),
-            }
-            .self_address(&acc),
-            "shared@b.c"
-        );
-        assert_eq!(
-            WatchTarget::Extra {
-                slot_id: "slot1".to_string(),
-                label: "second@other.example".to_string(),
-            }
-            .self_address(&acc),
-            "second@other.example"
-        );
-        // A target whose account is gone has no address to compare
-        // against - and must not fall back to another account's.
-        assert_eq!(
-            WatchTarget::Shared {
-                account_id: "gone".to_string(),
-                label: "gone@b.c".to_string(),
-            }
-            .self_address(&acc),
-            ""
-        );
-    }
-
-    #[test]
-    fn skip_reasons_carry_bounded_metric_labels() {
-        // The label ends up in a Prometheus metric: it has to be one of
-        // a fixed set, never a message id, an address or a subject.
-        let labels = [
-            SkipReason::Draft.label(),
-            SkipReason::Sent.label(),
-            SkipReason::OwnMessage.label(),
-            SkipReason::AlreadyRead.label(),
-        ];
-        for label in labels {
-            assert!(!label.is_empty());
-            assert!(
-                label.chars().all(|c| c.is_ascii_lowercase()),
-                "{label} must be a plain lowercase word"
-            );
-        }
-        assert_eq!(labels.len(), 4, "the set of reasons is fixed");
     }
 
     #[test]
