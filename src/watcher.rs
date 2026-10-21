@@ -406,9 +406,9 @@ async fn sync_and_notify(
     let self_address = target.self_address(&account);
     for email in &changed {
         // Not every message the account gained is news: a draft the
-        // user is still writing, a copy of a mail they sent, a message
-        // they have already read elsewhere. Announcing those is noise -
-        // the bot reports what arrived, it does not mirror the mailbox.
+        // user is still writing, a copy of a mail they sent. Announcing
+        // those is noise - the bot reports what arrived, it does not
+        // mirror the mailbox.
         if let Some(reason) = skip_reason(email, self_address) {
             state
                 .metrics
@@ -451,9 +451,9 @@ async fn sync_and_notify(
 /// Why a new message is not worth a notification.
 ///
 /// The bot exists to report what arrived, not to mirror the mailbox. A
-/// draft being written, a copy of a message already sent, a message the
-/// user has read in another client - none of that is news, and all of it
-/// used to produce a notification.
+/// draft being written and a copy of a message already sent are the
+/// user's own output, not news - and both used to produce a
+/// notification.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SkipReason {
     /// A draft: a message being composed, either sitting in the Drafts
@@ -463,13 +463,11 @@ pub enum SkipReason {
     Sent,
     /// A message this account wrote: the sender is its own address.
     OwnMessage,
-    /// A message the user has already read.
-    AlreadyRead,
 }
 
 impl SkipReason {
     /// The label the skip counter carries. Bounded by construction: one
-    /// of four fixed words, never anything server- or user-chosen (an
+    /// of three fixed words, never anything server- or user-chosen (an
     /// address, a subject or a message id would make the metric's
     /// cardinality unbounded).
     fn label(&self) -> &'static str {
@@ -477,7 +475,6 @@ impl SkipReason {
             SkipReason::Draft => "draft",
             SkipReason::Sent => "sent",
             SkipReason::OwnMessage => "own",
-            SkipReason::AlreadyRead => "seen",
         }
     }
 }
@@ -488,6 +485,11 @@ impl SkipReason {
 /// `self_address` is the address the watched account writes from (see
 /// [`WatchTarget::self_address`]): a message whose sender is that
 /// address is one the user wrote themselves.
+///
+/// The read state is deliberately not part of the decision: a mailbox
+/// is an inbox, so everything that lands in it was received, and the
+/// user wants to know about it whether or not another client got to it
+/// first. `$seen` says "someone read this", not "this is not for you".
 pub(crate) fn skip_reason(changed: &jmap::ChangedEmail, self_address: &str) -> Option<SkipReason> {
     // A draft is never incoming mail. Both signals are checked because
     // servers differ: the folder role says where the message is, the
@@ -512,11 +514,6 @@ pub(crate) fn skip_reason(changed: &jmap::ChangedEmail, self_address: &str) -> O
             .is_some_and(|from| from.eq_ignore_ascii_case(self_address))
     {
         return Some(SkipReason::OwnMessage);
-    }
-    // Already read: the user has seen it in another client, so
-    // announcing it now would be noise.
-    if changed.keywords.iter().any(|keyword| keyword == "$seen") {
-        return Some(SkipReason::AlreadyRead);
     }
     None
 }
@@ -952,15 +949,30 @@ mod tests {
     }
 
     #[test]
-    fn an_already_read_message_is_not_notified() {
-        // The user has seen it - in another client, while the bot was
-        // reconnecting. Telling them about it now is noise.
+    fn an_already_read_message_is_still_notified() {
+        // A mailbox is an inbox: everything that lands in it was
+        // received, and the user wants to know about it - whether or not
+        // another client got to it first. The $seen keyword is the
+        // server's own "someone read this", not "this is not for you".
         assert_eq!(
             skip_reason(
                 &changed(Some("alice@example.org"), vec![Role::Inbox], vec!["$seen"]),
                 "me@example.org"
             ),
-            Some(SkipReason::AlreadyRead)
+            None
+        );
+    }
+
+    #[test]
+    fn an_already_read_message_in_a_draft_folder_is_still_not_notified() {
+        // The read state never overrules what the message *is*: a
+        // draft is a draft, read or not.
+        assert_eq!(
+            skip_reason(
+                &changed(Some("me@example.org"), vec![Role::Drafts], vec!["$seen"]),
+                "me@example.org"
+            ),
+            Some(SkipReason::Draft)
         );
     }
 
@@ -1038,7 +1050,6 @@ mod tests {
             SkipReason::Draft.label(),
             SkipReason::Sent.label(),
             SkipReason::OwnMessage.label(),
-            SkipReason::AlreadyRead.label(),
         ];
         for label in labels {
             assert!(!label.is_empty());
@@ -1047,7 +1058,7 @@ mod tests {
                 "{label} must be a plain lowercase word"
             );
         }
-        assert_eq!(labels.len(), 4, "the set of reasons is fixed");
+        assert_eq!(labels.len(), 3, "the set of reasons is fixed");
     }
 
     #[test]
