@@ -1,6 +1,6 @@
 [package]
 name = "jmap2telegram"
-version = "0.9.1"
+version = "0.10.0"
 edition = "2024"
 # Not a library and not on crates.io: the license below is a custom text, so
 # an accidental `cargo publish` is already impossible - but say so here
