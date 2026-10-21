@@ -276,17 +276,15 @@ that are genuinely news reach the chat:
 
 | Message | Notified? | Why |
 |---------|-----------|-----|
-| A mail that arrived, unread | yes | the case the bot exists for |
+| A mail that arrived | yes | the case the bot exists for - read or not, a mailbox is an inbox: everything that lands in it was received, and you want to know about it even if another client got to it first |
 | A draft being written | no | it is a message *you* are composing, not one you received - and a webmail client saves a new draft on every auto-save, so this used to produce one notification per keystroke-batch |
 | A copy of a mail you sent | no | it is filed in the Sent folder, or sent from your own address |
-| A mail you already read elsewhere | no | you have seen it; announcing it again is noise |
 
 The classification reads the server's own truth - the mailbox roles
-(`Drafts`, `Sent`, ...), the RFC 8621 `$draft`/`$seen` keywords, and the
-sender - so it does not depend on the folder a provider happens to use.
-A filing rule that moves your incoming mail out of the Inbox does not
-silence it: the filter only removes what you wrote, or what you have
-already seen.
+(`Drafts`, `Sent`, ...), the RFC 8621 `$draft` keyword, and the sender
+- so it does not depend on the folder a provider happens to use. A
+filing rule that moves your incoming mail out of the Inbox does not
+silence it: the filter only removes what you wrote.
 
 `/mute` still applies on top of that, per sender or keyword, and the
 sync cursor moves past a skipped message either way - it is never
@@ -368,7 +366,7 @@ connection/sync gauges (`jmap2telegram_watchers_registered`,
 delivered notifications, send errors, triage actions, mark-as-read and
 undos. One more counter, `jmap2telegram_notifications_skipped_total{kind=…,reason=…}`,
 counts the new messages that were *not* announced - `reason` being one of
-`draft`, `sent`, `own` or `seen` (see
+`draft`, `sent` or `own` (see
 [What gets notified](#what-gets-notified)). Every label is bounded and
 bot-generated - no email address, subject or message id ever becomes a
 metric label, so cardinality stays flat regardless of traffic.

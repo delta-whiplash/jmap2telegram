@@ -1549,7 +1549,7 @@ mod tests {
                 "Email/changes": {
                     "accountId": "acc1", "oldState": "s1", "newState": "s2",
                     "hasMoreChanges": false,
-                    "created": ["draft1", "sent1", "incoming1"],
+                    "created": ["draft1", "sent1", "incoming1", "read1"],
                     "updated": [], "destroyed": []
                 },
                 "Email/get": {
@@ -1557,7 +1557,10 @@ mod tests {
                     "list": [
                         changed_email_json("draft1", &["drafts"], &["$draft"], "me@example.org"),
                         changed_email_json("sent1", &["sent"], &[], "me@example.org"),
-                        changed_email_json("incoming1", &["inbox"], &[], "alice@example.org")
+                        changed_email_json("incoming1", &["inbox"], &[], "alice@example.org"),
+                        // Already read in another client, but it landed in
+                        // the inbox: it was received, so it is announced.
+                        changed_email_json("read1", &["inbox"], &["$seen"], "alice@example.org")
                     ]
                 },
                 "Mailbox/get": mailboxes_json()
@@ -1566,7 +1569,7 @@ mod tests {
         .await;
 
         let (changed, _) = fetch_changed_emails(&client, "s1").await.unwrap();
-        assert_eq!(changed.len(), 3, "all three are new messages");
+        assert_eq!(changed.len(), 4, "all four are new messages");
 
         let notified: Vec<&str> = changed
             .iter()
@@ -1575,8 +1578,8 @@ mod tests {
             .collect();
         assert_eq!(
             notified,
-            vec!["incoming1"],
-            "only the incoming message is worth a notification"
+            vec!["incoming1", "read1"],
+            "only the incoming messages are worth a notification"
         );
         // And the reasons are the ones the policy names, so the metric
         // can tell them apart.
