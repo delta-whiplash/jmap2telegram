@@ -9,14 +9,15 @@ use tokio::task::JoinHandle;
 use crate::config::Config;
 use crate::store::Store;
 
-/// (chat id, JMAP account id): identifies one of a chat's opted-in shared
-/// accounts, distinct from its own mailbox (which only needs the chat id).
-type SharedAccountKey = (i64, String);
+/// (chat id, slot id): identifies one of a chat's connected JMAP accounts.
+pub type AccountKey = (i64, String);
 
-/// (chat id, our own generated slot id): identifies one of a chat's extra,
-/// fully independent JMAP accounts. A separate key space from
-/// `SharedAccountKey` on purpose - see `store::Account::extra_accounts`.
-type ExtraAccountKey = (i64, String);
+/// (chat id, JMAP account id): identifies one of a chat's opted-in shared accounts.
+pub type SharedAccountKey = (i64, String);
+
+/// Backward-compatible alias for `AccountKey`.
+#[allow(dead_code)]
+pub type ExtraAccountKey = AccountKey;
 
 /// How long `/undo` (the "↩️ Annuler" button left after a triage action)
 /// stays valid. Deliberately short and in-memory only: this is a "catch an
@@ -55,24 +56,12 @@ pub struct AppState {
     pub health: Arc<crate::health::Health>,
     /// Application counters/gauges rendered by /metrics (see health.rs).
     pub metrics: Arc<crate::health::Metrics>,
-    /// Live JMAP clients for each chat's own mailbox, keyed by chat id,
-    /// shared between the watcher tasks and the inline-button handlers so
-    /// an action doesn't need a fresh session negotiation every time.
-    pub clients: Arc<RwLock<HashMap<i64, Arc<JmapClient>>>>,
-    pub watchers: Arc<RwLock<HashMap<i64, JoinHandle<()>>>>,
-    /// Same as `clients`/`watchers` but for opted-in shared JMAP accounts.
-    /// These need their own `Client` per account: `jmap-client` tracks one
-    /// default account per `Client`, and mutating a shared `Arc<Client>`'s
-    /// default account out from under concurrent tasks would race.
+    /// Live JMAP clients for connected personal accounts, keyed by (chat_id, slot_id).
+    pub account_clients: Arc<RwLock<HashMap<AccountKey, Arc<JmapClient>>>>,
+    pub account_watchers: Arc<RwLock<HashMap<AccountKey, JoinHandle<()>>>>,
+    /// Same as `account_clients`/`account_watchers` but for opted-in shared JMAP accounts.
     pub shared_clients: Arc<RwLock<HashMap<SharedAccountKey, Arc<JmapClient>>>>,
     pub shared_watchers: Arc<RwLock<HashMap<SharedAccountKey, JoinHandle<()>>>>,
-    /// Same idea again, for extra fully independent personal accounts
-    /// (their own server/token, added via `/comptes`) - kept in maps of
-    /// their own rather than reusing `shared_clients`/`shared_watchers` so
-    /// a shared-account JMAP id can never collide with a generated extra-
-    /// account slot id in the same cache.
-    pub extra_clients: Arc<RwLock<HashMap<ExtraAccountKey, Arc<JmapClient>>>>,
-    pub extra_watchers: Arc<RwLock<HashMap<ExtraAccountKey, JoinHandle<()>>>>,
     /// One pending `/undo` slot per chat. In-memory only, never persisted:
     /// this is a short-lived safety net for an accidental tap, not
     /// durable state anything depends on surviving a restart.
@@ -86,12 +75,10 @@ impl AppState {
             store,
             health: Arc::new(crate::health::Health::default()),
             metrics: Arc::new(crate::health::Metrics::new()),
-            clients: Arc::new(RwLock::new(HashMap::new())),
-            watchers: Arc::new(RwLock::new(HashMap::new())),
+            account_clients: Arc::new(RwLock::new(HashMap::new())),
+            account_watchers: Arc::new(RwLock::new(HashMap::new())),
             shared_clients: Arc::new(RwLock::new(HashMap::new())),
             shared_watchers: Arc::new(RwLock::new(HashMap::new())),
-            extra_clients: Arc::new(RwLock::new(HashMap::new())),
-            extra_watchers: Arc::new(RwLock::new(HashMap::new())),
             pending_undo: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -123,10 +110,7 @@ impl AppState {
         )
     }
 
-    /// Shared cache-lookup step for every `client_for*` method below: all
-    /// three follow the same "already cached? return it - otherwise the
-    /// caller resolves credentials and connects" shape, differing only in
-    /// which map and key type they use.
+    /// Shared cache-lookup step for every `client_for*` method below.
     async fn cached<K: Eq + std::hash::Hash>(
         cache: &RwLock<HashMap<K, Arc<JmapClient>>>,
         key: &K,
@@ -146,33 +130,74 @@ impl AppState {
         client
     }
 
-    /// Returns a live client for this chat's own mailbox, reconnecting from
-    /// the stored credentials if none is cached yet (e.g. after a fresh
-    /// reconnect following a bot restart, before the watcher has
-    /// re-established it).
-    pub async fn client_for(&self, chat_id: i64) -> anyhow::Result<Option<Arc<JmapClient>>> {
-        if let Some(client) = Self::cached(&self.clients, &chat_id).await {
+    /// Returns a live client for a specific account slot.
+    pub async fn client_for_account(
+        &self,
+        chat_id: i64,
+        slot_id: &str,
+    ) -> anyhow::Result<Option<Arc<JmapClient>>> {
+        let key = (chat_id, slot_id.to_string());
+        if let Some(client) = Self::cached(&self.account_clients, &key).await {
             return Ok(Some(client));
         }
 
         let Some(account) = self.store.get(chat_id) else {
             return Ok(None);
         };
+        let Some(slot) = account.accounts.get(slot_id) else {
+            return Ok(None);
+        };
 
         let client = crate::jmap::connect(
-            &account.server_url,
-            &account.token,
+            &slot.server_url,
+            &slot.token,
             self.config.allow_private_jmap_hosts,
         )
         .await?;
-        Ok(Some(Self::cache_new(&self.clients, chat_id, client).await))
+        Ok(Some(
+            Self::cache_new(&self.account_clients, key, client).await,
+        ))
     }
 
-    /// Same as `client_for`, but for one of the chat's opted-in shared JMAP
-    /// accounts. Returns `None` both when the chat has no primary account
-    /// and when it hasn't (or no longer) opted into this specific shared
-    /// account, e.g. a stale inline button tapped after the account was
-    /// toggled off.
+    /// Returns a live client for this chat's first/default mailbox.
+    pub async fn client_for(&self, chat_id: i64) -> anyhow::Result<Option<Arc<JmapClient>>> {
+        let Some(account) = self.store.get(chat_id) else {
+            return Ok(None);
+        };
+        let Some(slot) = account.primary_slot() else {
+            return Ok(None);
+        };
+        self.client_for_account(chat_id, &slot.slot_id).await
+    }
+
+    /// Returns all live clients for all connected accounts of this chat.
+    pub async fn all_clients_for_chat(
+        &self,
+        chat_id: i64,
+    ) -> anyhow::Result<Vec<(crate::store::AccountSlot, Arc<JmapClient>)>> {
+        let Some(account) = self.store.get(chat_id) else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::new();
+        for (slot_id, slot) in &account.accounts {
+            if let Some(client) = self.client_for_account(chat_id, slot_id).await? {
+                out.push((slot.clone(), client));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Same as `client_for_account`, kept for backward compatibility.
+    #[allow(dead_code)]
+    pub async fn client_for_extra(
+        &self,
+        chat_id: i64,
+        slot_id: &str,
+    ) -> anyhow::Result<Option<Arc<JmapClient>>> {
+        self.client_for_account(chat_id, slot_id).await
+    }
+
+    /// Same as `client_for`, but for one of the chat's opted-in shared JMAP accounts.
     pub async fn client_for_shared(
         &self,
         chat_id: i64,
@@ -190,17 +215,13 @@ impl AppState {
             return Ok(None);
         };
 
-        let (server_url, token) = match &shared.parent_slot {
-            None => (&account.server_url, &account.token),
-            Some(slot_id) => match account.extra_accounts.get(slot_id) {
-                Some(extra) => (&extra.server_url, &extra.token),
-                None => return Ok(None),
-            },
+        let Some(slot) = account.resolve_parent_slot(shared) else {
+            return Ok(None);
         };
 
         let client = crate::jmap::connect_shared(
-            server_url,
-            token,
+            &slot.server_url,
+            &slot.token,
             self.config.allow_private_jmap_hosts,
             account_id,
         )
@@ -210,70 +231,19 @@ impl AppState {
         ))
     }
 
-    /// Same as `client_for_shared`, but for one of the chat's extra, fully
-    /// independent personal accounts (its own server/token). Returns
-    /// `None` both when the chat has no primary account and when this
-    /// slot id no longer names a connected extra account.
-    pub async fn client_for_extra(
-        &self,
-        chat_id: i64,
-        slot_id: &str,
-    ) -> anyhow::Result<Option<Arc<JmapClient>>> {
-        let key = (chat_id, slot_id.to_string());
-        if let Some(client) = Self::cached(&self.extra_clients, &key).await {
-            return Ok(Some(client));
-        }
-
-        let Some(account) = self.store.get(chat_id) else {
-            return Ok(None);
-        };
-        let Some(extra) = account.extra_accounts.get(slot_id) else {
-            return Ok(None);
-        };
-
-        let client = crate::jmap::connect(
-            &extra.server_url,
-            &extra.token,
-            self.config.allow_private_jmap_hosts,
-        )
-        .await?;
-        Ok(Some(
-            Self::cache_new(&self.extra_clients, key, client).await,
-        ))
-    }
-
-    /// Tears down everything for a chat: its own mailbox watcher/client and
-    /// every shared/extra-account watcher/client. Used on /logout and
-    /// before re-establishing a fresh connection on /login, so a stale
-    /// watcher never keeps running under an id that's since been reused or
-    /// removed.
+    /// Tears down everything for a chat: all account watchers and clients,
+    /// and all shared-account watchers and clients.
     pub async fn forget(&self, chat_id: i64) {
-        self.clients.write().await.remove(&chat_id);
-        if let Some(handle) = self.watchers.write().await.remove(&chat_id) {
-            handle.abort();
-        }
         self.pending_undo.write().await.remove(&chat_id);
         self.refresh_undo_gauge().await;
 
-        // `abort()` cancels a watcher task at its next await point, so it
-        // never gets to run its own registry cleanup (the deregister on
-        // its clean-exit path). Without this sweep, the entry
-        // `watcher::spawn` registered would outlive the task forever and
-        // leak in the health registry for an account nobody is watching
-        // anymore. One prefix sweep covers the primary mailbox, every
-        // shared and every extra slot, *and* targets that hold a registry
-        // entry but no live handle to iterate over here - e.g. a
-        // boot-resume still waiting out its retry backoff (see accounts.rs).
         self.health.deregister_chat(chat_id);
 
+        Self::forget_all_for_chat(&self.account_clients, &self.account_watchers, chat_id).await;
         Self::forget_all_for_chat(&self.shared_clients, &self.shared_watchers, chat_id).await;
-        Self::forget_all_for_chat(&self.extra_clients, &self.extra_watchers, chat_id).await;
     }
 
-    /// Drops every cached client and aborts every watcher belonging to
-    /// `chat_id` from a (client-map, watcher-map) pair keyed by `(chat_id,
-    /// _)` - the shared bulk-teardown step `forget` needs once per account
-    /// kind (shared accounts, extra accounts).
+    /// Drops every cached client and aborts every watcher belonging to `chat_id`.
     async fn forget_all_for_chat<K>(
         clients: &RwLock<HashMap<(i64, K), Arc<JmapClient>>>,
         watchers: &RwLock<HashMap<(i64, K), JoinHandle<()>>>,
@@ -292,34 +262,39 @@ impl AppState {
         });
     }
 
-    /// Tears down just one shared account's watcher/client, leaving the
-    /// chat's own mailbox and its other shared accounts untouched. Used
-    /// when a single shared account is toggled off via /partages.
+    /// Tears down just one account's watcher/client, as well as any child shared accounts.
+    pub async fn forget_account(&self, chat_id: i64, slot_id: &str) {
+        self.health
+            .deregister(&crate::watcher::account_health_key(chat_id, slot_id));
+        let key = (chat_id, slot_id.to_string());
+        self.account_clients.write().await.remove(&key);
+        if let Some(handle) = self.account_watchers.write().await.remove(&key) {
+            handle.abort();
+        }
+
+        // Also tear down any child shared accounts that were authorized under this slot
+        if let Some(account) = self.store.get(chat_id) {
+            for (account_id, shared) in &account.shared_accounts {
+                if shared.is_child_of(slot_id) {
+                    self.forget_shared(chat_id, account_id).await;
+                }
+            }
+        }
+    }
+
+    /// Backward-compatible alias for `forget_account`.
+    #[allow(dead_code)]
+    pub async fn forget_extra(&self, chat_id: i64, slot_id: &str) {
+        self.forget_account(chat_id, slot_id).await;
+    }
+
+    /// Tears down just one shared account's watcher/client.
     pub async fn forget_shared(&self, chat_id: i64, account_id: &str) {
-        // Same deregister obligation as `forget` above - an aborted
-        // watcher task can't clean up after itself - keyed exactly like
-        // `watcher::spawn` keys it, and unconditional on purpose: the
-        // entry exists (registered by the watcher, or at boot before its
-        // first connect attempt) even when no handle sits in the map
-        // below, so deregistering only on abort would leak exactly those.
         self.health
             .deregister(&crate::watcher::shared_health_key(chat_id, account_id));
         let key = (chat_id, account_id.to_string());
         self.shared_clients.write().await.remove(&key);
         if let Some(handle) = self.shared_watchers.write().await.remove(&key) {
-            handle.abort();
-        }
-    }
-
-    /// Tears down just one extra account's watcher/client. Used when it's
-    /// disconnected via /comptes.
-    pub async fn forget_extra(&self, chat_id: i64, slot_id: &str) {
-        // Same deregister obligation as `forget_shared` above.
-        self.health
-            .deregister(&crate::watcher::extra_health_key(chat_id, slot_id));
-        let key = (chat_id, slot_id.to_string());
-        self.extra_clients.write().await.remove(&key);
-        if let Some(handle) = self.extra_watchers.write().await.remove(&key) {
             handle.abort();
         }
     }
@@ -398,14 +373,18 @@ mod tests {
         state.health.register(&WatchTarget::Primary.health_key(43));
 
         // Live handles, as running watchers would have left behind.
-        state.watchers.write().await.insert(42, parked_handle());
+        state
+            .account_watchers
+            .write()
+            .await
+            .insert((42, "default".to_string()), parked_handle());
         state
             .shared_watchers
             .write()
             .await
             .insert((42, "acc7".to_string()), parked_handle());
         state
-            .extra_watchers
+            .account_watchers
             .write()
             .await
             .insert((42, "slot1".to_string()), parked_handle());
@@ -419,9 +398,8 @@ mod tests {
         assert!(snapshot.contains_key("43/primary"), "{snapshot:?}");
         // The watcher maps went with it, so a later forget is a no-op
         // rather than an abort of a stale handle.
-        assert!(state.watchers.read().await.is_empty());
+        assert!(state.account_watchers.read().await.is_empty());
         assert!(state.shared_watchers.read().await.is_empty());
-        assert!(state.extra_watchers.read().await.is_empty());
     }
 
     #[tokio::test]
@@ -484,7 +462,7 @@ mod tests {
         // No handle for slot1 here on purpose: the deregister must not
         // depend on there being a watcher to abort.
         state
-            .extra_watchers
+            .account_watchers
             .write()
             .await
             .insert((42, "slot1".to_string()), parked_handle());
@@ -495,5 +473,46 @@ mod tests {
         assert!(!snapshot.contains_key("42/extra-slot1"), "{snapshot:?}");
         assert!(snapshot.contains_key("42/primary"), "{snapshot:?}");
         assert!(snapshot.contains_key("42/shared-acc7"), "{snapshot:?}");
+    }
+
+    #[tokio::test]
+    async fn forget_default_account_cleans_up_shared_watchers_with_none_parent_slot() {
+        let (state, _dir) = test_state().await;
+        let mut acc = crate::store::Account::new(
+            "https://127.0.0.1:9".to_string(),
+            "tok".to_string(),
+            "user@example.org".to_string(),
+        );
+        acc.shared_accounts.insert(
+            "acc7".to_string(),
+            crate::store::SharedAccount {
+                name: "shared@example.org".to_string(),
+                last_state: None,
+                parent_slot: None,
+            },
+        );
+        state.store.set(42, acc).unwrap();
+
+        state
+            .account_watchers
+            .write()
+            .await
+            .insert((42, "default".to_string()), parked_handle());
+        state
+            .shared_watchers
+            .write()
+            .await
+            .insert((42, "acc7".to_string()), parked_handle());
+
+        state.forget_account(42, "default").await;
+
+        assert!(
+            state.account_watchers.read().await.is_empty(),
+            "default account watcher should be removed"
+        );
+        assert!(
+            state.shared_watchers.read().await.is_empty(),
+            "child shared watcher should be removed when default account is forgotten"
+        );
     }
 }

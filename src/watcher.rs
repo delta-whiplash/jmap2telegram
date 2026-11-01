@@ -46,23 +46,35 @@ const FAILURE_NOTIFY_THRESHOLD: u32 = 5;
 /// that needs to read/write the right cursor in the store, decide when to
 /// stop, and label/route notifications so an action button lands on a
 /// JMAP client connected to the right account.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WatchTarget {
+    #[allow(dead_code)]
     Primary,
-    Shared { account_id: String, label: String },
-    Extra { slot_id: String, label: String },
+    Shared {
+        account_id: String,
+        label: String,
+    },
+    #[allow(dead_code)]
+    Extra {
+        slot_id: String,
+        label: String,
+    },
+    Account {
+        slot_id: String,
+        label: String,
+    },
 }
 
 impl WatchTarget {
     fn since_state(&self, account: &crate::store::Account) -> Option<String> {
         match self {
-            WatchTarget::Primary => account.last_state.clone(),
+            WatchTarget::Primary => account.last_state().map(str::to_string),
             WatchTarget::Shared { account_id, .. } => account
                 .shared_accounts
                 .get(account_id)
                 .and_then(|s| s.last_state.clone()),
-            WatchTarget::Extra { slot_id, .. } => account
-                .extra_accounts
+            WatchTarget::Extra { slot_id, .. } | WatchTarget::Account { slot_id, .. } => account
+                .accounts
                 .get(slot_id)
                 .and_then(|e| e.last_state.clone()),
         }
@@ -74,11 +86,13 @@ impl WatchTarget {
     /// happened while we were waiting.
     pub(crate) fn still_active(&self, account: &crate::store::Account) -> bool {
         match self {
-            WatchTarget::Primary => true,
+            WatchTarget::Primary => !account.accounts.is_empty(),
             WatchTarget::Shared { account_id, .. } => {
                 account.shared_accounts.contains_key(account_id)
             }
-            WatchTarget::Extra { slot_id, .. } => account.extra_accounts.contains_key(slot_id),
+            WatchTarget::Extra { slot_id, .. } | WatchTarget::Account { slot_id, .. } => {
+                account.accounts.contains_key(slot_id)
+            }
         }
     }
 
@@ -88,8 +102,8 @@ impl WatchTarget {
             WatchTarget::Shared { account_id, .. } => {
                 store.update_shared_account_state(chat_id, account_id, new_state)
             }
-            WatchTarget::Extra { slot_id, .. } => {
-                store.update_extra_account_state(chat_id, slot_id, new_state)
+            WatchTarget::Extra { slot_id, .. } | WatchTarget::Account { slot_id, .. } => {
+                store.update_account_state(chat_id, slot_id, new_state)
             }
         };
         if let Err(e) = result {
@@ -101,14 +115,18 @@ impl WatchTarget {
         match self {
             WatchTarget::Primary => None,
             WatchTarget::Shared { account_id, .. } => Some(account_id),
-            WatchTarget::Extra { slot_id, .. } => Some(slot_id),
+            WatchTarget::Extra { slot_id, .. } | WatchTarget::Account { slot_id, .. } => {
+                Some(slot_id)
+            }
         }
     }
 
     fn label(&self) -> Option<&str> {
         match self {
             WatchTarget::Primary => None,
-            WatchTarget::Shared { label, .. } | WatchTarget::Extra { label, .. } => Some(label),
+            WatchTarget::Shared { label, .. }
+            | WatchTarget::Extra { label, .. }
+            | WatchTarget::Account { label, .. } => Some(label),
         }
     }
 
@@ -120,7 +138,7 @@ impl WatchTarget {
         match self {
             WatchTarget::Primary => "primary",
             WatchTarget::Shared { .. } => "shared",
-            WatchTarget::Extra { .. } => "extra",
+            WatchTarget::Extra { .. } | WatchTarget::Account { .. } => "extra",
         }
     }
 
@@ -132,7 +150,9 @@ impl WatchTarget {
         match self {
             WatchTarget::Primary => format!("{chat_id}/primary"),
             WatchTarget::Shared { account_id, .. } => format!("{chat_id}/shared-{account_id}"),
-            WatchTarget::Extra { slot_id, .. } => format!("{chat_id}/extra-{slot_id}"),
+            WatchTarget::Extra { slot_id, .. } | WatchTarget::Account { slot_id, .. } => {
+                account_health_key(chat_id, slot_id)
+            }
         }
     }
 
@@ -144,7 +164,7 @@ impl WatchTarget {
             WatchTarget::Shared { label, .. } => {
                 t!("watcher.scope_shared", locale = lang, label = label).to_string()
             }
-            WatchTarget::Extra { label, .. } => {
+            WatchTarget::Extra { label, .. } | WatchTarget::Account { label, .. } => {
                 t!("watcher.scope_extra", locale = lang, label = label).to_string()
             }
         }
@@ -154,23 +174,16 @@ impl WatchTarget {
     /// logged in with for their own mailbox, the shared mailbox's own
     /// address for a delegated account, the extra account's address
     /// otherwise.
-    ///
-    /// A message whose sender is this address is one the user wrote
-    /// themselves - so it is not incoming mail, whatever folder it ended
-    /// up in. Deliberately narrow: the account's own address and
-    /// nothing else, so a message that merely comes *from* one of the
-    /// user's aliases is still reported (it is addressed to them, so
-    /// they may not have seen it).
     pub(crate) fn self_address<'a>(&self, account: &'a crate::store::Account) -> &'a str {
         match self {
-            WatchTarget::Primary => account.email.as_str(),
+            WatchTarget::Primary => account.email(),
             WatchTarget::Shared { account_id, .. } => account
                 .shared_accounts
                 .get(account_id)
                 .map(|shared| shared.name.as_str())
                 .unwrap_or_default(),
-            WatchTarget::Extra { slot_id, .. } => account
-                .extra_accounts
+            WatchTarget::Extra { slot_id, .. } | WatchTarget::Account { slot_id, .. } => account
+                .accounts
                 .get(slot_id)
                 .map(|extra| extra.email.as_str())
                 .unwrap_or_default(),
@@ -192,14 +205,19 @@ pub(crate) fn shared_health_key(chat_id: i64, account_id: &str) -> String {
     .health_key(chat_id)
 }
 
+pub(crate) fn account_health_key(chat_id: i64, slot_id: &str) -> String {
+    if slot_id == "default" || slot_id == "primary" {
+        format!("{chat_id}/primary")
+    } else {
+        format!("{chat_id}/extra-{slot_id}")
+    }
+}
+
 /// Same as [`shared_health_key`], for an extra account's slot
 /// (`state.rs`'s `forget_extra`).
+#[allow(dead_code)]
 pub(crate) fn extra_health_key(chat_id: i64, slot_id: &str) -> String {
-    WatchTarget::Extra {
-        slot_id: slot_id.to_string(),
-        label: String::new(),
-    }
-    .health_key(chat_id)
+    account_health_key(chat_id, slot_id)
 }
 
 /// Connection-broken health notice. Deliberately interpolates *no*
@@ -548,37 +566,35 @@ fn is_muted(summary: &jmap::EmailSummary, muted: &[String]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use super::*;
     use crate::store::{Account, SharedAccount};
 
     fn account() -> Account {
-        Account {
-            server_url: "https://jmap.example.org".to_string(),
-            token: "tok".to_string(),
-            email: "a@b.c".to_string(),
-            last_state: Some("primary-state".to_string()),
-            language: None,
-            shared_accounts: HashMap::from([(
-                "acc7".to_string(),
-                SharedAccount {
-                    name: "shared@b.c".to_string(),
-                    last_state: Some("shared-state".to_string()),
-                    parent_slot: None,
-                },
-            )]),
-            extra_accounts: HashMap::from([(
-                "slot1".to_string(),
-                crate::store::ExtraAccount {
-                    server_url: "https://jmap.other.example".to_string(),
-                    token: "other-tok".to_string(),
-                    email: "second@other.example".to_string(),
-                    last_state: Some("extra-state".to_string()),
-                },
-            )]),
-            muted: Vec::new(),
-        }
+        let mut acc = Account::new(
+            "https://jmap.example.org".to_string(),
+            "tok".to_string(),
+            "a@b.c".to_string(),
+        );
+        acc.primary_slot_mut().unwrap().last_state = Some("primary-state".to_string());
+        acc.shared_accounts.insert(
+            "acc7".to_string(),
+            SharedAccount {
+                name: "shared@b.c".to_string(),
+                last_state: Some("shared-state".to_string()),
+                parent_slot: None,
+            },
+        );
+        acc.accounts.insert(
+            "slot1".to_string(),
+            crate::store::AccountSlot {
+                slot_id: "slot1".to_string(),
+                server_url: "https://jmap.other.example".to_string(),
+                token: "other-tok".to_string(),
+                email: "second@other.example".to_string(),
+                last_state: Some("extra-state".to_string()),
+            },
+        );
+        acc
     }
 
     #[test]
@@ -706,8 +722,8 @@ mod tests {
         // resolves against the other.
         let acc = account();
         assert!(acc.shared_accounts.contains_key("acc7"));
-        assert!(!acc.extra_accounts.contains_key("acc7"));
-        assert!(acc.extra_accounts.contains_key("slot1"));
+        assert!(!acc.accounts.contains_key("acc7"));
+        assert!(acc.accounts.contains_key("slot1"));
         assert!(!acc.shared_accounts.contains_key("slot1"));
     }
 

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::time::Instant;
 
 use teloxide::dispatching::UpdateHandler;
@@ -15,7 +15,7 @@ use crate::format::{self, TELEGRAM_MAX_MESSAGE_LEN, chunk_text};
 use crate::i18n;
 use crate::jmap;
 use crate::state::{AppState, PendingUndo, UNDO_WINDOW};
-use crate::store::{Account, ExtraAccount};
+use crate::store::{Account, AccountSlot};
 
 type HandlerResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
@@ -240,40 +240,44 @@ async fn cmd_login(
         }
     };
 
-    let account = Account {
+    // Find if this email is already registered in an existing slot
+    let existing_slot = state.store.get(chat_id.0).and_then(|acc| {
+        acc.accounts
+            .values()
+            .find(|s| s.email.eq_ignore_ascii_case(&email))
+            .map(|s| s.slot_id.clone())
+    });
+
+    let slot_id = existing_slot.unwrap_or_else(|| {
+        if state.store.get(chat_id.0).is_none() {
+            "default".to_string()
+        } else {
+            String::new() // let add_account generate a new slot id
+        }
+    });
+
+    let slot = AccountSlot {
+        slot_id,
         server_url,
         token,
         email: email.clone(),
         last_state: Some(initial_state),
-        // Seed the preference from here so a user whose Telegram client
-        // already says "fr" keeps getting French even before they ever
-        // run `/lang`.
-        language: Some(lang.to_string()),
-        shared_accounts: HashMap::new(),
-        extra_accounts: HashMap::new(),
-        muted: Vec::new(),
     };
 
-    if let Err(e) = state.store.set(chat_id.0, account) {
-        bot.send_message(chat_id, t!("bot.storage_error", locale = lang, error = e))
-            .await?;
-        return Ok(());
-    }
+    let saved_slot_id = match state.store.add_account(chat_id.0, slot) {
+        Ok(id) => id,
+        Err(e) => {
+            bot.send_message(chat_id, t!("bot.storage_error", locale = lang, error = e))
+                .await?;
+            return Ok(());
+        }
+    };
+    let _ = state.store.set_language(chat_id.0, lang);
     state.refresh_accounts_gauge();
 
-    // Re-login while already connected must not leak the previous
-    // watcher: without this, the old task's JoinHandle is silently
-    // overwritten below and keeps running forever with its own JMAP
-    // connection, since its only exit check (the store entry existing)
-    // stays true after a reconnect. This is safe against a concurrent
-    // /login (or a button tap racing this one) for the *same* chat only
-    // because teloxide's default distribution function serializes all
-    // updates for a given chat id onto one worker (see
-    // `teloxide::dispatching::distribution`); this handler never sets
-    // `.distribution_function(...)` on the dispatcher, so don't add one
-    // without re-checking this invariant.
-    state.forget(chat_id.0).await;
-    accounts::adopt_primary(bot, state, chat_id.0, client).await;
+    // Re-adopting the slot: teardown previous watcher for this slot if it was running
+    state.forget_account(chat_id.0, &saved_slot_id).await;
+    accounts::adopt_account(bot, state, chat_id.0, saved_slot_id, email.clone(), client).await;
 
     bot.send_message(
         chat_id,
@@ -284,16 +288,42 @@ async fn cmd_login(
 }
 
 async fn cmd_logout(bot: &Bot, state: &AppState, chat_id: ChatId, lang: &str) -> HandlerResult {
-    state.forget(chat_id.0).await;
-    let removed = state.store.remove(chat_id.0).unwrap_or(false);
-    state.refresh_accounts_gauge();
-
-    let text = if removed {
-        t!("bot.logout_done", locale = lang)
-    } else {
-        t!("bot.logout_nothing", locale = lang)
+    let Some(account) = state.store.get(chat_id.0) else {
+        bot.send_message(chat_id, t!("bot.logout_nothing", locale = lang))
+            .await?;
+        return Ok(());
     };
-    bot.send_message(chat_id, text).await?;
+
+    if account.accounts.len() <= 1 {
+        state.forget(chat_id.0).await;
+        let removed = state.store.remove(chat_id.0).unwrap_or(false);
+        state.refresh_accounts_gauge();
+
+        let text = if removed {
+            t!("bot.logout_done", locale = lang)
+        } else {
+            t!("bot.logout_nothing", locale = lang)
+        };
+        bot.send_message(chat_id, text).await?;
+        return Ok(());
+    }
+
+    // Multiple accounts connected: offer a choice to disconnect individual accounts or all
+    let mut buttons = Vec::new();
+    for (slot_id, slot) in &account.accounts {
+        buttons.push(vec![InlineKeyboardButton::callback(
+            format!("🗑 {}", slot.email),
+            format!("x:{slot_id}"),
+        )]);
+    }
+    buttons.push(vec![InlineKeyboardButton::callback(
+        format!("🚪 {}", t!("bot.logout_all", locale = lang)),
+        "logout:all".to_string(),
+    )]);
+
+    bot.send_message(chat_id, t!("bot.logout_prompt", locale = lang))
+        .reply_markup(InlineKeyboardMarkup::new(buttons))
+        .await?;
     Ok(())
 }
 
@@ -304,17 +334,19 @@ async fn cmd_status(bot: &Bot, state: &AppState, chat_id: ChatId, lang: &str) ->
         return Ok(());
     };
 
-    let watching = state.watchers.read().await.contains_key(&chat_id.0);
+    let account_watchers = state.account_watchers.read().await;
+    let watching = account_watchers.contains_key(&(chat_id.0, "default".to_string()))
+        || account_watchers.keys().any(|(cid, _)| *cid == chat_id.0);
 
     let mut text = format!(
         "{}\n{}\n{}",
-        t!("bot.status_title", locale = lang, email = account.email),
+        t!("bot.status_title", locale = lang, email = account.email()),
         if watching {
             t!("bot.status_watch_on", locale = lang)
         } else {
             t!("bot.status_watch_off", locale = lang)
         },
-        if account.last_state.is_some() {
+        if account.last_state().is_some() {
             t!("bot.status_state_synced", locale = lang)
         } else {
             t!("bot.status_state_init", locale = lang)
@@ -328,12 +360,12 @@ async fn cmd_status(bot: &Bot, state: &AppState, chat_id: ChatId, lang: &str) ->
             count = account.shared_accounts.len()
         ));
     }
-    if !account.extra_accounts.is_empty() {
+    if account.accounts.len() > 1 {
         text.push('\n');
         text.push_str(&t!(
             "bot.status_accounts",
             locale = lang,
-            count = account.extra_accounts.len()
+            count = account.accounts.len() - 1
         ));
     }
     if !account.muted.is_empty() {
@@ -349,10 +381,8 @@ async fn cmd_status(bot: &Bot, state: &AppState, chat_id: ChatId, lang: &str) ->
     Ok(())
 }
 
-/// `/comptes` (no args) lists the chat's primary account plus every extra,
-/// fully independent personal account connected via `/comptes <url>
-/// <token>` - distinct from `/partages`' delegated/shared accounts, which
-/// live under the primary token rather than having their own credentials.
+/// `/comptes` (no args) lists the chat's connected accounts.
+/// `/comptes <url> <token>` connects an additional account.
 async fn cmd_comptes(
     bot: &Bot,
     state: &AppState,
@@ -362,7 +392,7 @@ async fn cmd_comptes(
 ) -> HandlerResult {
     let args = args.trim();
     if args.is_empty() {
-        return list_extra_accounts(bot, state, chat_id, lang).await;
+        return list_accounts(bot, state, chat_id, lang).await;
     }
 
     let Some(account) = state.store.get(chat_id.0) else {
@@ -392,12 +422,7 @@ async fn cmd_comptes(
         };
 
     let email = jmap::account_email(&client);
-    if email == account.email
-        || account
-            .extra_accounts
-            .values()
-            .any(|extra| extra.email == email)
-    {
+    if account.contains_email(&email) {
         bot.send_message(
             chat_id,
             t!("bot.accounts_already", locale = lang, email = email),
@@ -418,21 +443,16 @@ async fn cmd_comptes(
         }
     };
 
-    let slot_id = match state.store.add_extra_account(
-        chat_id.0,
-        ExtraAccount {
-            server_url,
-            token,
-            email: email.clone(),
-            last_state: Some(initial_state),
-        },
-    ) {
-        Ok(Some(id)) => id,
-        Ok(None) => {
-            bot.send_message(chat_id, t!("bot.accounts_need_primary", locale = lang))
-                .await?;
-            return Ok(());
-        }
+    let slot = AccountSlot {
+        slot_id: String::new(),
+        server_url,
+        token,
+        email: email.clone(),
+        last_state: Some(initial_state),
+    };
+
+    let slot_id = match state.store.add_account(chat_id.0, slot) {
+        Ok(id) => id,
         Err(e) => {
             bot.send_message(chat_id, t!("bot.storage_error", locale = lang, error = e))
                 .await?;
@@ -440,7 +460,7 @@ async fn cmd_comptes(
         }
     };
 
-    accounts::adopt_extra(bot, state, chat_id.0, slot_id, email.clone(), client).await;
+    accounts::adopt_account(bot, state, chat_id.0, slot_id, email.clone(), client).await;
 
     bot.send_message(
         chat_id,
@@ -450,47 +470,44 @@ async fn cmd_comptes(
     Ok(())
 }
 
-async fn list_extra_accounts(
-    bot: &Bot,
-    state: &AppState,
-    chat_id: ChatId,
-    lang: &str,
-) -> HandlerResult {
+async fn list_accounts(bot: &Bot, state: &AppState, chat_id: ChatId, lang: &str) -> HandlerResult {
     let Some(account) = state.store.get(chat_id.0) else {
         bot.send_message(chat_id, t!("bot.no_account", locale = lang))
             .await?;
         return Ok(());
     };
 
-    // Numbered, primary first, extras in a stable (address-sorted) order
-    // rather than the store HashMap's arbitrary iteration order, so the
-    // numbers actually mean something across repeated /comptes calls.
-    let mut lines = vec![
-        t!(
-            "bot.accounts_list_primary",
-            locale = lang,
-            email = account.email
-        )
-        .to_string(),
-    ];
-    let mut extras: Vec<&ExtraAccount> = account.extra_accounts.values().collect();
-    extras.sort_by(|a, b| a.email.cmp(&b.email));
+    if account.accounts.is_empty() {
+        bot.send_message(chat_id, t!("bot.no_account", locale = lang))
+            .await?;
+        return Ok(());
+    }
 
+    let mut slots: Vec<(&String, &AccountSlot)> = account.accounts.iter().collect();
+    slots.sort_by(|(id_a, a), (id_b, b)| {
+        if *id_a == "default" {
+            std::cmp::Ordering::Less
+        } else if *id_b == "default" {
+            std::cmp::Ordering::Greater
+        } else {
+            a.email.cmp(&b.email)
+        }
+    });
+
+    let mut lines = Vec::new();
     let mut buttons = Vec::new();
-    for (index, extra) in extras.iter().enumerate() {
+    for (index, (slot_id, slot)) in slots.iter().enumerate() {
         lines.push(
             t!(
                 "bot.accounts_list_extra",
                 locale = lang,
-                index = index + 2,
-                email = extra.email
+                index = index + 1,
+                email = slot.email
             )
             .to_string(),
         );
-    }
-    for (slot_id, extra) in &account.extra_accounts {
         buttons.push(vec![InlineKeyboardButton::callback(
-            format!("🗑 {}", extra.email),
+            format!("🗑 {}", slot.email),
             format!("x:{slot_id}"),
         )]);
     }
@@ -500,7 +517,7 @@ async fn list_extra_accounts(
         t!("bot.accounts_list_title", locale = lang),
         lines.join("\n")
     );
-    if account.extra_accounts.is_empty() {
+    if account.accounts.len() <= 1 {
         text.push_str("\n\n");
         text.push_str(&t!("bot.accounts_no_extra", locale = lang));
     } else {
@@ -508,10 +525,12 @@ async fn list_extra_accounts(
         text.push_str(&t!("bot.accounts_legend", locale = lang));
     }
 
-    let mut send = bot.send_message(chat_id, text);
-    if !buttons.is_empty() {
-        send = send.reply_markup(InlineKeyboardMarkup::new(buttons));
-    }
+    let send = bot.send_message(chat_id, text);
+    let send = if !buttons.is_empty() {
+        send.reply_markup(InlineKeyboardMarkup::new(buttons))
+    } else {
+        send
+    };
     send.await?;
     Ok(())
 }
@@ -587,9 +606,9 @@ async fn refresh_partages_keyboard(
     Ok(())
 }
 
-/// Discovers every shared/delegated mailbox available across the chat's
-/// primary account and all connected extra accounts. Returns the list of
-/// items and whether at least one account connection succeeded.
+/// Discovers every shared/delegated mailbox available across all connected
+/// accounts. Returns the list of items and whether at least one account
+/// connection succeeded.
 async fn discover_all_shared_accounts(
     state: &AppState,
     account: &Account,
@@ -597,51 +616,29 @@ async fn discover_all_shared_accounts(
     let mut discovered = Vec::new();
     let mut any_connected = false;
 
-    // 1. Primary account
-    match jmap::connect(
-        &account.server_url,
-        &account.token,
-        state.config.allow_private_jmap_hosts,
-    )
-    .await
-    {
-        Ok(client) => {
-            any_connected = true;
-            for (id, name) in jmap::list_shared_accounts(&client) {
-                discovered.push(format::SharedAccountItem {
-                    id,
-                    name,
-                    parent_slot: None,
-                });
-            }
-        }
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "failed to connect to primary account to list shared mailboxes"
-            );
-        }
-    }
+    let mut slots: Vec<(&String, &AccountSlot)> = account.accounts.iter().collect();
+    slots.sort_by(|(_, a), (_, b)| a.email.cmp(&b.email));
 
-    // 2. Extra accounts (sorted by email for determinism)
-    let mut extras: Vec<(&String, &ExtraAccount)> = account.extra_accounts.iter().collect();
-    extras.sort_by(|(_, a), (_, b)| a.email.cmp(&b.email));
-
-    for (slot_id, extra) in extras {
+    for (slot_id, slot) in slots {
         match jmap::connect(
-            &extra.server_url,
-            &extra.token,
+            &slot.server_url,
+            &slot.token,
             state.config.allow_private_jmap_hosts,
         )
         .await
         {
             Ok(client) => {
                 any_connected = true;
+                let parent_slot = if slot_id == "default" {
+                    None
+                } else {
+                    Some(slot_id.clone())
+                };
                 for (id, name) in jmap::list_shared_accounts(&client) {
                     discovered.push(format::SharedAccountItem {
                         id,
                         name,
-                        parent_slot: Some(slot_id.clone()),
+                        parent_slot: parent_slot.clone(),
                     });
                 }
             }
@@ -649,7 +646,7 @@ async fn discover_all_shared_accounts(
                 tracing::warn!(
                     slot_id = %slot_id,
                     error = %e,
-                    "failed to connect to extra account to list shared mailboxes"
+                    "failed to connect to account to list shared mailboxes"
                 );
             }
         }
@@ -658,12 +655,8 @@ async fn discover_all_shared_accounts(
     (discovered, any_connected)
 }
 
-/// Disconnects one extra personal account (the "🗑 Déconnecter" button on
-/// `/comptes`'s listing). Unlike `/partages`' shared-account toggle, this
-/// is one-directional - reconnecting means running `/comptes <url>
-/// <token>` again with its credentials, not a re-enable button, since we
-/// don't keep a disconnected extra account's token around to reuse.
-async fn disconnect_extra_account(
+/// Disconnects one personal account slot.
+async fn disconnect_account(
     bot: &Bot,
     state: &AppState,
     chat_id: ChatId,
@@ -671,24 +664,10 @@ async fn disconnect_extra_account(
     slot_id: &str,
     lang: &str,
 ) -> HandlerResult {
-    // Teardown any shared mailbox watchers whose parent credentials belonged to
-    // this extra account.
-    if let Some(account) = state.store.get(chat_id.0) {
-        let child_shared: Vec<String> = account
-            .shared_accounts
-            .iter()
-            .filter(|(_, s)| s.parent_slot.as_deref() == Some(slot_id))
-            .map(|(id, _)| id.clone())
-            .collect();
-        for shared_id in child_shared {
-            state.forget_shared(chat_id.0, &shared_id).await;
-            let _ = state.store.remove_shared_account(chat_id.0, &shared_id);
-        }
-    }
-
-    state.forget_extra(chat_id.0, slot_id).await;
-    match state.store.remove_extra_account(chat_id.0, slot_id) {
+    state.forget_account(chat_id.0, slot_id).await;
+    match state.store.remove_account(chat_id.0, slot_id) {
         Ok(true) => {
+            state.refresh_accounts_gauge();
             bot.answer_callback_query(query_id)
                 .text(t!("bot.disconnect_done", locale = lang))
                 .await?;
@@ -741,10 +720,26 @@ async fn toggle_shared_account(
             .text(t!("bot.shared_off", locale = lang))
             .await?;
     } else {
-        let (server_url, token) = match &parent_slot {
-            None => (account.server_url.as_str(), account.token.as_str()),
-            Some(slot) => match account.extra_accounts.get(slot) {
-                Some(extra) => (extra.server_url.as_str(), extra.token.as_str()),
+        let (server_url, token, parent_slot_to_save) = match &parent_slot {
+            Some(slot) => match account.accounts.get(slot) {
+                Some(extra) => (
+                    extra.server_url.as_str(),
+                    extra.token.as_str(),
+                    Some(slot.clone()),
+                ),
+                None => {
+                    bot.answer_callback_query(query_id)
+                        .text(t!("bot.account_not_connected", locale = lang))
+                        .await?;
+                    return Ok(());
+                }
+            },
+            None => match account.primary_slot() {
+                Some(primary) => (
+                    primary.server_url.as_str(),
+                    primary.token.as_str(),
+                    Some(primary.slot_id.clone()),
+                ),
                 None => {
                     bot.answer_callback_query(query_id)
                         .text(t!("bot.account_not_connected", locale = lang))
@@ -802,7 +797,7 @@ async fn toggle_shared_account(
             account_id.to_string(),
             display_name.clone(),
             Some(initial_state),
-            parent_slot,
+            parent_slot_to_save,
         ) {
             bot.answer_callback_query(query_id)
                 .text(t!("bot.storage_error", locale = lang, error = e))
@@ -917,11 +912,9 @@ async fn cmd_unmute(
     Ok(())
 }
 
-/// Read-only full-text search against the chat's own mailbox (not its
-/// shared accounts - those would need their own per-account search, kept
-/// out of scope here). Results are rendered as ordinary notification
-/// messages, complete with the same action buttons, so triage works the
-/// same way whether a message arrived live or was dug up by search.
+/// Read-only full-text search across all connected accounts. Results are
+/// rendered as ordinary notification messages, complete with action buttons,
+/// tagged with [account] when multiple accounts are connected.
 async fn cmd_rechercher(
     bot: &Bot,
     state: &AppState,
@@ -936,9 +929,9 @@ async fn cmd_rechercher(
         return Ok(());
     }
 
-    let client = match state.client_for(chat_id.0).await {
-        Ok(Some(c)) => c,
-        Ok(None) => {
+    let clients = match state.all_clients_for_chat(chat_id.0).await {
+        Ok(c) if !c.is_empty() => c,
+        Ok(_) => {
             bot.send_message(chat_id, t!("bot.no_account", locale = lang))
                 .await?;
             return Ok(());
@@ -959,16 +952,36 @@ async fn cmd_rechercher(
 
     let _ = bot.send_chat_action(chat_id, ChatAction::Typing).await;
 
-    let results = match jmap::search(&client, query).await {
-        Ok(r) => r,
-        Err(e) => {
+    let multiple_accounts = clients.len() > 1;
+    let mut all_results = Vec::new();
+    let mut last_err = None;
+
+    for (slot, client) in &clients {
+        match jmap::search(client, query).await {
+            Ok(results) => {
+                for summary in results {
+                    all_results.push((slot.slot_id.clone(), slot.email.clone(), summary));
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    slot_id = %slot.slot_id,
+                    error = %e,
+                    "search failed on account slot"
+                );
+                last_err = Some(e);
+            }
+        }
+    }
+
+    if all_results.is_empty() {
+        if let Some(e) = last_err
+            && clients.len() == 1
+        {
             bot.send_message(chat_id, format!("❌ {}", e.localized(lang)))
                 .await?;
             return Ok(());
         }
-    };
-
-    if results.is_empty() {
         bot.send_message(
             chat_id,
             t!("bot.search_no_result", locale = lang, query = query),
@@ -982,14 +995,26 @@ async fn cmd_rechercher(
         t!(
             "bot.search_results",
             locale = lang,
-            count = results.len(),
+            count = all_results.len(),
             query = query
         ),
     )
     .await?;
-    for summary in &results {
-        let text = format::notification_text(summary, state.config.timezone, None, lang);
-        let keyboard = format::notification_keyboard(&summary.id, None, false, false, lang);
+
+    for (slot_id, email, summary) in &all_results {
+        let account_label = if multiple_accounts {
+            Some(email.as_str())
+        } else {
+            None
+        };
+        let btn_account_id = if slot_id == "default" {
+            None
+        } else {
+            Some(slot_id.as_str())
+        };
+        let text = format::notification_text(summary, state.config.timezone, account_label, lang);
+        let keyboard =
+            format::notification_keyboard(&summary.id, btn_account_id, false, false, lang);
         bot.send_message(chat_id, text)
             .parse_mode(ParseMode::MarkdownV2)
             .reply_markup(keyboard)
@@ -1171,7 +1196,22 @@ async fn callback_handler(bot: Bot, q: CallbackQuery, state: AppState) -> Handle
         .await;
     }
     if action == "x" {
-        return disconnect_extra_account(&bot, &state, chat_id, q.id, second, lang).await;
+        return disconnect_account(&bot, &state, chat_id, q.id, second, lang).await;
+    }
+    if action == "logout" && second == "all" {
+        state.forget(chat_id.0).await;
+        let _ = state.store.remove(chat_id.0);
+        state.refresh_accounts_gauge();
+        let _ = bot
+            .edit_message_reply_markup(chat_id, message_id)
+            .reply_markup(InlineKeyboardMarkup::default())
+            .await;
+        bot.answer_callback_query(q.id)
+            .text(t!("bot.logout_done", locale = lang))
+            .await?;
+        bot.send_message(chat_id, t!("bot.logout_done", locale = lang))
+            .await?;
+        return Ok(());
     }
 
     let (account_id, email_id): (Option<&str>, &str) = match third {
@@ -1216,15 +1256,12 @@ async fn callback_handler(bot: Bot, q: CallbackQuery, state: AppState) -> Handle
         return Ok(());
     }
 
-    // account_id names either a shared JMAP account (under the primary
-    // token) or an extra, fully independent one - two separate key spaces
-    // (see store::Account::extra_accounts), so try shared first and only
-    // fall back to extra when it's a clean "not found there", not an
-    // actual connection error.
+    // account_id names either a shared JMAP account or an account slot id.
+    // Try shared first, then account slot.
     let client_result = match account_id {
         Some(acc) => match state.client_for_shared(chat_id.0, acc).await {
             Ok(Some(c)) => Ok(Some(c)),
-            Ok(None) => state.client_for_extra(chat_id.0, acc).await,
+            Ok(None) => state.client_for_account(chat_id.0, acc).await,
             Err(e) => Err(e),
         },
         None => state.client_for(chat_id.0).await,
@@ -1535,6 +1572,7 @@ mod tests {
     // reuses the same trick as `src/health.rs`: a small tokio `TcpListener`
     // that speaks just enough HTTP/1.1 to record requests and answer them.
 
+    use std::collections::HashMap;
     use std::path::Path;
     use std::sync::{Arc, Mutex};
 
@@ -1709,14 +1747,21 @@ mod tests {
     /// any JMAP call fails fast (connection refused) instead of hanging on
     /// DNS/network - the error paths are what several of these tests exercise.
     fn account(email: &str, last_state: Option<&str>) -> Account {
+        let mut accounts = std::collections::BTreeMap::new();
+        accounts.insert(
+            "default".to_string(),
+            AccountSlot {
+                slot_id: "default".to_string(),
+                server_url: "https://127.0.0.1:9".to_string(),
+                token: "tok".to_string(),
+                email: email.to_string(),
+                last_state: last_state.map(str::to_string),
+            },
+        );
         Account {
-            server_url: "https://127.0.0.1:9".to_string(),
-            token: "tok".to_string(),
-            email: email.to_string(),
-            last_state: last_state.map(str::to_string),
             language: None,
             shared_accounts: HashMap::new(),
-            extra_accounts: HashMap::new(),
+            accounts,
             muted: Vec::new(),
         }
     }
@@ -2160,9 +2205,10 @@ mod tests {
             .unwrap();
         state
             .store
-            .add_extra_account(
+            .add_account(
                 42,
-                ExtraAccount {
+                AccountSlot {
+                    slot_id: "slot1".to_string(),
                     server_url: "https://127.0.0.1:9".to_string(),
                     token: "t".to_string(),
                     email: "extra@b.c".to_string(),
@@ -2173,7 +2219,7 @@ mod tests {
         state.store.mute(42, "newsletter").unwrap();
         // Drop the sync marker to exercise the "initializing" branch too.
         let mut stored = state.store.get(42).unwrap();
-        stored.last_state = None;
+        stored.primary_slot_mut().unwrap().last_state = None;
         state.store.set(42, stored).unwrap();
 
         cmd_status(&bot, &state, ChatId(42), "en").await.unwrap();
@@ -2193,9 +2239,10 @@ mod tests {
         for email in ["b@example.org", "a@example.org"] {
             state
                 .store
-                .add_extra_account(
+                .add_account(
                     42,
-                    ExtraAccount {
+                    AccountSlot {
+                        slot_id: String::new(),
                         server_url: "https://127.0.0.1:9".to_string(),
                         token: "t".to_string(),
                         email: email.to_string(),
@@ -2212,7 +2259,7 @@ mod tests {
         let text = mock.last_text();
         assert!(text.contains("Connected accounts:"), "got: {text}");
         // Primary first, extras address-sorted - stable numbering.
-        assert!(text.contains("1. user@example.org (main)"), "got: {text}");
+        assert!(text.contains("1. user@example.org"), "got: {text}");
         assert!(text.contains("2. a@example.org"), "got: {text}");
         assert!(text.contains("3. b@example.org"), "got: {text}");
         assert!(text.contains("🗑 = disconnect this account"), "got: {text}");
@@ -2247,7 +2294,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             mock.last_text(),
-            "Connect your main account with /login before adding a second one."
+            "Connect your account with /login before adding another one."
         );
 
         // Malformed arguments (no token).
@@ -2343,11 +2390,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let state = state(dir.path(), 42, true);
 
-        state
+        let slot_id = state
             .store
-            .add_extra_account(
+            .add_account(
                 42,
-                ExtraAccount {
+                AccountSlot {
+                    slot_id: "extra_slot".to_string(),
                     server_url: "https://127.0.0.1:9".to_string(),
                     token: "extra-tok".to_string(),
                     email: "extra@example.org".to_string(),
@@ -2355,16 +2403,6 @@ mod tests {
                 },
             )
             .unwrap();
-
-        let slot_id = state
-            .store
-            .get(42)
-            .unwrap()
-            .extra_accounts
-            .keys()
-            .next()
-            .unwrap()
-            .clone();
 
         state
             .store
@@ -2384,7 +2422,8 @@ mod tests {
         callback_handler(bot, q, state.clone()).await.unwrap();
 
         let account = state.store.get(42).unwrap();
-        assert!(account.extra_accounts.is_empty());
+        assert_eq!(account.accounts.len(), 1);
+        assert!(!account.accounts.contains_key(&slot_id));
         assert!(
             account.shared_accounts.is_empty(),
             "child shared account should be removed on extra account disconnect"
@@ -2425,5 +2464,102 @@ mod tests {
             body["text"],
             serde_json::json!("🔕 Notifications disabled.")
         );
+    }
+
+    #[tokio::test]
+    async fn disconnect_primary_account_preserves_secondary_account() {
+        let mock = spawn_mock_telegram().await;
+        let bot = mock.bot();
+        let dir = tempfile::tempdir().unwrap();
+        let state = state(dir.path(), 42, true); // has "default" slot user@example.org
+
+        state
+            .store
+            .add_account(
+                42,
+                AccountSlot {
+                    slot_id: "second_slot".to_string(),
+                    server_url: "https://127.0.0.1:9".to_string(),
+                    token: "tok2".to_string(),
+                    email: "second@example.org".to_string(),
+                    last_state: Some("s2".to_string()),
+                },
+            )
+            .unwrap();
+
+        state
+            .store
+            .set_shared_account(
+                42,
+                "shared_primary".to_string(),
+                "shared@example.org".to_string(),
+                None,
+                None, // parent_slot None belongs to default
+            )
+            .unwrap();
+
+        assert_eq!(state.store.get(42).unwrap().accounts.len(), 2);
+        assert_eq!(state.store.get(42).unwrap().shared_accounts.len(), 1);
+
+        // Disconnecting the first ("primary") account via x:default
+        let q = callback_query(&bot, "x:default", "en").await;
+        mock.clear();
+        callback_handler(bot, q, state.clone()).await.unwrap();
+
+        let account = state.store.get(42).expect("chat must survive");
+        assert_eq!(account.accounts.len(), 1);
+        assert!(!account.accounts.contains_key("default"));
+        assert!(account.accounts.contains_key("second_slot"));
+        assert_eq!(account.email(), "second@example.org");
+        assert!(
+            account.shared_accounts.is_empty(),
+            "child shared mailbox of default account must be removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn cmd_logout_with_multiple_accounts_prompts_choice_and_disconnects_all() {
+        let mock = spawn_mock_telegram().await;
+        let bot = mock.bot();
+        let dir = tempfile::tempdir().unwrap();
+        let state = state(dir.path(), 42, true);
+
+        state
+            .store
+            .add_account(
+                42,
+                AccountSlot {
+                    slot_id: "second_slot".to_string(),
+                    server_url: "https://127.0.0.1:9".to_string(),
+                    token: "tok2".to_string(),
+                    email: "second@example.org".to_string(),
+                    last_state: Some("s2".to_string()),
+                },
+            )
+            .unwrap();
+
+        // /logout when multiple accounts are connected prompts with inline keyboard
+        cmd_logout(&bot, &state, ChatId(42), "en").await.unwrap();
+        let text = mock.last_text();
+        assert!(
+            text.contains("Choose an account to disconnect:"),
+            "got: {text}"
+        );
+
+        let body = mock.last_body("sendmessage").unwrap();
+        let markup = &body["reply_markup"]["inline_keyboard"];
+        assert_eq!(markup.as_array().unwrap().len(), 3); // 2 accounts + Disconnect all
+
+        // Tap "Disconnect all"
+        let q = callback_query(&bot, "logout:all", "en").await;
+        mock.clear();
+        callback_handler(bot, q, state.clone()).await.unwrap();
+
+        assert!(
+            state.store.get(42).is_none(),
+            "store should be cleared after logout all"
+        );
+        let text = mock.last_text();
+        assert!(text.contains("Credentials and data deleted"), "got: {text}");
     }
 }
