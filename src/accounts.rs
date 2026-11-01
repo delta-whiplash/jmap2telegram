@@ -24,7 +24,7 @@ use crate::state::AppState;
 use crate::store::Account;
 use crate::watcher::{self, INITIAL_BACKOFF, WatchTarget, next_backoff};
 
-/// Adopts a freshly connected client for a chat's own mailbox.
+/// Adopts a freshly connected client for a chat's own mailbox (default slot).
 ///
 /// Idempotent per chat: returns `false` (dropping the fresh client)
 /// rather than spawning a second watcher when this slot already holds
@@ -33,28 +33,12 @@ use crate::watcher::{self, INITIAL_BACKOFF, WatchTarget, next_backoff};
 /// chat - but every caller benefits (a double-tapped inline button can't
 /// double-watch either).
 pub async fn adopt_primary(bot: &Bot, state: &AppState, chat_id: i64, client: JmapClient) -> bool {
-    // Holding the watcher-map write lock across check-and-insert is what
-    // makes adoption atomic: two concurrent adopters of the same slot
-    // can't both pass the contains_key check and end up with two live
-    // watchers (and a leaked first JoinHandle, since insert would
-    // silently overwrite it). The client-map lock is only ever taken
-    // inside the watcher-map lock (never the reverse), so this nesting
-    // can't deadlock.
-    let mut watchers = state.watchers.write().await;
-    if watchers.contains_key(&chat_id) {
-        return false;
-    }
-    let client = Arc::new(client);
-    state.clients.write().await.insert(chat_id, client.clone());
-    let handle = watcher::spawn(
-        bot.clone(),
-        state.clone(),
-        chat_id,
-        client,
-        WatchTarget::Primary,
-    );
-    watchers.insert(chat_id, handle);
-    true
+    let label = state
+        .store
+        .get(chat_id)
+        .and_then(|a| a.primary_slot().map(|s| s.email.clone()))
+        .unwrap_or_default();
+    adopt_account(bot, state, chat_id, "default".to_string(), label, client).await
 }
 
 /// Adopts a freshly connected client for one of a chat's shared/delegated
@@ -90,10 +74,9 @@ pub async fn adopt_shared(
     true
 }
 
-/// Adopts a freshly connected client for one of a chat's extra, fully
-/// independent personal accounts. Idempotent per (chat, slot) - see
-/// [`adopt_primary`].
-pub async fn adopt_extra(
+/// Adopts a freshly connected client for a specific account slot.
+/// Idempotent per (chat, slot).
+pub async fn adopt_account(
     bot: &Bot,
     state: &AppState,
     chat_id: i64,
@@ -102,13 +85,13 @@ pub async fn adopt_extra(
     client: JmapClient,
 ) -> bool {
     let key = (chat_id, slot_id.clone());
-    let mut watchers = state.extra_watchers.write().await;
+    let mut watchers = state.account_watchers.write().await;
     if watchers.contains_key(&key) {
         return false;
     }
     let client = Arc::new(client);
     state
-        .extra_clients
+        .account_clients
         .write()
         .await
         .insert(key.clone(), client.clone());
@@ -117,10 +100,23 @@ pub async fn adopt_extra(
         state.clone(),
         chat_id,
         client,
-        WatchTarget::Extra { slot_id, label },
+        WatchTarget::Account { slot_id, label },
     );
     watchers.insert(key, handle);
     true
+}
+
+/// Backward-compatible alias for `adopt_account`.
+#[allow(dead_code)]
+pub async fn adopt_extra(
+    bot: &Bot,
+    state: &AppState,
+    chat_id: i64,
+    slot_id: String,
+    label: String,
+    client: JmapClient,
+) -> bool {
+    adopt_account(bot, state, chat_id, slot_id, label, client).await
 }
 
 /// One persisted target worth resuming at boot: which JMAP account to
@@ -136,40 +132,31 @@ struct ResumeTarget {
     token: String,
 }
 
-/// The targets boot must bring back online for one persisted account: its
-/// primary mailbox, every opted-in shared account and every extra
-/// account.
+/// The targets boot must bring back online for one persisted account: every
+/// configured account slot and every opted-in shared account.
 fn persisted_targets(account: &Account) -> Vec<ResumeTarget> {
-    let mut targets = vec![ResumeTarget {
-        target: WatchTarget::Primary,
-        server_url: account.server_url.clone(),
-        token: account.token.clone(),
-    }];
-    for (account_id, shared) in &account.shared_accounts {
-        let (server_url, token) = match &shared.parent_slot {
-            None => (account.server_url.clone(), account.token.clone()),
-            Some(slot_id) => match account.extra_accounts.get(slot_id) {
-                Some(extra) => (extra.server_url.clone(), extra.token.clone()),
-                None => continue,
+    let mut targets = Vec::new();
+    for (slot_id, slot) in &account.accounts {
+        targets.push(ResumeTarget {
+            target: WatchTarget::Account {
+                slot_id: slot_id.clone(),
+                label: slot.email.clone(),
             },
+            server_url: slot.server_url.clone(),
+            token: slot.token.clone(),
+        });
+    }
+    for (account_id, shared) in &account.shared_accounts {
+        let Some(slot) = account.resolve_parent_slot(shared) else {
+            continue;
         };
         targets.push(ResumeTarget {
             target: WatchTarget::Shared {
                 account_id: account_id.clone(),
                 label: shared.name.clone(),
             },
-            server_url,
-            token,
-        });
-    }
-    for (slot_id, extra) in &account.extra_accounts {
-        targets.push(ResumeTarget {
-            target: WatchTarget::Extra {
-                slot_id: slot_id.clone(),
-                label: extra.email.clone(),
-            },
-            server_url: extra.server_url.clone(),
-            token: extra.token.clone(),
+            server_url: slot.server_url.clone(),
+            token: slot.token.clone(),
         });
     }
     targets
@@ -298,17 +285,21 @@ async fn resume_target_with(
 /// earlier resume attempt) already holds a live watcher for this slot.
 async fn slot_adopted(state: &AppState, chat_id: i64, target: &WatchTarget) -> bool {
     match target {
-        WatchTarget::Primary => state.watchers.read().await.contains_key(&chat_id),
+        WatchTarget::Primary => state
+            .account_watchers
+            .read()
+            .await
+            .contains_key(&(chat_id, "default".to_string())),
+        WatchTarget::Account { slot_id, .. } | WatchTarget::Extra { slot_id, .. } => state
+            .account_watchers
+            .read()
+            .await
+            .contains_key(&(chat_id, slot_id.clone())),
         WatchTarget::Shared { account_id, .. } => state
             .shared_watchers
             .read()
             .await
             .contains_key(&(chat_id, account_id.clone())),
-        WatchTarget::Extra { slot_id, .. } => state
-            .extra_watchers
-            .read()
-            .await
-            .contains_key(&(chat_id, slot_id.clone())),
     }
 }
 
@@ -322,6 +313,9 @@ async fn adopt_target(
 ) -> bool {
     match target {
         WatchTarget::Primary => adopt_primary(bot, state, chat_id, client).await,
+        WatchTarget::Account { slot_id, label } | WatchTarget::Extra { slot_id, label } => {
+            adopt_account(bot, state, chat_id, slot_id.clone(), label.clone(), client).await
+        }
         WatchTarget::Shared { account_id, label } => {
             adopt_shared(
                 bot,
@@ -332,9 +326,6 @@ async fn adopt_target(
                 client,
             )
             .await
-        }
-        WatchTarget::Extra { slot_id, label } => {
-            adopt_extra(bot, state, chat_id, slot_id.clone(), label.clone(), client).await
         }
     }
 }
@@ -348,13 +339,15 @@ async fn connect_target(config: &Config, target: &ResumeTarget) -> anyhow::Resul
         // `jmap::*` returns the typed `JmapError`; converting to `anyhow`
         // here preserves the concrete type in the chain, so presentation
         // code can still downcast it back (see `jmap::localized_error`).
-        WatchTarget::Primary | WatchTarget::Extra { .. } => jmap::connect(
-            &target.server_url,
-            &target.token,
-            config.allow_private_jmap_hosts,
-        )
-        .await
-        .map_err(anyhow::Error::from),
+        WatchTarget::Primary | WatchTarget::Extra { .. } | WatchTarget::Account { .. } => {
+            jmap::connect(
+                &target.server_url,
+                &target.token,
+                config.allow_private_jmap_hosts,
+            )
+            .await
+            .map_err(anyhow::Error::from)
+        }
         WatchTarget::Shared { account_id, .. } => jmap::connect_shared(
             &target.server_url,
             &target.token,
@@ -439,11 +432,29 @@ mod tests {
     /// nothing listens on, so a real `jmap::connect` against it fails
     /// fast (connection refused) instead of timing out.
     fn unreachable_account() -> Account {
+        let mut accounts = std::collections::BTreeMap::new();
+        accounts.insert(
+            "default".to_string(),
+            crate::store::AccountSlot {
+                slot_id: "default".to_string(),
+                server_url: "https://127.0.0.1:9".to_string(),
+                token: "tok".to_string(),
+                email: "a@b.c".to_string(),
+                last_state: Some("primary-state".to_string()),
+            },
+        );
+        accounts.insert(
+            "slot1".to_string(),
+            crate::store::AccountSlot {
+                slot_id: "slot1".to_string(),
+                server_url: "https://127.0.0.1:9".to_string(),
+                token: "other-tok".to_string(),
+                email: "second@other.example".to_string(),
+                last_state: Some("extra-state".to_string()),
+            },
+        );
         Account {
-            server_url: "https://127.0.0.1:9".to_string(),
-            token: "tok".to_string(),
-            email: "a@b.c".to_string(),
-            last_state: Some("primary-state".to_string()),
+            accounts,
             language: None,
             shared_accounts: HashMap::from([(
                 "acc7".to_string(),
@@ -451,15 +462,6 @@ mod tests {
                     name: "shared@b.c".to_string(),
                     last_state: Some("shared-state".to_string()),
                     parent_slot: None,
-                },
-            )]),
-            extra_accounts: HashMap::from([(
-                "slot1".to_string(),
-                crate::store::ExtraAccount {
-                    server_url: "https://127.0.0.1:9".to_string(),
-                    token: "other-tok".to_string(),
-                    email: "second@other.example".to_string(),
-                    last_state: Some("extra-state".to_string()),
                 },
             )]),
             muted: Vec::new(),
@@ -534,14 +536,23 @@ mod tests {
     #[test]
     fn persisted_targets_lists_primary_shared_and_extra_with_their_credentials() {
         let targets = persisted_targets(&unreachable_account());
-        let [primary, shared, extra] = targets.as_slice() else {
-            panic!("expected exactly 3 targets, got {targets:?}");
-        };
-        // Primary and shared ride the account's primary credentials;
-        // the extra account carries its own (possibly different server).
-        assert!(matches!(primary.target, WatchTarget::Primary));
+        assert_eq!(
+            targets.len(),
+            3,
+            "expected exactly 3 targets, got {targets:?}"
+        );
+
+        let primary = targets
+            .iter()
+            .find(|t| matches!(&t.target, WatchTarget::Account { slot_id, .. } if slot_id == "default"))
+            .expect("expected default account target");
         assert_eq!(primary.server_url, "https://127.0.0.1:9");
         assert_eq!(primary.token, "tok");
+
+        let shared = targets
+            .iter()
+            .find(|t| matches!(&t.target, WatchTarget::Shared { .. }))
+            .expect("expected shared target");
         match &shared.target {
             WatchTarget::Shared { account_id, label } => {
                 assert_eq!(account_id, "acc7");
@@ -551,8 +562,15 @@ mod tests {
         }
         assert_eq!(shared.server_url, primary.server_url);
         assert_eq!(shared.token, primary.token);
+
+        let extra = targets
+            .iter()
+            .find(
+                |t| matches!(&t.target, WatchTarget::Account { slot_id, .. } if slot_id == "slot1"),
+            )
+            .expect("expected slot1 account target");
         match &extra.target {
-            WatchTarget::Extra { slot_id, label } => {
+            WatchTarget::Account { slot_id, label } => {
                 assert_eq!(slot_id, "slot1");
                 assert_eq!(label, "second@other.example");
             }
@@ -673,7 +691,7 @@ mod tests {
         // small; the loop is shared by all three kinds.
         let primary = targets
             .into_iter()
-            .find(|t| matches!(t.target, WatchTarget::Primary))
+            .find(|t| matches!(&t.target, WatchTarget::Account { slot_id, .. } if slot_id == "default"))
             .expect("primary target");
 
         let attempts = Arc::new(AtomicUsize::new(0));
@@ -701,7 +719,7 @@ mod tests {
         assert!(!snapshot["42/primary"].connected, "{snapshot:?}");
         // No adoption happened - the client map stays empty while the
         // server is down.
-        assert!(state.clients.read().await.is_empty());
+        assert!(state.account_clients.read().await.is_empty());
         // And the snapshot keeps every dead account registered (all three
         // targets of the account stayed registered; only the primary's
         // loop is being driven here).
@@ -734,7 +752,7 @@ mod tests {
         register_persisted_targets(&state, 42, &targets);
         let primary = targets
             .into_iter()
-            .find(|t| matches!(t.target, WatchTarget::Primary))
+            .find(|t| matches!(&t.target, WatchTarget::Account { slot_id, .. } if slot_id == "default"))
             .expect("primary target");
 
         let attempts = Arc::new(AtomicUsize::new(0));
@@ -754,8 +772,20 @@ mod tests {
             .expect("resume task must finish after adopting")
             .expect("resume task must not panic");
 
-        assert!(state.clients.read().await.contains_key(&42));
-        assert!(state.watchers.read().await.contains_key(&42));
+        assert!(
+            state
+                .account_clients
+                .read()
+                .await
+                .contains_key(&(42, "default".to_string()))
+        );
+        assert!(
+            state
+                .account_watchers
+                .read()
+                .await
+                .contains_key(&(42, "default".to_string()))
+        );
         let snapshot = state.health.snapshot();
         assert!(snapshot.contains_key("42/primary"), "{snapshot:?}");
         // The watcher owns the entry from here; connected reflects its own
@@ -765,7 +795,7 @@ mod tests {
         // watchpoint this whole branch is about.
         state.forget(42).await;
         assert!(!state.health.snapshot().contains_key("42/primary"));
-        assert!(state.clients.read().await.is_empty());
+        assert!(state.account_clients.read().await.is_empty());
     }
 
     #[tokio::test]
@@ -779,7 +809,7 @@ mod tests {
         register_persisted_targets(&state, 42, &targets);
         let primary = targets
             .into_iter()
-            .find(|t| matches!(t.target, WatchTarget::Primary))
+            .find(|t| matches!(&t.target, WatchTarget::Account { slot_id, .. } if slot_id == "default"))
             .expect("primary target");
 
         let attempts = Arc::new(AtomicUsize::new(0));
@@ -878,12 +908,10 @@ mod tests {
 
         // Exactly one handle and one client per slot, and one health entry
         // per target, keyed the way the watcher itself keys them.
-        assert_eq!(state.watchers.read().await.len(), 1);
+        assert_eq!(state.account_watchers.read().await.len(), 2);
         assert_eq!(state.shared_watchers.read().await.len(), 1);
-        assert_eq!(state.extra_watchers.read().await.len(), 1);
-        assert_eq!(state.clients.read().await.len(), 1);
+        assert_eq!(state.account_clients.read().await.len(), 2);
         assert_eq!(state.shared_clients.read().await.len(), 1);
-        assert_eq!(state.extra_clients.read().await.len(), 1);
         let snapshot = state.health.snapshot();
         let mut keys: Vec<_> = snapshot.keys().cloned().collect();
         keys.sort();

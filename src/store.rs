@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -14,81 +14,52 @@ use serde::{Deserialize, Serialize};
 const NONCE_LEN: usize = 12;
 const KEY_LEN: usize = 32;
 
-/// A single authorized user's JMAP account, as entered live through the bot.
+/// A single JMAP account slot connected to a chat (personal mailbox).
 ///
-/// This is the only personal data the bot ever persists. No email content
-/// is ever written to disk: `last_state` is just an opaque JMAP sync
-/// cursor, not a copy of any message.
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct Account {
+/// In the peer multi-account architecture, all accounts (the initial one
+/// as well as subsequent ones) have equal standing as `AccountSlot`s.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct AccountSlot {
+    pub slot_id: String,
     pub server_url: String,
     pub token: String,
     pub email: String,
+    #[serde(default)]
     pub last_state: Option<String>,
-    /// The chat's preferred language (`en`/`fr`), set by `/lang` or seeded
-    /// from Telegram's `language_code` at login. `None` means "never
-    /// chosen": language resolution then falls through to the current
-    /// message's `language_code`, then `BOT_LANGUAGE`. `#[serde(default)]`
-    /// keeps this backward compatible with state files written before this
-    /// field existed.
-    #[serde(default)]
-    pub language: Option<String>,
-    /// JMAP delegated/shared accounts (e.g. a shared team mailbox) the user
-    /// has opted into notifications for, keyed by JMAP account id.
-    /// `#[serde(default)]` keeps this backward compatible with state files
-    /// written before this field existed.
-    #[serde(default)]
-    pub shared_accounts: HashMap<String, SharedAccount>,
-    /// Additional, fully independent personal JMAP accounts (their own
-    /// server_url + token, not delegated access under the primary
-    /// account's token) connected via `/comptes <url> <token>`, keyed by an
-    /// id we generate ourselves (`generate_slot_id`) rather than anything
-    /// the JMAP server issues - deliberately a different key space from
-    /// `shared_accounts` so the two can never collide, since two unrelated
-    /// JMAP servers could otherwise coincidentally assign the same account
-    /// id string.
-    #[serde(default)]
-    pub extra_accounts: HashMap<String, ExtraAccount>,
-    /// Lowercased sender-address/keyword filters from `/mute`: a new
-    /// message whose sender or subject contains any of these is not
-    /// notified about (the JMAP sync cursor still advances past it - this
-    /// is purely "don't tell me about this", not "don't sync it").
-    /// Applies across the chat's own mailbox and every shared/extra account.
-    #[serde(default)]
-    pub muted: Vec<String>,
 }
+
+/// Legacy alias for `AccountSlot`.
+#[allow(dead_code)]
+pub type ExtraAccount = AccountSlot;
 
 /// A shared JMAP account the user has opted into. Presence in
 /// `Account::shared_accounts` *is* the opt-in: there is no separate
 /// enabled flag to fall out of sync with the watcher/client state.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct SharedAccount {
     /// Display name from the JMAP session (e.g. the shared mailbox's
     /// address), shown in notifications and the toggle menu.
     pub name: String,
     pub last_state: Option<String>,
-    /// If this shared account belongs to an extra account (connected via
-    /// `/accounts`), this is that account's slot id. `None` means it belongs
-    /// to the chat's primary account.
+    /// Slot id of the connected account that authorized access to this
+    /// shared mailbox. `None` falls back to the default/first account slot.
     #[serde(default)]
     pub parent_slot: Option<String>,
 }
 
-/// A second (or third, ...) fully independent JMAP account connected to
-/// the same chat via `/comptes <url> <token>` - its own server and token,
-/// not a delegated account under the primary login. Shape mirrors
-/// `Account` minus the nested shared/extra/muted fields, which only the
-/// primary slot carries.
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct ExtraAccount {
-    pub server_url: String,
-    pub token: String,
-    pub email: String,
-    pub last_state: Option<String>,
+impl SharedAccount {
+    /// Returns true if this shared account is authorized under `slot_id`.
+    /// `None` indicates the default account slot (`"default"`).
+    pub fn is_child_of(&self, slot_id: &str) -> bool {
+        match &self.parent_slot {
+            Some(parent) => parent == slot_id,
+            None => slot_id == "default",
+        }
+    }
 }
 
 /// A short id we generate (never one a JMAP server issues) to key
-/// `Account::extra_accounts`, so it can never collide with a JMAP-issued
+/// `Account::accounts`, so it can never collide with a JMAP-issued
 /// account id from `shared_accounts`' entirely separate key space.
 pub fn generate_slot_id() -> String {
     const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
@@ -96,6 +67,221 @@ pub fn generate_slot_id() -> String {
     (0..8)
         .map(|_| ALPHABET[rng.random_range(0..ALPHABET.len())] as char)
         .collect()
+}
+
+/// An authorized chat's full persistent state: its connected JMAP accounts,
+/// opted-in shared mailboxes, language preference and mute filters.
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct Account {
+    /// The chat's preferred language (`en`/`fr`), set by `/lang` or seeded
+    /// from Telegram's `language_code` at login. `None` means "never
+    /// chosen": language resolution then falls through to the current
+    /// message's `language_code`, then `BOT_LANGUAGE`.
+    #[serde(default)]
+    pub language: Option<String>,
+    /// JMAP delegated/shared accounts (e.g. a shared team mailbox) the user
+    /// has opted into notifications for, keyed by JMAP account id.
+    #[serde(default)]
+    pub shared_accounts: HashMap<String, SharedAccount>,
+    /// All connected personal JMAP accounts, keyed by slot id (`"default"`
+    /// for the initial account, or a generated 8-char id). All accounts
+    /// have equal status.
+    #[serde(default)]
+    pub accounts: BTreeMap<String, AccountSlot>,
+    /// Lowercased sender-address/keyword filters from `/mute`: a new
+    /// message whose sender or subject contains any of these is not
+    /// notified about (the JMAP sync cursor still advances past it - this
+    /// is purely "don't tell me about this", not "don't sync it").
+    /// Applies across every connected account and shared mailbox.
+    #[serde(default)]
+    pub muted: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum AccountVersion {
+    Unified {
+        accounts: BTreeMap<String, AccountSlot>,
+        #[serde(default)]
+        language: Option<String>,
+        #[serde(default)]
+        shared_accounts: HashMap<String, SharedAccount>,
+        #[serde(default)]
+        muted: Vec<String>,
+    },
+    Legacy {
+        server_url: String,
+        token: String,
+        email: String,
+        #[serde(default)]
+        last_state: Option<String>,
+        #[serde(default)]
+        language: Option<String>,
+        #[serde(default)]
+        shared_accounts: HashMap<String, SharedAccount>,
+        #[serde(default)]
+        extra_accounts: HashMap<String, LegacyAccountSlotHelper>,
+        #[serde(default)]
+        muted: Vec<String>,
+    },
+}
+
+#[derive(Deserialize)]
+struct LegacyAccountSlotHelper {
+    server_url: String,
+    token: String,
+    email: String,
+    #[serde(default)]
+    last_state: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for Account {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let version = AccountVersion::deserialize(deserializer)?;
+        match version {
+            AccountVersion::Unified {
+                language,
+                mut shared_accounts,
+                accounts,
+                muted,
+            } => {
+                for shared in shared_accounts.values_mut() {
+                    if shared.parent_slot.is_none() {
+                        shared.parent_slot = Some("default".to_string());
+                    }
+                }
+                Ok(Account {
+                    language,
+                    shared_accounts,
+                    accounts,
+                    muted,
+                })
+            }
+            AccountVersion::Legacy {
+                server_url,
+                token,
+                email,
+                last_state,
+                language,
+                mut shared_accounts,
+                extra_accounts,
+                muted,
+            } => {
+                let default_slot_id = "default".to_string();
+                let mut accounts = BTreeMap::new();
+                accounts.insert(
+                    default_slot_id.clone(),
+                    AccountSlot {
+                        slot_id: default_slot_id.clone(),
+                        server_url,
+                        token,
+                        email,
+                        last_state,
+                    },
+                );
+                for (extra_id, extra) in extra_accounts {
+                    accounts.insert(
+                        extra_id.clone(),
+                        AccountSlot {
+                            slot_id: extra_id,
+                            server_url: extra.server_url,
+                            token: extra.token,
+                            email: extra.email,
+                            last_state: extra.last_state,
+                        },
+                    );
+                }
+                for shared in shared_accounts.values_mut() {
+                    if shared.parent_slot.is_none() {
+                        shared.parent_slot = Some(default_slot_id.clone());
+                    }
+                }
+                Ok(Account {
+                    language,
+                    shared_accounts,
+                    accounts,
+                    muted,
+                })
+            }
+        }
+    }
+}
+
+impl Account {
+    /// Convenience constructor for an initial single-account chat state.
+    #[allow(dead_code)]
+    pub fn new(server_url: String, token: String, email: String) -> Self {
+        let slot_id = "default".to_string();
+        let mut accounts = BTreeMap::new();
+        accounts.insert(
+            slot_id.clone(),
+            AccountSlot {
+                slot_id,
+                server_url,
+                token,
+                email,
+                last_state: None,
+            },
+        );
+        Self {
+            language: None,
+            shared_accounts: HashMap::new(),
+            accounts,
+            muted: Vec::new(),
+        }
+    }
+
+    /// Returns the first connected account slot, if any.
+    pub fn primary_slot(&self) -> Option<&AccountSlot> {
+        self.accounts.values().next()
+    }
+
+    /// Mutable reference to the first connected account slot.
+    pub fn primary_slot_mut(&mut self) -> Option<&mut AccountSlot> {
+        self.accounts.values_mut().next()
+    }
+
+    /// Primary email address, or empty string if no accounts are connected.
+    pub fn email(&self) -> &str {
+        self.primary_slot().map(|s| s.email.as_str()).unwrap_or("")
+    }
+
+    /// Primary server URL.
+    #[allow(dead_code)]
+    pub fn server_url(&self) -> &str {
+        self.primary_slot()
+            .map(|s| s.server_url.as_str())
+            .unwrap_or("")
+    }
+
+    /// Primary token.
+    #[allow(dead_code)]
+    pub fn token(&self) -> &str {
+        self.primary_slot().map(|s| s.token.as_str()).unwrap_or("")
+    }
+
+    /// Primary sync cursor.
+    pub fn last_state(&self) -> Option<&str> {
+        self.primary_slot().and_then(|s| s.last_state.as_deref())
+    }
+
+    /// Checks if a given email is already connected in any account slot.
+    pub fn contains_email(&self, email: &str) -> bool {
+        self.accounts
+            .values()
+            .any(|s| s.email.eq_ignore_ascii_case(email))
+    }
+
+    /// Resolves the parent account slot for a shared mailbox.
+    pub fn resolve_parent_slot<'a>(&'a self, shared: &'a SharedAccount) -> Option<&'a AccountSlot> {
+        match &shared.parent_slot {
+            Some(slot) => self.accounts.get(slot),
+            None => self.primary_slot(),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -170,6 +356,7 @@ impl Store {
         self.data.read().unwrap().accounts.len()
     }
 
+    #[allow(dead_code)]
     pub fn set(&self, chat_id: i64, account: Account) -> Result<()> {
         {
             let mut data = self.data.write().unwrap();
@@ -182,7 +369,78 @@ impl Store {
         {
             let mut data = self.data.write().unwrap();
             match data.accounts.get_mut(&chat_id) {
-                Some(acc) => acc.last_state = Some(state),
+                Some(acc) => {
+                    if let Some(slot) = acc.primary_slot_mut() {
+                        slot.last_state = Some(state);
+                    }
+                }
+                None => return Ok(()),
+            }
+        }
+        self.persist()
+    }
+
+    /// Adds or updates an account slot in the chat. If `slot_id` is empty,
+    /// generates a random 8-hex identifier.
+    pub fn add_account(&self, chat_id: i64, mut slot: AccountSlot) -> Result<String> {
+        let slot_id = if slot.slot_id.is_empty() {
+            generate_slot_id()
+        } else {
+            slot.slot_id.clone()
+        };
+        slot.slot_id = slot_id.clone();
+        {
+            let mut data = self.data.write().unwrap();
+            let acc = data.accounts.entry(chat_id).or_insert_with(|| Account {
+                language: None,
+                shared_accounts: HashMap::new(),
+                accounts: BTreeMap::new(),
+                muted: Vec::new(),
+            });
+            acc.accounts.insert(slot_id.clone(), slot);
+        }
+        self.persist()?;
+        Ok(slot_id)
+    }
+
+    /// Removes an account slot from the chat. Also removes all shared
+    /// mailboxes that belonged to this slot. If no accounts remain,
+    /// cleans up the chat record.
+    pub fn remove_account(&self, chat_id: i64, slot_id: &str) -> Result<bool> {
+        let (removed, is_empty) = {
+            let mut data = self.data.write().unwrap();
+            match data.accounts.get_mut(&chat_id) {
+                Some(acc) => {
+                    let removed = acc.accounts.remove(slot_id).is_some();
+                    if removed {
+                        acc.shared_accounts
+                            .retain(|_, shared| !shared.is_child_of(slot_id));
+                    }
+                    (removed, acc.accounts.is_empty())
+                }
+                None => (false, false),
+            }
+        };
+        if removed {
+            if is_empty {
+                let mut data = self.data.write().unwrap();
+                data.accounts.remove(&chat_id);
+            }
+            self.persist()?;
+        }
+        Ok(removed)
+    }
+
+    /// Updates the sync state cursor for a specific account slot.
+    pub fn update_account_state(&self, chat_id: i64, slot_id: &str, state: String) -> Result<()> {
+        {
+            let mut data = self.data.write().unwrap();
+            match data
+                .accounts
+                .get_mut(&chat_id)
+                .and_then(|acc| acc.accounts.get_mut(slot_id))
+            {
+                Some(slot) => slot.last_state = Some(state),
                 None => return Ok(()),
             }
         }
@@ -206,8 +464,7 @@ impl Store {
 
     /// Opts a chat into notifications for a shared JMAP account, or updates
     /// its display name/cursor if already opted in. No-ops (without error)
-    /// if the chat has no primary account, since a shared account can't
-    /// outlive the login it was discovered through.
+    /// if the chat has no account.
     pub fn set_shared_account(
         &self,
         chat_id: i64,
@@ -271,18 +528,22 @@ impl Store {
         self.persist()
     }
 
-    /// Connects a second (or third, ...) fully independent JMAP account to
-    /// a chat, under a freshly generated slot id. No-ops (without error,
-    /// returning `None`) if the chat has no primary account yet - an extra
-    /// account only makes sense alongside one. Returns the generated slot
-    /// id on success, so the caller can spawn its watcher against it.
+    /// Connects an additional account under a generated slot id, or no-ops
+    /// if no primary account exists (legacy behavior for backward compatibility).
+    #[allow(dead_code)]
     pub fn add_extra_account(&self, chat_id: i64, account: ExtraAccount) -> Result<Option<String>> {
-        let slot_id = generate_slot_id();
+        let slot_id = if account.slot_id.is_empty() {
+            generate_slot_id()
+        } else {
+            account.slot_id.clone()
+        };
         let added = {
             let mut data = self.data.write().unwrap();
             match data.accounts.get_mut(&chat_id) {
                 Some(acc) => {
-                    acc.extra_accounts.insert(slot_id.clone(), account);
+                    let mut slot = account;
+                    slot.slot_id = slot_id.clone();
+                    acc.accounts.insert(slot_id.clone(), slot);
                     true
                 }
                 None => false,
@@ -296,38 +557,19 @@ impl Store {
     }
 
     /// Disconnects one extra account. Returns whether it existed.
+    #[allow(dead_code)]
     pub fn remove_extra_account(&self, chat_id: i64, slot_id: &str) -> Result<bool> {
-        let removed = {
-            let mut data = self.data.write().unwrap();
-            match data.accounts.get_mut(&chat_id) {
-                Some(acc) => acc.extra_accounts.remove(slot_id).is_some(),
-                None => false,
-            }
-        };
-        if removed {
-            self.persist()?;
-        }
-        Ok(removed)
+        self.remove_account(chat_id, slot_id)
     }
 
+    #[allow(dead_code)]
     pub fn update_extra_account_state(
         &self,
         chat_id: i64,
         slot_id: &str,
         state: String,
     ) -> Result<()> {
-        {
-            let mut data = self.data.write().unwrap();
-            match data
-                .accounts
-                .get_mut(&chat_id)
-                .and_then(|acc| acc.extra_accounts.get_mut(slot_id))
-            {
-                Some(extra) => extra.last_state = Some(state),
-                None => return Ok(()),
-            }
-        }
-        self.persist()
+        self.update_account_state(chat_id, slot_id, state)
     }
 
     /// Adds a mute filter for a chat. No-ops (without error) if the chat
@@ -547,20 +789,16 @@ mod tests {
     use super::*;
 
     fn account(email: &str) -> Account {
-        Account {
-            server_url: "https://jmap.example.org/session".to_string(),
-            token: "s3cr3t-token".to_string(),
-            email: email.to_string(),
-            last_state: None,
-            language: None,
-            shared_accounts: HashMap::new(),
-            extra_accounts: HashMap::new(),
-            muted: Vec::new(),
-        }
+        Account::new(
+            "https://jmap.example.org/session".to_string(),
+            "s3cr3t-token".to_string(),
+            email.to_string(),
+        )
     }
 
     fn extra_account(email: &str) -> ExtraAccount {
-        ExtraAccount {
+        AccountSlot {
+            slot_id: String::new(),
             server_url: "https://jmap.other.example/session".to_string(),
             token: "other-token".to_string(),
             email: email.to_string(),
@@ -581,7 +819,7 @@ mod tests {
         let ciphertext = encrypt(&key, &plaintext).unwrap();
         let decrypted = decrypt(&key, &ciphertext).unwrap();
         assert_eq!(decrypted.accounts.len(), 1);
-        assert_eq!(decrypted.accounts[&1].email, "a@b.c");
+        assert_eq!(decrypted.accounts[&1].email(), "a@b.c");
     }
 
     #[test]
@@ -611,12 +849,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
         store.set(42, account("user@example.org")).unwrap();
-        assert_eq!(store.get(42).unwrap().email, "user@example.org");
+        assert_eq!(store.get(42).unwrap().email(), "user@example.org");
 
         // Reopen: must survive a restart using the same on-disk key/state.
         drop(store);
         let reopened = Store::open(dir.path()).unwrap();
-        assert_eq!(reopened.get(42).unwrap().email, "user@example.org");
+        assert_eq!(reopened.get(42).unwrap().email(), "user@example.org");
     }
 
     #[test]
@@ -687,7 +925,7 @@ mod tests {
         let key_path = dir.path().join("master.key");
         fs::set_permissions(&key_path, fs::Permissions::from_mode(0o644)).unwrap();
         let reopened = Store::open(dir.path()).unwrap();
-        assert_eq!(reopened.get(1).unwrap().email, "a@b.c");
+        assert_eq!(reopened.get(1).unwrap().email(), "a@b.c");
         assert_eq!(
             fs::metadata(&key_path).unwrap().permissions().mode() & 0o777,
             0o600
@@ -706,7 +944,7 @@ mod tests {
         let key_path = dir.path().join("master.key");
         fs::set_permissions(&key_path, fs::Permissions::from_mode(0o400)).unwrap();
         let reopened = Store::open(dir.path()).unwrap();
-        assert_eq!(reopened.get(1).unwrap().email, "a@b.c");
+        assert_eq!(reopened.get(1).unwrap().email(), "a@b.c");
         assert_eq!(
             fs::metadata(&key_path).unwrap().permissions().mode() & 0o777,
             0o400
@@ -817,8 +1055,48 @@ mod tests {
         let acc: Account = serde_json::from_str(json).unwrap();
         assert!(acc.shared_accounts.is_empty());
         assert!(acc.muted.is_empty());
-        assert!(acc.extra_accounts.is_empty());
+        assert_eq!(acc.accounts.len(), 1);
+        assert_eq!(acc.email(), "a@b.c");
         assert!(acc.language.is_none());
+    }
+
+    #[test]
+    fn legacy_account_format_migrates_seamlessly_to_unified() {
+        let legacy_json = r#"{
+            "server_url": "https://primary.example.org",
+            "token": "tok1",
+            "email": "primary@example.org",
+            "last_state": "state-p",
+            "language": "fr",
+            "shared_accounts": {
+                "shared1": { "name": "team@example.org", "last_state": null, "parent_slot": null }
+            },
+            "extra_accounts": {
+                "slot2": { "server_url": "https://sec.example.org", "token": "tok2", "email": "sec@example.org", "last_state": "state-s" }
+            },
+            "muted": ["newsletter@example.org"]
+        }"#;
+
+        let acc: Account = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(acc.language.as_deref(), Some("fr"));
+        assert_eq!(acc.muted, vec!["newsletter@example.org"]);
+        assert_eq!(acc.accounts.len(), 2);
+        assert_eq!(acc.accounts["default"].email, "primary@example.org");
+        assert_eq!(
+            acc.accounts["default"].server_url,
+            "https://primary.example.org"
+        );
+        assert_eq!(
+            acc.accounts["default"].last_state.as_deref(),
+            Some("state-p")
+        );
+        assert_eq!(acc.accounts["slot2"].email, "sec@example.org");
+        assert_eq!(acc.accounts["slot2"].server_url, "https://sec.example.org");
+        assert_eq!(acc.accounts["slot2"].last_state.as_deref(), Some("state-s"));
+        assert_eq!(
+            acc.shared_accounts["shared1"].parent_slot.as_deref(),
+            Some("default")
+        );
     }
 
     #[test]
@@ -854,7 +1132,7 @@ mod tests {
             .unwrap()
             .expect("primary account exists, add must succeed");
 
-        let stored = &store.get(1).unwrap().extra_accounts[&slot_id];
+        let stored = &store.get(1).unwrap().accounts[&slot_id];
         assert_eq!(stored.email, "second@other.example");
     }
 
@@ -894,7 +1172,7 @@ mod tests {
             .unwrap();
 
         assert!(store.remove_extra_account(1, &slot_id).unwrap());
-        assert!(!store.get(1).unwrap().extra_accounts.contains_key(&slot_id));
+        assert!(!store.get(1).unwrap().accounts.contains_key(&slot_id));
         assert!(!store.remove_extra_account(1, &slot_id).unwrap());
     }
 
@@ -906,7 +1184,101 @@ mod tests {
         store
             .update_extra_account_state(1, "does-not-exist", "state-x".to_string())
             .unwrap();
-        assert!(store.get(1).unwrap().extra_accounts.is_empty());
+        assert_eq!(store.get(1).unwrap().accounts.len(), 1);
+    }
+
+    #[test]
+    fn remove_account_cleans_up_associated_shared_mailboxes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.set(1, account("a@b.c")).unwrap();
+
+        let slot2 = store
+            .add_account(
+                1,
+                AccountSlot {
+                    slot_id: "slot2".to_string(),
+                    server_url: "https://other.example".to_string(),
+                    token: "tok2".to_string(),
+                    email: "b@b.c".to_string(),
+                    last_state: None,
+                },
+            )
+            .unwrap();
+
+        store
+            .set_shared_account(
+                1,
+                "shared_primary".to_string(),
+                "shared1".to_string(),
+                None,
+                Some("default".to_string()),
+            )
+            .unwrap();
+        store
+            .set_shared_account(
+                1,
+                "shared_slot2".to_string(),
+                "shared2".to_string(),
+                None,
+                Some(slot2.clone()),
+            )
+            .unwrap();
+
+        assert_eq!(store.get(1).unwrap().shared_accounts.len(), 2);
+
+        // Remove slot2: its child shared account should be purged, but default's shared account remains!
+        assert!(store.remove_account(1, &slot2).unwrap());
+        let remaining = store.get(1).unwrap();
+        assert_eq!(remaining.accounts.len(), 1);
+        assert_eq!(remaining.shared_accounts.len(), 1);
+        assert!(remaining.shared_accounts.contains_key("shared_primary"));
+        assert!(!remaining.shared_accounts.contains_key("shared_slot2"));
+
+        // Removing default removes the last account and clears the chat
+        assert!(store.remove_account(1, "default").unwrap());
+        assert!(store.get(1).is_none());
+    }
+
+    #[test]
+    fn remove_account_with_none_parent_slot_cleans_up_shared_mailboxes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.set(1, account("a@b.c")).unwrap();
+
+        let _slot2 = store
+            .add_account(
+                1,
+                AccountSlot {
+                    slot_id: "slot2".to_string(),
+                    server_url: "https://other.example".to_string(),
+                    token: "tok2".to_string(),
+                    email: "b@b.c".to_string(),
+                    last_state: None,
+                },
+            )
+            .unwrap();
+
+        store
+            .set_shared_account(
+                1,
+                "shared_primary".to_string(),
+                "shared1".to_string(),
+                None,
+                None, // parent_slot is None!
+            )
+            .unwrap();
+
+        assert_eq!(store.get(1).unwrap().shared_accounts.len(), 1);
+
+        // Remove default account: its child shared mailbox (parent_slot: None) must be removed!
+        assert!(store.remove_account(1, "default").unwrap());
+        let remaining = store.get(1).unwrap();
+        assert_eq!(remaining.accounts.len(), 1);
+        assert!(
+            remaining.shared_accounts.is_empty(),
+            "shared mailbox with parent_slot None must be removed when default account is removed"
+        );
     }
 
     #[test]
