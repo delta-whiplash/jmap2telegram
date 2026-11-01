@@ -10,7 +10,7 @@
 //! then retries each target's connect in its own background task on the
 //! watcher's backoff schedule (see [`crate::watcher::INITIAL_BACKOFF`]) -
 //! so a bot restarting against a JMAP server that is still down stays
-//! /readyz-honest (the accounts show up as disconnected) while the
+//! honest in its metrics (the accounts show up as disconnected) while the
 //! Telegram dispatcher is already live.
 
 use std::sync::Arc;
@@ -171,11 +171,11 @@ fn persisted_targets(account: &Account) -> Vec<ResumeTarget> {
 
 /// Registers every target's health key with `connected: false`, before
 /// any connect attempt is made. That ordering is the whole point: an
-/// account whose server is still down at boot shows up in /readyz as a
-/// named, disconnected watcher (503) rather than being silently absent
-/// from the registry (a green pod watching nothing), and the entry only
-/// disappears when a watcher takes the target over (re-registering the
-/// same key) or a `forget*` teardown drops it.
+/// account whose server is still down at boot shows up in /metrics as a
+/// disconnected watcher rather than being silently absent from the
+/// registry, and the entry only disappears when a watcher takes the
+/// target over (re-registering the same key) or a `forget*` teardown
+/// drops it.
 ///
 /// Split from [`spawn_boot_resume`] as its own step so tests can observe
 /// the registry exactly as boot leaves it, without a connect happening
@@ -217,8 +217,8 @@ pub fn spawn_boot_resume(bot: &Bot, state: &AppState, chat_id: i64, account: &Ac
 /// retrying pre-restart credentials, a `/partages` re-enable). Anything
 /// else - server down, token being rotated, network flapping - is just
 /// another round of backoff, which is what makes a persisted account no
-/// longer silently dead at boot: either its watcher comes up, or /readyz
-/// keeps saying so.
+/// longer silently dead at boot: either its watcher comes up, or the
+/// metrics keep showing it as disconnected.
 async fn resume_target_with(
     bot: Bot,
     state: AppState,
@@ -556,12 +556,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn boot_registration_marks_every_persisted_target_not_ready_before_any_connect() {
+    async fn boot_registration_marks_every_persisted_target_disconnected_before_any_connect() {
         // Regression test for the silent-green-boot bug: a dead JMAP server
         // at boot used to mean the account was never registered at all, so
-        // /readyz answered 200 for a bot that was silently watching
-        // nothing. Registration must happen before any connect attempt -
-        // verified here with zero connects having run at all.
+        // the bot was silently watching nothing. Registration must happen
+        // before any connect attempt - verified here with zero connects
+        // having run at all.
         let (state, _dir) = state_with_account(unreachable_account()).await;
         let targets = persisted_targets(&state.store.get(42).unwrap());
         register_persisted_targets(&state, 42, &targets);
@@ -581,20 +581,12 @@ mod tests {
                 "42/primary".to_string(),
                 "42/shared-acc7".to_string(),
             ],
-            "readiness must name exactly the three registered targets"
+            "all registered targets must be disconnected at boot with no connects"
         );
-        // And through the readiness contract itself: not ready, naming
-        // every persisted target.
-        let Err(failing) = state.health.readiness() else {
-            panic!("a registered-but-never-connected account must hold /readyz at 503");
-        };
-        let mut failing = failing;
-        failing.sort();
-        assert_eq!(failing, disconnected);
     }
 
     #[tokio::test]
-    async fn a_failing_connect_keeps_the_target_registered_and_not_ready() {
+    async fn a_failing_connect_keeps_the_target_registered_and_disconnected() {
         // The connect step here is the very `jmap::connect` boot resume
         // uses, against the account's real (unreachable) server URL - the
         // failure must leave the registration intact, not silently drop
@@ -616,7 +608,7 @@ mod tests {
         let snapshot = state.health.snapshot();
         assert_eq!(snapshot.len(), 3, "{snapshot:?}");
         assert!(snapshot.values().all(|s| !s.connected), "{snapshot:?}");
-        assert!(state.health.readiness().is_err());
+        assert!(state.health.snapshot().values().all(|s| !s.connected));
     }
 
     /// Canned connect step for driving the retry loop: fails a fixed
@@ -685,13 +677,15 @@ mod tests {
         // No adoption happened - the client map stays empty while the
         // server is down.
         assert!(state.clients.read().await.is_empty());
-        // And /readyz keeps naming every dead account (all three targets
-        // of the account stayed registered; only the primary's loop is
-        // being driven here).
-        let Err(failing) = state.health.readiness() else {
-            panic!("/readyz must keep naming the dead account");
-        };
-        let mut failing = failing;
+        // And the snapshot keeps every dead account registered (all three
+        // targets of the account stayed registered; only the primary's
+        // loop is being driven here).
+        let snapshot = state.health.snapshot();
+        let mut failing: Vec<String> = snapshot
+            .iter()
+            .filter(|(_, s)| !s.connected)
+            .map(|(k, _)| k.clone())
+            .collect();
         failing.sort();
         assert_eq!(
             failing,
