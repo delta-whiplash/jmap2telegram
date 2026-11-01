@@ -349,26 +349,43 @@ pub fn undo_keyboard(email_id: &str, account_id: Option<&str>, lang: &str) -> In
     )]])
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SharedAccountItem {
+    pub id: String,
+    pub name: String,
+    pub parent_slot: Option<String>,
+}
+
 /// Builds the `/partages` toggle menu: one button per shared JMAP account
-/// visible to the token right now, rung (🔔) when the chat is currently
+/// visible to the connected tokens right now, rung (🔔) when the chat is currently
 /// opted into notifications for it and silenced (🔕) otherwise. Bells
 /// rather than checkboxes because the menu's own text is a reminder that a
 /// tap toggles notifications, not a multi-select form. An account whose id
 /// is too long to fit Telegram's callback_data limit is left out rather
 /// than shown as a button that can never be tapped successfully.
 pub fn shared_accounts_keyboard(
-    accounts: &[(String, String)],
+    accounts: &[SharedAccountItem],
     enabled: &std::collections::HashSet<String>,
 ) -> InlineKeyboardMarkup {
     let rows: Vec<Vec<InlineKeyboardButton>> = accounts
         .iter()
-        .filter(|(id, _)| format!("s:{id}").len() <= TELEGRAM_CALLBACK_DATA_MAX_LEN)
-        .map(|(id, name)| {
-            let mark = if enabled.contains(id) { "🔔" } else { "🔕" };
-            vec![InlineKeyboardButton::callback(
-                format!("{mark} {name}"),
-                format!("s:{id}"),
-            )]
+        .filter_map(|item| {
+            let callback = match &item.parent_slot {
+                None => format!("s:{}", item.id),
+                Some(slot) => format!("s:{slot}:{}", item.id),
+            };
+            if callback.len() > TELEGRAM_CALLBACK_DATA_MAX_LEN {
+                return None;
+            }
+            let mark = if enabled.contains(&item.id) {
+                "🔔"
+            } else {
+                "🔕"
+            };
+            Some(vec![InlineKeyboardButton::callback(
+                format!("{mark} {}", item.name),
+                callback,
+            )])
         })
         .collect();
     InlineKeyboardMarkup::new(rows)
@@ -833,8 +850,16 @@ mod tests {
     #[test]
     fn shared_accounts_keyboard_rings_enabled_accounts() {
         let accounts = vec![
-            ("acc7".to_string(), "contact@delta-net.ovh".to_string()),
-            ("acc8".to_string(), "contact@cardinalcodes.com".to_string()),
+            SharedAccountItem {
+                id: "acc7".to_string(),
+                name: "contact@delta-net.ovh".to_string(),
+                parent_slot: None,
+            },
+            SharedAccountItem {
+                id: "acc8".to_string(),
+                name: "contact@cardinalcodes.com".to_string(),
+                parent_slot: None,
+            },
         ];
         let mut enabled = std::collections::HashSet::new();
         enabled.insert("acc7".to_string());
@@ -851,9 +876,24 @@ mod tests {
 
     #[test]
     fn shared_accounts_keyboard_omits_accounts_with_ids_too_long_for_telegram() {
-        let accounts = vec![("x".repeat(100), "unreachable".to_string())];
+        let accounts = vec![SharedAccountItem {
+            id: "x".repeat(100),
+            name: "unreachable".to_string(),
+            parent_slot: None,
+        }];
         let kb = shared_accounts_keyboard(&accounts, &std::collections::HashSet::new());
         assert!(kb.inline_keyboard.is_empty());
+    }
+
+    #[test]
+    fn shared_accounts_keyboard_encodes_parent_slot_for_extra_accounts() {
+        let accounts = vec![SharedAccountItem {
+            id: "acc9".to_string(),
+            name: "shared@extra.com".to_string(),
+            parent_slot: Some("slot1234".to_string()),
+        }];
+        let kb = shared_accounts_keyboard(&accounts, &std::collections::HashSet::new());
+        assert_eq!(callback_data(&kb.inline_keyboard[0][0]), "s:slot1234:acc9");
     }
 
     #[test]

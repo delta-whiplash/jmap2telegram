@@ -565,6 +565,7 @@ mod tests {
                 SharedAccount {
                     name: "shared@b.c".to_string(),
                     last_state: Some("shared-state".to_string()),
+                    parent_slot: None,
                 },
             )]),
             extra_accounts: HashMap::from([(

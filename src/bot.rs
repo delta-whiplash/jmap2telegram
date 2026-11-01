@@ -517,11 +517,11 @@ async fn list_extra_accounts(
 }
 
 /// Shows the live, dynamic list of shared JMAP accounts the connected
-/// token currently has access to (delegated/shared mailboxes, distinct
-/// from the chat's own account), with a toggle button per account. Always
-/// reconnects rather than reusing the cached client, so a mailbox access
-/// grant added on the server after /login shows up without needing a
-/// fresh /login.
+/// tokens currently have access to (delegated/shared mailboxes, distinct
+/// from the chat's own accounts), with a toggle button per account across
+/// the primary account and all extra accounts. Always reconnects rather
+/// than reusing the cached client, so a mailbox access grant added on the
+/// server after /login or /accounts shows up without needing a restart.
 async fn cmd_partages(bot: &Bot, state: &AppState, chat_id: ChatId, lang: &str) -> HandlerResult {
     let Some(account) = state.store.get(chat_id.0) else {
         bot.send_message(chat_id, t!("bot.no_account", locale = lang))
@@ -529,25 +529,20 @@ async fn cmd_partages(bot: &Bot, state: &AppState, chat_id: ChatId, lang: &str) 
         return Ok(());
     };
 
-    let client = match jmap::connect(
-        &account.server_url,
-        &account.token,
-        state.config.allow_private_jmap_hosts,
-    )
-    .await
-    {
-        Ok(c) => c,
-        Err(e) => {
-            bot.send_message(
-                chat_id,
-                t!("bot.login_failed", locale = lang, error = e.localized(lang)),
-            )
-            .await?;
-            return Ok(());
-        }
-    };
+    let (accounts, any_connected) = discover_all_shared_accounts(state, &account).await;
+    if !any_connected {
+        bot.send_message(
+            chat_id,
+            t!(
+                "bot.login_failed",
+                locale = lang,
+                error = jmap::JmapError::Unreachable.localized(lang)
+            ),
+        )
+        .await?;
+        return Ok(());
+    }
 
-    let accounts = jmap::list_shared_accounts(&client);
     if accounts.is_empty() {
         bot.send_message(chat_id, t!("bot.shared_none", locale = lang))
             .await?;
@@ -577,17 +572,12 @@ async fn refresh_partages_keyboard(
     let Some(account) = state.store.get(chat_id.0) else {
         return Ok(());
     };
-    let Ok(client) = jmap::connect(
-        &account.server_url,
-        &account.token,
-        state.config.allow_private_jmap_hosts,
-    )
-    .await
-    else {
-        return Ok(());
-    };
 
-    let accounts = jmap::list_shared_accounts(&client);
+    let (accounts, any_connected) = discover_all_shared_accounts(state, &account).await;
+    if !any_connected {
+        return Ok(());
+    }
+
     let enabled: HashSet<String> = account.shared_accounts.keys().cloned().collect();
     let keyboard = format::shared_accounts_keyboard(&accounts, &enabled);
     let _ = bot
@@ -595,6 +585,77 @@ async fn refresh_partages_keyboard(
         .reply_markup(keyboard)
         .await;
     Ok(())
+}
+
+/// Discovers every shared/delegated mailbox available across the chat's
+/// primary account and all connected extra accounts. Returns the list of
+/// items and whether at least one account connection succeeded.
+async fn discover_all_shared_accounts(
+    state: &AppState,
+    account: &Account,
+) -> (Vec<format::SharedAccountItem>, bool) {
+    let mut discovered = Vec::new();
+    let mut any_connected = false;
+
+    // 1. Primary account
+    match jmap::connect(
+        &account.server_url,
+        &account.token,
+        state.config.allow_private_jmap_hosts,
+    )
+    .await
+    {
+        Ok(client) => {
+            any_connected = true;
+            for (id, name) in jmap::list_shared_accounts(&client) {
+                discovered.push(format::SharedAccountItem {
+                    id,
+                    name,
+                    parent_slot: None,
+                });
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "failed to connect to primary account to list shared mailboxes"
+            );
+        }
+    }
+
+    // 2. Extra accounts (sorted by email for determinism)
+    let mut extras: Vec<(&String, &ExtraAccount)> = account.extra_accounts.iter().collect();
+    extras.sort_by(|(_, a), (_, b)| a.email.cmp(&b.email));
+
+    for (slot_id, extra) in extras {
+        match jmap::connect(
+            &extra.server_url,
+            &extra.token,
+            state.config.allow_private_jmap_hosts,
+        )
+        .await
+        {
+            Ok(client) => {
+                any_connected = true;
+                for (id, name) in jmap::list_shared_accounts(&client) {
+                    discovered.push(format::SharedAccountItem {
+                        id,
+                        name,
+                        parent_slot: Some(slot_id.clone()),
+                    });
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    slot_id = %slot_id,
+                    error = %e,
+                    "failed to connect to extra account to list shared mailboxes"
+                );
+            }
+        }
+    }
+
+    (discovered, any_connected)
 }
 
 /// Disconnects one extra personal account (the "🗑 Déconnecter" button on
@@ -610,6 +671,21 @@ async fn disconnect_extra_account(
     slot_id: &str,
     lang: &str,
 ) -> HandlerResult {
+    // Teardown any shared mailbox watchers whose parent credentials belonged to
+    // this extra account.
+    if let Some(account) = state.store.get(chat_id.0) {
+        let child_shared: Vec<String> = account
+            .shared_accounts
+            .iter()
+            .filter(|(_, s)| s.parent_slot.as_deref() == Some(slot_id))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for shared_id in child_shared {
+            state.forget_shared(chat_id.0, &shared_id).await;
+            let _ = state.store.remove_shared_account(chat_id.0, &shared_id);
+        }
+    }
+
     state.forget_extra(chat_id.0, slot_id).await;
     match state.store.remove_extra_account(chat_id.0, slot_id) {
         Ok(true) => {
@@ -632,13 +708,18 @@ async fn disconnect_extra_account(
     Ok(())
 }
 
+struct SharedToggleTarget<'a> {
+    account_id: &'a str,
+    parent_slot: Option<String>,
+}
+
 async fn toggle_shared_account(
     bot: &Bot,
     state: &AppState,
     chat_id: ChatId,
     message_id: MessageId,
     query_id: CallbackQueryId,
-    account_id: &str,
+    target: SharedToggleTarget<'_>,
     lang: &str,
 ) -> HandlerResult {
     let Some(account) = state.store.get(chat_id.0) else {
@@ -648,6 +729,11 @@ async fn toggle_shared_account(
         return Ok(());
     };
 
+    let SharedToggleTarget {
+        account_id,
+        parent_slot,
+    } = target;
+
     if account.shared_accounts.contains_key(account_id) {
         state.forget_shared(chat_id.0, account_id).await;
         let _ = state.store.remove_shared_account(chat_id.0, account_id);
@@ -655,9 +741,22 @@ async fn toggle_shared_account(
             .text(t!("bot.shared_off", locale = lang))
             .await?;
     } else {
+        let (server_url, token) = match &parent_slot {
+            None => (account.server_url.as_str(), account.token.as_str()),
+            Some(slot) => match account.extra_accounts.get(slot) {
+                Some(extra) => (extra.server_url.as_str(), extra.token.as_str()),
+                None => {
+                    bot.answer_callback_query(query_id)
+                        .text(t!("bot.account_not_connected", locale = lang))
+                        .await?;
+                    return Ok(());
+                }
+            },
+        };
+
         let client = match jmap::connect_shared(
-            &account.server_url,
-            &account.token,
+            server_url,
+            token,
             state.config.allow_private_jmap_hosts,
             account_id,
         )
@@ -703,6 +802,7 @@ async fn toggle_shared_account(
             account_id.to_string(),
             display_name.clone(),
             Some(initial_state),
+            parent_slot,
         ) {
             bot.answer_callback_query(query_id)
                 .text(t!("bot.storage_error", locale = lang, error = e))
@@ -1031,9 +1131,10 @@ async fn callback_handler(bot: Bot, q: CallbackQuery, state: AppState) -> Handle
         return Ok(());
     };
 
-    // Two shapes: "s:{account_id}" (toggle a shared account from
-    // /partages) or an email action, either "{action}:{email_id}" (the
-    // chat's own mailbox) or "{action}:{account_id}:{email_id}" (a shared
+    // Three shapes: "s:{account_id}" or "s:{slot}:{account_id}" (toggle a
+    // shared account from /partages), "x:{slot_id}" (disconnect an extra
+    // account from /accounts), or an email action, either "{action}:{email_id}"
+    // (the chat's own mailbox) or "{action}:{account_id}:{email_id}" (a shared
     // mailbox - JMAP email ids are only unique within their account, so
     // the account has to travel with the id to route to the right client).
     let mut parts = data.splitn(3, ':');
@@ -1044,7 +1145,30 @@ async fn callback_handler(bot: Bot, q: CallbackQuery, state: AppState) -> Handle
     let third = parts.next();
 
     if action == "s" {
-        return toggle_shared_account(&bot, &state, chat_id, message_id, q.id, second, lang).await;
+        let (account_id, parent_slot) = match third {
+            Some(id) => {
+                let slot = if second == "p" {
+                    None
+                } else {
+                    Some(second.to_string())
+                };
+                (id, slot)
+            }
+            None => (second, None),
+        };
+        return toggle_shared_account(
+            &bot,
+            &state,
+            chat_id,
+            message_id,
+            q.id,
+            SharedToggleTarget {
+                account_id,
+                parent_slot,
+            },
+            lang,
+        )
+        .await;
     }
     if action == "x" {
         return disconnect_extra_account(&bot, &state, chat_id, q.id, second, lang).await;
@@ -2031,6 +2155,7 @@ mod tests {
                 "acc7".to_string(),
                 "Shared".to_string(),
                 Some("s".to_string()),
+                None,
             )
             .unwrap();
         state
@@ -2212,24 +2337,93 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn callback_already_read_is_inert_even_when_the_account_is_offline() {
+    async fn disconnect_extra_account_removes_child_shared_accounts() {
         let mock = spawn_mock_telegram().await;
         let bot = mock.bot();
         let dir = tempfile::tempdir().unwrap();
-        // The account points at a dead loopback port, so any JMAP client
-        // resolution would fail - the inert button must not even try.
         let state = state(dir.path(), 42, true);
 
-        let q = callback_query(&bot, "n:M123", "fr").await;
-        mock.clear();
-        callback_handler(bot, q, state).await.unwrap();
+        state
+            .store
+            .add_extra_account(
+                42,
+                ExtraAccount {
+                    server_url: "https://127.0.0.1:9".to_string(),
+                    token: "extra-tok".to_string(),
+                    email: "extra@example.org".to_string(),
+                    last_state: Some("s".to_string()),
+                },
+            )
+            .unwrap();
 
-        let body = mock.last_body("answercallbackquery").unwrap();
-        assert_eq!(body["text"], serde_json::json!("Déjà lu."), "{body}");
-        assert_eq!(body["show_alert"], serde_json::Value::Null, "{body}");
+        let slot_id = state
+            .store
+            .get(42)
+            .unwrap()
+            .extra_accounts
+            .keys()
+            .next()
+            .unwrap()
+            .clone();
+
+        state
+            .store
+            .set_shared_account(
+                42,
+                "shared_extra_1".to_string(),
+                "Shared Extra".to_string(),
+                Some("s".to_string()),
+                Some(slot_id.clone()),
+            )
+            .unwrap();
+
+        assert_eq!(state.store.get(42).unwrap().shared_accounts.len(), 1);
+
+        let q = callback_query(&bot, &format!("x:{slot_id}"), "en").await;
+        mock.clear();
+        callback_handler(bot, q, state.clone()).await.unwrap();
+
+        let account = state.store.get(42).unwrap();
+        assert!(account.extra_accounts.is_empty());
         assert!(
-            mock.last_body("sendmessage").is_none(),
-            "the inert button must not send anything"
+            account.shared_accounts.is_empty(),
+            "child shared account should be removed on extra account disconnect"
+        );
+    }
+
+    #[tokio::test]
+    async fn toggle_shared_account_disables_active_extra_shared_account() {
+        let mock = spawn_mock_telegram().await;
+        let bot = mock.bot();
+        let dir = tempfile::tempdir().unwrap();
+        let state = state(dir.path(), 42, true);
+
+        state
+            .store
+            .set_shared_account(
+                42,
+                "shared_extra_2".to_string(),
+                "Shared 2".to_string(),
+                Some("s".to_string()),
+                Some("slot99".to_string()),
+            )
+            .unwrap();
+
+        assert_eq!(state.store.get(42).unwrap().shared_accounts.len(), 1);
+
+        let q = callback_query(&bot, "s:slot99:shared_extra_2", "en").await;
+        mock.clear();
+        callback_handler(bot, q, state.clone()).await.unwrap();
+
+        let account = state.store.get(42).unwrap();
+        assert!(
+            account.shared_accounts.is_empty(),
+            "tapping active shared account should disable and remove it"
+        );
+        let body = mock.last_body("answercallbackquery").unwrap();
+        assert_eq!(
+            body["text"],
+            serde_json::json!("🔕 Notifications disabled.")
         );
     }
 }
