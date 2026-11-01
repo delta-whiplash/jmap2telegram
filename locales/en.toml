@@ -13,10 +13,28 @@ accounts = "additional personal account: /accounts <server_url> <token> (no argu
 mute = "filter a sender/keyword: /mute <term> (no argument: list active filters)"
 unmute = "remove a filter: /unmute <term>"
 search = "full-text search in the mailbox: /search <text>"
+threads = "manage threaded mode / forum topics: /threads [on|off]"
 lang = "change the bot language: /lang <en|fr>"
 help = "show help"
 
+[topics]
+welcome_slot = "📬 Notifications for %{email} will arrive in this topic."
+welcome_shared = "👥 Notifications for shared mailbox %{name} will arrive in this topic."
+
 [bot]
+threads_enabled_success = "✨ Threaded mode enabled! %{count} topic(s) created."
+threads_disabled_success = "🔕 Threaded mode disabled. All notifications will arrive in the main chat."
+threads_not_forum = "⚠️ Could not create topics: the bot does not have Threaded Mode enabled in @BotFather. Please enable it in @BotFather > Bot Settings > Threads Settings > Threaded Mode, then run /threads on."
+threads_status_on = "Enabled"
+threads_status_off = "Disabled"
+threads_overview = "🧵 *Threaded Conversations*\n\nStatus: *%{status}*\nServer default: *%{server_mode}*\nConnected accounts: *%{count}*\n\nWhen enabled, each mail account has its own dedicated topic in this chat."
+threads_btn_enable = "🔔 Enable topics"
+threads_btn_disable = "🔕 Disable topics"
+threads_btn_sync = "🔄 Sync topics"
+threads_toast_enabled = "✨ Topics enabled"
+threads_toast_disabled = "🔕 Topics disabled"
+threads_toast_synced = "🔄 Topics synchronized"
+threads_toast_not_forum = "⚠️ Threaded Mode is disabled in @BotFather"
 no_account = "No account connected. Type /login to get started."
 unauthorized = "⛔ Unauthorized. This bot is restricted to authorized users."
 unknown_command = "Unknown command. Type /help for the list of commands."

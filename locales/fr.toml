@@ -12,10 +12,28 @@ accounts = "compte perso supplémentaire : /accounts <server_url> <token> (sans 
 mute = "filtrer un expéditeur/mot-clé : /mute <terme> (sans argument : liste les filtres actifs)"
 unmute = "annule un filtre : /unmute <terme>"
 search = "recherche plein texte dans la boîte : /search <texte>"
+threads = "gérer les onglets / topics Telegram : /threads [on|off]"
 lang = "changer la langue du bot : /lang <en|fr>"
 help = "afficher l'aide"
 
+[topics]
+welcome_slot = "📬 Les notifications pour %{email} arriveront dans cet onglet."
+welcome_shared = "👥 Les notifications pour la boîte partagée %{name} arriveront dans cet onglet."
+
 [bot]
+threads_enabled_success = "✨ Onglets activés ! %{count} onglet(s) créé(s)."
+threads_disabled_success = "🔕 Onglets désactivés. Toutes les notifications arriveront dans le fil principal."
+threads_not_forum = "⚠️ Impossible de créer les onglets : le mode 'Threaded Mode' n'est pas activé pour ce bot dans @BotFather. Veuillez l'activer dans @BotFather > Bot Settings > Threads Settings > Threaded Mode, puis tapez /threads on."
+threads_status_on = "Activé"
+threads_status_off = "Désactivé"
+threads_overview = "🧵 *Gestion des onglets (Threads)*\n\nStatut : *%{status}*\nMode serveur : *%{server_mode}*\nComptes connectés : *%{count}*\n\nLorsqu'activé, chaque compte mail dispose de son propre onglet dédié dans cette conversation."
+threads_btn_enable = "🔔 Activer les onglets"
+threads_btn_disable = "🔕 Désactiver les onglets"
+threads_btn_sync = "🔄 Synchroniser les onglets"
+threads_toast_enabled = "✨ Onglets activés"
+threads_toast_disabled = "🔕 Onglets désactivés"
+threads_toast_synced = "🔄 Onglets synchronisés"
+threads_toast_not_forum = "⚠️ Threaded Mode désactivé dans @BotFather"
 no_account = "Aucun compte connecté. Tape /login pour commencer."
 unauthorized = "⛔ Accès non autorisé. Ce bot est réservé à des utilisateurs autorisés."
 unknown_command = "Commande inconnue. Tape /help pour la liste des commandes."

@@ -61,6 +61,12 @@ spec:
               value: {{ .Values.timezone | quote }}
             - name: BOT_LANGUAGE
               value: {{ .Values.language | quote }}
+            - name: TELEGRAM_THREADED_MODE
+              value: {{ .Values.telegram.threadedMode | default "auto" | quote }}
+            - name: TELEGRAM_THREAD_STRATEGY
+              value: {{ .Values.telegram.threadStrategy | default "account" | quote }}
+            - name: TELEGRAM_SHARED_THREAD_MODE
+              value: {{ .Values.telegram.sharedThreadMode | default "parent" | quote }}
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

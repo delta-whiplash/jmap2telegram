@@ -26,6 +26,8 @@ pub struct AccountSlot {
     pub email: String,
     #[serde(default)]
     pub last_state: Option<String>,
+    #[serde(default)]
+    pub thread_id: Option<i32>,
 }
 
 /// Legacy alias for `AccountSlot`.
@@ -45,6 +47,9 @@ pub struct SharedAccount {
     /// shared mailbox. `None` falls back to the default/first account slot.
     #[serde(default)]
     pub parent_slot: Option<String>,
+    /// Telegram forum topic thread id for dedicated shared mailbox topics.
+    #[serde(default)]
+    pub thread_id: Option<i32>,
 }
 
 impl SharedAccount {
@@ -95,6 +100,10 @@ pub struct Account {
     /// Applies across every connected account and shared mailbox.
     #[serde(default)]
     pub muted: Vec<String>,
+    /// Optional user preference override for Telegram threaded mode (forum topics).
+    /// `None` follows the deployment's `TELEGRAM_THREADED_MODE` setting.
+    #[serde(default)]
+    pub threads_enabled: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -108,6 +117,8 @@ enum AccountVersion {
         shared_accounts: HashMap<String, SharedAccount>,
         #[serde(default)]
         muted: Vec<String>,
+        #[serde(default)]
+        threads_enabled: Option<bool>,
     },
     Legacy {
         server_url: String,
@@ -123,6 +134,8 @@ enum AccountVersion {
         extra_accounts: HashMap<String, LegacyAccountSlotHelper>,
         #[serde(default)]
         muted: Vec<String>,
+        #[serde(default)]
+        threads_enabled: Option<bool>,
     },
 }
 
@@ -147,6 +160,7 @@ impl<'de> Deserialize<'de> for Account {
                 mut shared_accounts,
                 accounts,
                 muted,
+                threads_enabled,
             } => {
                 for shared in shared_accounts.values_mut() {
                     if shared.parent_slot.is_none() {
@@ -158,6 +172,7 @@ impl<'de> Deserialize<'de> for Account {
                     shared_accounts,
                     accounts,
                     muted,
+                    threads_enabled,
                 })
             }
             AccountVersion::Legacy {
@@ -169,6 +184,7 @@ impl<'de> Deserialize<'de> for Account {
                 mut shared_accounts,
                 extra_accounts,
                 muted,
+                threads_enabled,
             } => {
                 let default_slot_id = "default".to_string();
                 let mut accounts = BTreeMap::new();
@@ -180,6 +196,7 @@ impl<'de> Deserialize<'de> for Account {
                         token,
                         email,
                         last_state,
+                        thread_id: None,
                     },
                 );
                 for (extra_id, extra) in extra_accounts {
@@ -191,6 +208,7 @@ impl<'de> Deserialize<'de> for Account {
                             token: extra.token,
                             email: extra.email,
                             last_state: extra.last_state,
+                            thread_id: None,
                         },
                     );
                 }
@@ -204,6 +222,7 @@ impl<'de> Deserialize<'de> for Account {
                     shared_accounts,
                     accounts,
                     muted,
+                    threads_enabled,
                 })
             }
         }
@@ -224,6 +243,7 @@ impl Account {
                 token,
                 email,
                 last_state: None,
+                thread_id: None,
             },
         );
         Self {
@@ -231,6 +251,7 @@ impl Account {
             shared_accounts: HashMap::new(),
             accounts,
             muted: Vec::new(),
+            threads_enabled: None,
         }
     }
 
@@ -396,6 +417,7 @@ impl Store {
                 shared_accounts: HashMap::new(),
                 accounts: BTreeMap::new(),
                 muted: Vec::new(),
+                threads_enabled: None,
             });
             acc.accounts.insert(slot_id.clone(), slot);
         }
@@ -447,6 +469,63 @@ impl Store {
         self.persist()
     }
 
+    /// Sets or clears the Telegram forum topic thread id for an account slot.
+    pub fn set_account_thread_id(
+        &self,
+        chat_id: i64,
+        slot_id: &str,
+        thread_id: Option<i32>,
+    ) -> Result<bool> {
+        {
+            let mut data = self.data.write().unwrap();
+            match data
+                .accounts
+                .get_mut(&chat_id)
+                .and_then(|acc| acc.accounts.get_mut(slot_id))
+            {
+                Some(slot) => slot.thread_id = thread_id,
+                None => return Ok(false),
+            }
+        }
+        self.persist()?;
+        Ok(true)
+    }
+
+    /// Sets or clears the Telegram forum topic thread id for a shared account.
+    pub fn set_shared_account_thread_id(
+        &self,
+        chat_id: i64,
+        account_id: &str,
+        thread_id: Option<i32>,
+    ) -> Result<bool> {
+        {
+            let mut data = self.data.write().unwrap();
+            match data
+                .accounts
+                .get_mut(&chat_id)
+                .and_then(|acc| acc.shared_accounts.get_mut(account_id))
+            {
+                Some(shared) => shared.thread_id = thread_id,
+                None => return Ok(false),
+            }
+        }
+        self.persist()?;
+        Ok(true)
+    }
+
+    /// Sets or clears the chat's preference for Telegram threaded conversations.
+    pub fn set_threads_enabled(&self, chat_id: i64, enabled: Option<bool>) -> Result<bool> {
+        {
+            let mut data = self.data.write().unwrap();
+            match data.accounts.get_mut(&chat_id) {
+                Some(acc) => acc.threads_enabled = enabled,
+                None => return Ok(false),
+            }
+        }
+        self.persist()?;
+        Ok(true)
+    }
+
     /// Records the chat's language preference (`/lang`). No-ops - returning
     /// `false` - for a chat with no account, since the preference lives on
     /// the account record and the caller reports that to the user.
@@ -483,6 +562,7 @@ impl Store {
                             name,
                             last_state,
                             parent_slot,
+                            thread_id: None,
                         },
                     );
                 }
@@ -803,6 +883,7 @@ mod tests {
             token: "other-token".to_string(),
             email: email.to_string(),
             last_state: None,
+            thread_id: None,
         }
     }
 
@@ -1202,6 +1283,7 @@ mod tests {
                     token: "tok2".to_string(),
                     email: "b@b.c".to_string(),
                     last_state: None,
+                    thread_id: None,
                 },
             )
             .unwrap();
@@ -1255,6 +1337,7 @@ mod tests {
                     token: "tok2".to_string(),
                     email: "b@b.c".to_string(),
                     last_state: None,
+                    thread_id: None,
                 },
             )
             .unwrap();
@@ -1326,5 +1409,60 @@ mod tests {
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].0, 1);
         assert_eq!(all[1].0, 2);
+    }
+
+    #[test]
+    fn thread_id_and_threads_enabled_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.set(1, account("a@b.c")).unwrap();
+
+        // Initially thread_id and threads_enabled are None
+        let acc = store.get(1).unwrap();
+        assert_eq!(acc.accounts["default"].thread_id, None);
+        assert_eq!(acc.threads_enabled, None);
+
+        // Set thread_id on account slot
+        assert!(
+            store
+                .set_account_thread_id(1, "default", Some(12345))
+                .unwrap()
+        );
+        assert_eq!(
+            store.get(1).unwrap().accounts["default"].thread_id,
+            Some(12345)
+        );
+
+        // Set threads_enabled preference
+        assert!(store.set_threads_enabled(1, Some(true)).unwrap());
+        assert_eq!(store.get(1).unwrap().threads_enabled, Some(true));
+
+        // Set shared account and its thread_id
+        store
+            .set_shared_account(1, "s1".to_string(), "shared@b.c".to_string(), None, None)
+            .unwrap();
+        assert_eq!(store.get(1).unwrap().shared_accounts["s1"].thread_id, None);
+        assert!(
+            store
+                .set_shared_account_thread_id(1, "s1", Some(67890))
+                .unwrap()
+        );
+        assert_eq!(
+            store.get(1).unwrap().shared_accounts["s1"].thread_id,
+            Some(67890)
+        );
+
+        // Unknown chat returns false
+        assert!(
+            !store
+                .set_account_thread_id(999, "default", Some(1))
+                .unwrap()
+        );
+        assert!(
+            !store
+                .set_shared_account_thread_id(999, "s1", Some(1))
+                .unwrap()
+        );
+        assert!(!store.set_threads_enabled(999, Some(false)).unwrap());
     }
 }

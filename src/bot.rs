@@ -5,12 +5,13 @@ use teloxide::dispatching::UpdateHandler;
 use teloxide::prelude::*;
 use teloxide::types::{
     CallbackQueryId, ChatAction, InlineKeyboardButton, InlineKeyboardMarkup, Me, MessageId,
-    ParseMode,
+    ParseMode, ThreadId,
 };
 use teloxide::utils::command::BotCommands;
 
 use crate::Bot;
 use crate::accounts;
+use crate::config::ThreadedModeConfig;
 use crate::format::{self, TELEGRAM_MAX_MESSAGE_LEN, chunk_text};
 use crate::i18n;
 use crate::jmap;
@@ -18,6 +19,43 @@ use crate::state::{AppState, PendingUndo, UNDO_WINDOW};
 use crate::store::{Account, AccountSlot};
 
 type HandlerResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+/// Chat target for outgoing messages, routing either to the chat root
+/// or to a specific forum topic (thread).
+#[derive(Clone, Copy, Debug)]
+pub struct ChatTarget {
+    pub id: ChatId,
+    pub thread_id: Option<ThreadId>,
+}
+
+impl From<ChatId> for ChatTarget {
+    fn from(id: ChatId) -> Self {
+        Self {
+            id,
+            thread_id: None,
+        }
+    }
+}
+
+impl From<(ChatId, Option<ThreadId>)> for ChatTarget {
+    fn from((id, thread_id): (ChatId, Option<ThreadId>)) -> Self {
+        Self { id, thread_id }
+    }
+}
+
+impl ChatTarget {
+    pub fn send(
+        &self,
+        bot: &Bot,
+        text: impl Into<String>,
+    ) -> <Bot as teloxide::requests::Requester>::SendMessage {
+        let mut req = bot.send_message(self.id, text);
+        if let Some(tid) = self.thread_id {
+            req = req.message_thread_id(tid);
+        }
+        req
+    }
+}
 
 /// Command names are stable English identifiers (telegram's autocomplete and
 /// muscle memory both key off them); the French names users already know are
@@ -63,6 +101,12 @@ pub enum Command {
     )]
     Search { query: String },
     #[command(
+        description = "manage threaded mode / forum topics: /threads [on|off]",
+        alias = "onglets",
+        hide_aliases
+    )]
+    Threads { arg: String },
+    #[command(
         description = "change the bot language: /lang <en|fr>",
         alias = "langue",
         hide_aliases
@@ -80,6 +124,10 @@ pub fn schema() -> UpdateHandler<Box<dyn std::error::Error + Send + Sync + 'stat
 
 async fn message_handler(bot: Bot, msg: Message, me: Me, state: AppState) -> HandlerResult {
     let chat_id = msg.chat.id;
+    let target = ChatTarget {
+        id: chat_id,
+        thread_id: msg.thread_id,
+    };
     // Resolved once per update: the stored preference, else this client's
     // own `language_code`, else the operator's `BOT_LANGUAGE`.
     let lang = state.language_for(
@@ -98,7 +146,8 @@ async fn message_handler(bot: Bot, msg: Message, me: Me, state: AppState) -> Han
 
     if !state.config.authorized_chat_ids.contains(&chat_id) {
         tracing::warn!(chat_id = chat_id.0, "unauthorized access attempt");
-        bot.send_message(chat_id, t!("bot.unauthorized", locale = lang))
+        target
+            .send(&bot, t!("bot.unauthorized", locale = lang))
             .await?;
         return Ok(());
     }
@@ -108,9 +157,9 @@ async fn message_handler(bot: Bot, msg: Message, me: Me, state: AppState) -> Han
     };
 
     match BotCommands::parse(text, me.username()) {
-        Ok(Command::Start) => cmd_start(&bot, &state, chat_id, lang).await?,
+        Ok(Command::Start) => cmd_start(&bot, &state, target, lang).await?,
         Ok(Command::Help) => {
-            bot.send_message(chat_id, i18n::help_text(lang)).await?;
+            target.send(&bot, i18n::help_text(lang)).await?;
         }
         Ok(Command::Login { server_url, token }) => {
             // The token is sensitive: remove it from the chat history as
@@ -120,32 +169,36 @@ async fn message_handler(bot: Bot, msg: Message, me: Me, state: AppState) -> Han
             // sure the user actually finds out instead of trusting a
             // promise the bot couldn't keep.
             if bot.delete_message(chat_id, msg.id).await.is_err() {
-                bot.send_message(chat_id, t!("bot.delete_token_login", locale = lang))
+                target
+                    .send(&bot, t!("bot.delete_token_login", locale = lang))
                     .await?;
             }
-            cmd_login(&bot, &state, chat_id, server_url, token, lang).await?;
+            cmd_login(&bot, &state, target, server_url, token, lang).await?;
         }
-        Ok(Command::Logout) => cmd_logout(&bot, &state, chat_id, lang).await?,
-        Ok(Command::Status) => cmd_status(&bot, &state, chat_id, lang).await?,
-        Ok(Command::Shared) => cmd_partages(&bot, &state, chat_id, lang).await?,
+        Ok(Command::Logout) => cmd_logout(&bot, &state, target, lang).await?,
+        Ok(Command::Status) => cmd_status(&bot, &state, target, lang).await?,
+        Ok(Command::Shared) => cmd_partages(&bot, &state, target, lang).await?,
         Ok(Command::Accounts { args }) => {
             // Same as /login: when this carries a token (i.e. it's not the
             // bare "list what's connected" form), delete it from the chat
             // history right after reading it.
             if !args.trim().is_empty() && bot.delete_message(chat_id, msg.id).await.is_err() {
-                bot.send_message(chat_id, t!("bot.delete_token_accounts", locale = lang))
+                target
+                    .send(&bot, t!("bot.delete_token_accounts", locale = lang))
                     .await?;
             }
-            cmd_comptes(&bot, &state, chat_id, args, lang).await?
+            cmd_comptes(&bot, &state, target, args, lang).await?
         }
-        Ok(Command::Mute { term }) => cmd_mute(&bot, &state, chat_id, term, lang).await?,
-        Ok(Command::Unmute { term }) => cmd_unmute(&bot, &state, chat_id, term, lang).await?,
-        Ok(Command::Search { query }) => cmd_rechercher(&bot, &state, chat_id, query, lang).await?,
+        Ok(Command::Mute { term }) => cmd_mute(&bot, &state, target, term, lang).await?,
+        Ok(Command::Unmute { term }) => cmd_unmute(&bot, &state, target, term, lang).await?,
+        Ok(Command::Search { query }) => cmd_rechercher(&bot, &state, target, query, lang).await?,
+        Ok(Command::Threads { arg }) => cmd_threads(&bot, &state, target, &arg, lang).await?,
         Ok(Command::Lang { lang: requested }) => {
-            cmd_lang(&bot, &state, chat_id, requested, lang).await?
+            cmd_lang(&bot, &state, target, requested, lang).await?
         }
         Err(_) => {
-            bot.send_message(chat_id, t!("bot.unknown_command", locale = lang))
+            target
+                .send(&bot, t!("bot.unknown_command", locale = lang))
                 .await?;
         }
     }
@@ -159,70 +212,86 @@ async fn message_handler(bot: Bot, msg: Message, me: Me, state: AppState) -> Han
 async fn cmd_lang(
     bot: &Bot,
     state: &AppState,
-    chat_id: ChatId,
+    target: impl Into<ChatTarget>,
     requested: String,
     lang: &str,
 ) -> HandlerResult {
+    let target = target.into();
+    let chat_id = target.id;
     let requested = requested.trim();
     if requested.is_empty() {
-        bot.send_message(chat_id, t!("bot.lang_usage", locale = lang, current = lang))
+        target
+            .send(bot, t!("bot.lang_usage", locale = lang, current = lang))
             .await?;
         return Ok(());
     }
 
-    let Some(target) = i18n::canonical(requested) else {
-        bot.send_message(chat_id, t!("bot.lang_invalid", locale = lang))
+    let Some(target_lang) = i18n::canonical(requested) else {
+        target
+            .send(bot, t!("bot.lang_invalid", locale = lang))
             .await?;
         return Ok(());
     };
 
-    match state.store.set_language(chat_id.0, target) {
+    match state.store.set_language(chat_id.0, target_lang) {
         // Confirm in the newly selected language, not the one they were
         // just reading - that way the change is immediately visible.
         Ok(true) => {
-            bot.send_message(chat_id, t!("bot.lang_set", locale = target))
+            target
+                .send(bot, t!("bot.lang_set", locale = target_lang))
                 .await?;
         }
         Ok(false) => {
-            bot.send_message(chat_id, t!("bot.no_account", locale = lang))
+            target
+                .send(bot, t!("bot.no_account", locale = lang))
                 .await?;
         }
         Err(e) => {
-            bot.send_message(chat_id, t!("bot.storage_error", locale = lang, error = e))
+            target
+                .send(bot, t!("bot.storage_error", locale = lang, error = e))
                 .await?;
         }
     }
     Ok(())
 }
 
-async fn cmd_start(bot: &Bot, state: &AppState, chat_id: ChatId, lang: &str) -> HandlerResult {
+async fn cmd_start(
+    bot: &Bot,
+    state: &AppState,
+    target: impl Into<ChatTarget>,
+    lang: &str,
+) -> HandlerResult {
+    let target = target.into();
+    let chat_id = target.id;
     if state.store.get(chat_id.0).is_some() {
-        cmd_status(bot, state, chat_id, lang).await?;
+        cmd_status(bot, state, target, lang).await?;
         return Ok(());
     }
 
-    bot.send_message(chat_id, t!("bot.welcome", locale = lang))
-        .await?;
+    target.send(bot, t!("bot.welcome", locale = lang)).await?;
     Ok(())
 }
 
 async fn cmd_login(
     bot: &Bot,
     state: &AppState,
-    chat_id: ChatId,
+    target: impl Into<ChatTarget>,
     server_url: String,
     token: String,
     lang: &str,
 ) -> HandlerResult {
+    let target = target.into();
+    let chat_id = target.id;
     let client =
         match jmap::connect(&server_url, &token, state.config.allow_private_jmap_hosts).await {
             Ok(c) => c,
             Err(e) => {
-                bot.send_message(
-                    chat_id,
-                    t!("bot.login_failed", locale = lang, error = e.localized(lang)),
-                )
-                .await?;
+                target
+                    .send(
+                        bot,
+                        t!("bot.login_failed", locale = lang, error = e.localized(lang)),
+                    )
+                    .await?;
                 return Ok(());
             }
         };
@@ -231,11 +300,12 @@ async fn cmd_login(
     let initial_state = match jmap::current_email_state(&client).await {
         Ok(s) => s,
         Err(e) => {
-            bot.send_message(
-                chat_id,
-                t!("bot.init_failed", locale = lang, error = e.localized(lang)),
-            )
-            .await?;
+            target
+                .send(
+                    bot,
+                    t!("bot.init_failed", locale = lang, error = e.localized(lang)),
+                )
+                .await?;
             return Ok(());
         }
     };
@@ -262,12 +332,14 @@ async fn cmd_login(
         token,
         email: email.clone(),
         last_state: Some(initial_state),
+        thread_id: None,
     };
 
     let saved_slot_id = match state.store.add_account(chat_id.0, slot) {
         Ok(id) => id,
         Err(e) => {
-            bot.send_message(chat_id, t!("bot.storage_error", locale = lang, error = e))
+            target
+                .send(bot, t!("bot.storage_error", locale = lang, error = e))
                 .await?;
             return Ok(());
         }
@@ -279,22 +351,34 @@ async fn cmd_login(
     state.forget_account(chat_id.0, &saved_slot_id).await;
     accounts::adopt_account(bot, state, chat_id.0, saved_slot_id, email.clone(), client).await;
 
-    bot.send_message(
-        chat_id,
-        t!("bot.login_success", locale = lang, email = email),
-    )
-    .await?;
+    target
+        .send(bot, t!("bot.login_success", locale = lang, email = email))
+        .await?;
     Ok(())
 }
 
-async fn cmd_logout(bot: &Bot, state: &AppState, chat_id: ChatId, lang: &str) -> HandlerResult {
+async fn cmd_logout(
+    bot: &Bot,
+    state: &AppState,
+    target: impl Into<ChatTarget>,
+    lang: &str,
+) -> HandlerResult {
+    let target = target.into();
+    let chat_id = target.id;
     let Some(account) = state.store.get(chat_id.0) else {
-        bot.send_message(chat_id, t!("bot.logout_nothing", locale = lang))
+        target
+            .send(bot, t!("bot.logout_nothing", locale = lang))
             .await?;
         return Ok(());
     };
 
     if account.accounts.len() <= 1 {
+        for slot in account.accounts.values() {
+            crate::topics::delete_topic(bot, chat_id.0, slot.thread_id).await;
+        }
+        for shared in account.shared_accounts.values() {
+            crate::topics::delete_topic(bot, chat_id.0, shared.thread_id).await;
+        }
         state.forget(chat_id.0).await;
         let removed = state.store.remove(chat_id.0).unwrap_or(false);
         state.refresh_accounts_gauge();
@@ -304,7 +388,7 @@ async fn cmd_logout(bot: &Bot, state: &AppState, chat_id: ChatId, lang: &str) ->
         } else {
             t!("bot.logout_nothing", locale = lang)
         };
-        bot.send_message(chat_id, text).await?;
+        target.send(bot, text).await?;
         return Ok(());
     }
 
@@ -321,15 +405,24 @@ async fn cmd_logout(bot: &Bot, state: &AppState, chat_id: ChatId, lang: &str) ->
         "logout:all".to_string(),
     )]);
 
-    bot.send_message(chat_id, t!("bot.logout_prompt", locale = lang))
+    target
+        .send(bot, t!("bot.logout_prompt", locale = lang))
         .reply_markup(InlineKeyboardMarkup::new(buttons))
         .await?;
     Ok(())
 }
 
-async fn cmd_status(bot: &Bot, state: &AppState, chat_id: ChatId, lang: &str) -> HandlerResult {
+async fn cmd_status(
+    bot: &Bot,
+    state: &AppState,
+    target: impl Into<ChatTarget>,
+    lang: &str,
+) -> HandlerResult {
+    let target = target.into();
+    let chat_id = target.id;
     let Some(account) = state.store.get(chat_id.0) else {
-        bot.send_message(chat_id, t!("bot.no_account", locale = lang))
+        target
+            .send(bot, t!("bot.no_account", locale = lang))
             .await?;
         return Ok(());
     };
@@ -377,7 +470,7 @@ async fn cmd_status(bot: &Bot, state: &AppState, chat_id: ChatId, lang: &str) ->
         ));
     }
 
-    bot.send_message(chat_id, text).await?;
+    target.send(bot, text).await?;
     Ok(())
 }
 
@@ -386,23 +479,27 @@ async fn cmd_status(bot: &Bot, state: &AppState, chat_id: ChatId, lang: &str) ->
 async fn cmd_comptes(
     bot: &Bot,
     state: &AppState,
-    chat_id: ChatId,
+    target: impl Into<ChatTarget>,
     args: String,
     lang: &str,
 ) -> HandlerResult {
+    let target = target.into();
+    let chat_id = target.id;
     let args = args.trim();
     if args.is_empty() {
-        return list_accounts(bot, state, chat_id, lang).await;
+        return list_accounts(bot, state, target, lang).await;
     }
 
     let Some(account) = state.store.get(chat_id.0) else {
-        bot.send_message(chat_id, t!("bot.accounts_need_primary", locale = lang))
+        target
+            .send(bot, t!("bot.accounts_need_primary", locale = lang))
             .await?;
         return Ok(());
     };
 
     let Some((server_url, token)) = args.split_once(char::is_whitespace) else {
-        bot.send_message(chat_id, t!("bot.accounts_usage", locale = lang))
+        target
+            .send(bot, t!("bot.accounts_usage", locale = lang))
             .await?;
         return Ok(());
     };
@@ -412,33 +509,36 @@ async fn cmd_comptes(
         match jmap::connect(&server_url, &token, state.config.allow_private_jmap_hosts).await {
             Ok(c) => c,
             Err(e) => {
-                bot.send_message(
-                    chat_id,
-                    t!("bot.login_failed", locale = lang, error = e.localized(lang)),
-                )
-                .await?;
+                target
+                    .send(
+                        bot,
+                        t!("bot.login_failed", locale = lang, error = e.localized(lang)),
+                    )
+                    .await?;
                 return Ok(());
             }
         };
 
     let email = jmap::account_email(&client);
     if account.contains_email(&email) {
-        bot.send_message(
-            chat_id,
-            t!("bot.accounts_already", locale = lang, email = email),
-        )
-        .await?;
+        target
+            .send(
+                bot,
+                t!("bot.accounts_already", locale = lang, email = email),
+            )
+            .await?;
         return Ok(());
     }
 
     let initial_state = match jmap::current_email_state(&client).await {
         Ok(s) => s,
         Err(e) => {
-            bot.send_message(
-                chat_id,
-                t!("bot.init_failed", locale = lang, error = e.localized(lang)),
-            )
-            .await?;
+            target
+                .send(
+                    bot,
+                    t!("bot.init_failed", locale = lang, error = e.localized(lang)),
+                )
+                .await?;
             return Ok(());
         }
     };
@@ -449,12 +549,14 @@ async fn cmd_comptes(
         token,
         email: email.clone(),
         last_state: Some(initial_state),
+        thread_id: None,
     };
 
     let slot_id = match state.store.add_account(chat_id.0, slot) {
         Ok(id) => id,
         Err(e) => {
-            bot.send_message(chat_id, t!("bot.storage_error", locale = lang, error = e))
+            target
+                .send(bot, t!("bot.storage_error", locale = lang, error = e))
                 .await?;
             return Ok(());
         }
@@ -462,23 +564,30 @@ async fn cmd_comptes(
 
     accounts::adopt_account(bot, state, chat_id.0, slot_id, email.clone(), client).await;
 
-    bot.send_message(
-        chat_id,
-        t!("bot.accounts_added", locale = lang, email = email),
-    )
-    .await?;
+    target
+        .send(bot, t!("bot.accounts_added", locale = lang, email = email))
+        .await?;
     Ok(())
 }
 
-async fn list_accounts(bot: &Bot, state: &AppState, chat_id: ChatId, lang: &str) -> HandlerResult {
+async fn list_accounts(
+    bot: &Bot,
+    state: &AppState,
+    target: impl Into<ChatTarget>,
+    lang: &str,
+) -> HandlerResult {
+    let target = target.into();
+    let chat_id = target.id;
     let Some(account) = state.store.get(chat_id.0) else {
-        bot.send_message(chat_id, t!("bot.no_account", locale = lang))
+        target
+            .send(bot, t!("bot.no_account", locale = lang))
             .await?;
         return Ok(());
     };
 
     if account.accounts.is_empty() {
-        bot.send_message(chat_id, t!("bot.no_account", locale = lang))
+        target
+            .send(bot, t!("bot.no_account", locale = lang))
             .await?;
         return Ok(());
     }
@@ -525,7 +634,7 @@ async fn list_accounts(bot: &Bot, state: &AppState, chat_id: ChatId, lang: &str)
         text.push_str(&t!("bot.accounts_legend", locale = lang));
     }
 
-    let send = bot.send_message(chat_id, text);
+    let send = target.send(bot, text);
     let send = if !buttons.is_empty() {
         send.reply_markup(InlineKeyboardMarkup::new(buttons))
     } else {
@@ -541,36 +650,47 @@ async fn list_accounts(bot: &Bot, state: &AppState, chat_id: ChatId, lang: &str)
 /// the primary account and all extra accounts. Always reconnects rather
 /// than reusing the cached client, so a mailbox access grant added on the
 /// server after /login or /accounts shows up without needing a restart.
-async fn cmd_partages(bot: &Bot, state: &AppState, chat_id: ChatId, lang: &str) -> HandlerResult {
+async fn cmd_partages(
+    bot: &Bot,
+    state: &AppState,
+    target: impl Into<ChatTarget>,
+    lang: &str,
+) -> HandlerResult {
+    let target = target.into();
+    let chat_id = target.id;
     let Some(account) = state.store.get(chat_id.0) else {
-        bot.send_message(chat_id, t!("bot.no_account", locale = lang))
+        target
+            .send(bot, t!("bot.no_account", locale = lang))
             .await?;
         return Ok(());
     };
 
     let (accounts, any_connected) = discover_all_shared_accounts(state, &account).await;
     if !any_connected {
-        bot.send_message(
-            chat_id,
-            t!(
-                "bot.login_failed",
-                locale = lang,
-                error = jmap::JmapError::Unreachable.localized(lang)
-            ),
-        )
-        .await?;
+        target
+            .send(
+                bot,
+                t!(
+                    "bot.login_failed",
+                    locale = lang,
+                    error = jmap::JmapError::Unreachable.localized(lang)
+                ),
+            )
+            .await?;
         return Ok(());
     }
 
     if accounts.is_empty() {
-        bot.send_message(chat_id, t!("bot.shared_none", locale = lang))
+        target
+            .send(bot, t!("bot.shared_none", locale = lang))
             .await?;
         return Ok(());
     }
 
     let enabled: HashSet<String> = account.shared_accounts.keys().cloned().collect();
     let keyboard = format::shared_accounts_keyboard(&accounts, &enabled);
-    bot.send_message(chat_id, t!("bot.shared_title", locale = lang))
+    target
+        .send(bot, t!("bot.shared_title", locale = lang))
         .reply_markup(keyboard)
         .await?;
     Ok(())
@@ -664,6 +784,13 @@ async fn disconnect_account(
     slot_id: &str,
     lang: &str,
 ) -> HandlerResult {
+    if let Some(slot) = state
+        .store
+        .get(chat_id.0)
+        .and_then(|a| a.accounts.get(slot_id).cloned())
+    {
+        crate::topics::delete_topic(bot, chat_id.0, slot.thread_id).await;
+    }
     state.forget_account(chat_id.0, slot_id).await;
     match state.store.remove_account(chat_id.0, slot_id) {
         Ok(true) => {
@@ -714,6 +841,9 @@ async fn toggle_shared_account(
     } = target;
 
     if account.shared_accounts.contains_key(account_id) {
+        if let Some(shared) = account.shared_accounts.get(account_id) {
+            crate::topics::delete_topic(bot, chat_id.0, shared.thread_id).await;
+        }
         state.forget_shared(chat_id.0, account_id).await;
         let _ = state.store.remove_shared_account(chat_id.0, account_id);
         bot.answer_callback_query(query_id)
@@ -831,14 +961,17 @@ async fn toggle_shared_account(
 async fn cmd_mute(
     bot: &Bot,
     state: &AppState,
-    chat_id: ChatId,
+    target: impl Into<ChatTarget>,
     term: String,
     lang: &str,
 ) -> HandlerResult {
+    let target = target.into();
+    let chat_id = target.id;
     let term = term.trim();
     if term.is_empty() {
         let Some(account) = state.store.get(chat_id.0) else {
-            bot.send_message(chat_id, t!("bot.no_account", locale = lang))
+            target
+                .send(bot, t!("bot.no_account", locale = lang))
                 .await?;
             return Ok(());
         };
@@ -853,25 +986,29 @@ async fn cmd_mute(
                 .join("\n");
             t!("bot.mute_list", locale = lang, list = list).to_string()
         };
-        bot.send_message(chat_id, text).await?;
+        target.send(bot, text).await?;
         return Ok(());
     }
 
     match state.store.mute(chat_id.0, term) {
         Ok(true) => {
-            bot.send_message(chat_id, t!("bot.mute_added", locale = lang, term = term))
+            target
+                .send(bot, t!("bot.mute_added", locale = lang, term = term))
                 .await?;
         }
         Ok(false) if state.store.get(chat_id.0).is_none() => {
-            bot.send_message(chat_id, t!("bot.no_account", locale = lang))
+            target
+                .send(bot, t!("bot.no_account", locale = lang))
                 .await?;
         }
         Ok(false) => {
-            bot.send_message(chat_id, t!("bot.mute_already", locale = lang, term = term))
+            target
+                .send(bot, t!("bot.mute_already", locale = lang, term = term))
                 .await?;
         }
         Err(e) => {
-            bot.send_message(chat_id, t!("bot.error_generic", locale = lang, error = e))
+            target
+                .send(bot, t!("bot.error_generic", locale = lang, error = e))
                 .await?;
         }
     }
@@ -881,31 +1018,37 @@ async fn cmd_mute(
 async fn cmd_unmute(
     bot: &Bot,
     state: &AppState,
-    chat_id: ChatId,
+    target: impl Into<ChatTarget>,
     term: String,
     lang: &str,
 ) -> HandlerResult {
+    let target = target.into();
+    let chat_id = target.id;
     let term = term.trim();
     if term.is_empty() {
-        bot.send_message(chat_id, t!("bot.unmute_usage", locale = lang))
+        target
+            .send(bot, t!("bot.unmute_usage", locale = lang))
             .await?;
         return Ok(());
     }
 
     match state.store.unmute(chat_id.0, term) {
         Ok(true) => {
-            bot.send_message(chat_id, t!("bot.unmute_done", locale = lang, term = term))
+            target
+                .send(bot, t!("bot.unmute_done", locale = lang, term = term))
                 .await?;
         }
         Ok(false) => {
-            bot.send_message(
-                chat_id,
-                t!("bot.unmute_not_filtered", locale = lang, term = term),
-            )
-            .await?;
+            target
+                .send(
+                    bot,
+                    t!("bot.unmute_not_filtered", locale = lang, term = term),
+                )
+                .await?;
         }
         Err(e) => {
-            bot.send_message(chat_id, t!("bot.error_generic", locale = lang, error = e))
+            target
+                .send(bot, t!("bot.error_generic", locale = lang, error = e))
                 .await?;
         }
     }
@@ -918,39 +1061,68 @@ async fn cmd_unmute(
 async fn cmd_rechercher(
     bot: &Bot,
     state: &AppState,
-    chat_id: ChatId,
+    target: impl Into<ChatTarget>,
     query: String,
     lang: &str,
 ) -> HandlerResult {
+    let target = target.into();
+    let chat_id = target.id;
     let query = query.trim();
     if query.is_empty() {
-        bot.send_message(chat_id, t!("bot.search_usage", locale = lang))
+        target
+            .send(bot, t!("bot.search_usage", locale = lang))
             .await?;
         return Ok(());
     }
 
-    let clients = match state.all_clients_for_chat(chat_id.0).await {
+    let all_clients = match state.all_clients_for_chat(chat_id.0).await {
         Ok(c) if !c.is_empty() => c,
         Ok(_) => {
-            bot.send_message(chat_id, t!("bot.no_account", locale = lang))
+            target
+                .send(bot, t!("bot.no_account", locale = lang))
                 .await?;
             return Ok(());
         }
         Err(e) => {
-            bot.send_message(
-                chat_id,
-                t!(
-                    "bot.connection_error",
-                    locale = lang,
-                    error = jmap::localized_error(&e, lang)
-                ),
-            )
-            .await?;
+            target
+                .send(
+                    bot,
+                    t!(
+                        "bot.connection_error",
+                        locale = lang,
+                        error = jmap::localized_error(&e, lang)
+                    ),
+                )
+                .await?;
             return Ok(());
         }
     };
 
-    let _ = bot.send_chat_action(chat_id, ChatAction::Typing).await;
+    // If search is executed inside a specific topic, prioritize that account
+    let clients = if let Some(tid) = target.thread_id
+        && let Some(account) = state.store.get(chat_id.0)
+        && let Some(matched_slot) = account
+            .accounts
+            .values()
+            .find(|s| s.thread_id == Some(tid.0.0))
+    {
+        if let Ok(Some(client)) = state
+            .client_for_account(chat_id.0, &matched_slot.slot_id)
+            .await
+        {
+            vec![(matched_slot.clone(), client)]
+        } else {
+            all_clients
+        }
+    } else {
+        all_clients
+    };
+
+    let mut action_req = bot.send_chat_action(chat_id, ChatAction::Typing);
+    if let Some(tid) = target.thread_id {
+        action_req = action_req.message_thread_id(tid);
+    }
+    let _ = action_req.await;
 
     let multiple_accounts = clients.len() > 1;
     let mut all_results = Vec::new();
@@ -978,28 +1150,31 @@ async fn cmd_rechercher(
         if let Some(e) = last_err
             && clients.len() == 1
         {
-            bot.send_message(chat_id, format!("❌ {}", e.localized(lang)))
+            target
+                .send(bot, format!("❌ {}", e.localized(lang)))
                 .await?;
             return Ok(());
         }
-        bot.send_message(
-            chat_id,
-            t!("bot.search_no_result", locale = lang, query = query),
-        )
-        .await?;
+        target
+            .send(
+                bot,
+                t!("bot.search_no_result", locale = lang, query = query),
+            )
+            .await?;
         return Ok(());
     }
 
-    bot.send_message(
-        chat_id,
-        t!(
-            "bot.search_results",
-            locale = lang,
-            count = all_results.len(),
-            query = query
-        ),
-    )
-    .await?;
+    target
+        .send(
+            bot,
+            t!(
+                "bot.search_results",
+                locale = lang,
+                count = all_results.len(),
+                query = query
+            ),
+        )
+        .await?;
 
     for (slot_id, email, summary) in &all_results {
         let account_label = if multiple_accounts {
@@ -1015,11 +1190,105 @@ async fn cmd_rechercher(
         let text = format::notification_text(summary, state.config.timezone, account_label, lang);
         let keyboard =
             format::notification_keyboard(&summary.id, btn_account_id, false, false, lang);
-        bot.send_message(chat_id, text)
+        target
+            .send(bot, text)
             .parse_mode(ParseMode::MarkdownV2)
             .reply_markup(keyboard)
             .await?;
     }
+    Ok(())
+}
+
+/// `/threads [on|off]` manages Telegram Threaded Conversations (forum topics).
+async fn cmd_threads(
+    bot: &Bot,
+    state: &AppState,
+    target: impl Into<ChatTarget>,
+    arg: &str,
+    lang: &str,
+) -> HandlerResult {
+    let target = target.into();
+    let chat_id = target.id;
+    let Some(account) = state.store.get(chat_id.0) else {
+        target
+            .send(bot, t!("bot.no_account", locale = lang))
+            .await?;
+        return Ok(());
+    };
+
+    let trimmed = arg.trim().to_lowercase();
+    match trimmed.as_str() {
+        "on" | "enable" | "activer" => {
+            state.store.set_threads_enabled(chat_id.0, Some(true))?;
+            let sync_results = crate::topics::sync_all_topics(bot, state, chat_id.0).await?;
+            let created_count = sync_results.iter().filter(|(_, tid)| tid.is_some()).count();
+            if created_count > 0 {
+                target
+                    .send(
+                        bot,
+                        t!(
+                            "bot.threads_enabled_success",
+                            locale = lang,
+                            count = created_count
+                        ),
+                    )
+                    .await?;
+            } else {
+                target
+                    .send(bot, t!("bot.threads_not_forum", locale = lang))
+                    .await?;
+            }
+        }
+        "off" | "disable" | "desactiver" => {
+            state.store.set_threads_enabled(chat_id.0, Some(false))?;
+            target
+                .send(bot, t!("bot.threads_disabled_success", locale = lang))
+                .await?;
+        }
+        _ => {
+            let is_enabled = crate::topics::is_threaded_mode_enabled(&state.config, Some(&account));
+            let status_label = if is_enabled {
+                t!("bot.threads_status_on", locale = lang)
+            } else {
+                t!("bot.threads_status_off", locale = lang)
+            };
+
+            let server_mode = match state.config.telegram_threaded_mode {
+                ThreadedModeConfig::Auto => "auto",
+                ThreadedModeConfig::Enabled => "enabled",
+                ThreadedModeConfig::Disabled => "disabled",
+            };
+
+            let text = t!(
+                "bot.threads_overview",
+                locale = lang,
+                status = status_label,
+                server_mode = server_mode,
+                count = account.accounts.len()
+            );
+
+            let toggle_btn = if is_enabled {
+                InlineKeyboardButton::callback(
+                    t!("bot.threads_btn_disable", locale = lang),
+                    "th:off",
+                )
+            } else {
+                InlineKeyboardButton::callback(t!("bot.threads_btn_enable", locale = lang), "th:on")
+            };
+
+            let sync_btn = InlineKeyboardButton::callback(
+                t!("bot.threads_btn_sync", locale = lang),
+                "th:sync",
+            );
+
+            let keyboard = InlineKeyboardMarkup::default()
+                .append_row(vec![toggle_btn])
+                .append_row(vec![sync_btn]);
+
+            target.send(bot, text).reply_markup(keyboard).await?;
+        }
+    }
+
     Ok(())
 }
 
@@ -1198,7 +1467,54 @@ async fn callback_handler(bot: Bot, q: CallbackQuery, state: AppState) -> Handle
     if action == "x" {
         return disconnect_account(&bot, &state, chat_id, q.id, second, lang).await;
     }
+    if action == "th" {
+        match second {
+            "on" => {
+                let _ = state.store.set_threads_enabled(chat_id.0, Some(true));
+                let sync_results = crate::topics::sync_all_topics(&bot, &state, chat_id.0).await?;
+                let created_count = sync_results.iter().filter(|(_, tid)| tid.is_some()).count();
+                let toast = if created_count > 0 {
+                    t!("bot.threads_toast_enabled", locale = lang)
+                } else {
+                    t!("bot.threads_toast_not_forum", locale = lang)
+                };
+                bot.answer_callback_query(q.id).text(toast).await?;
+                let _ = bot.delete_message(chat_id, message_id).await;
+                cmd_threads(&bot, &state, chat_id, "", lang).await?;
+            }
+            "off" => {
+                let _ = state.store.set_threads_enabled(chat_id.0, Some(false));
+                bot.answer_callback_query(q.id)
+                    .text(t!("bot.threads_toast_disabled", locale = lang))
+                    .await?;
+                let _ = bot.delete_message(chat_id, message_id).await;
+                cmd_threads(&bot, &state, chat_id, "", lang).await?;
+            }
+            "sync" => {
+                let sync_results = crate::topics::sync_all_topics(&bot, &state, chat_id.0).await?;
+                let created_count = sync_results.iter().filter(|(_, tid)| tid.is_some()).count();
+                let toast = format!(
+                    "{} ({})",
+                    t!("bot.threads_toast_synced", locale = lang),
+                    created_count
+                );
+                bot.answer_callback_query(q.id).text(toast).await?;
+                let _ = bot.delete_message(chat_id, message_id).await;
+                cmd_threads(&bot, &state, chat_id, "", lang).await?;
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
     if action == "logout" && second == "all" {
+        if let Some(account) = state.store.get(chat_id.0) {
+            for slot in account.accounts.values() {
+                crate::topics::delete_topic(&bot, chat_id.0, slot.thread_id).await;
+            }
+            for shared in account.shared_accounts.values() {
+                crate::topics::delete_topic(&bot, chat_id.0, shared.thread_id).await;
+            }
+        }
         state.forget(chat_id.0).await;
         let _ = state.store.remove(chat_id.0);
         state.refresh_accounts_gauge();
@@ -1756,6 +2072,7 @@ mod tests {
                 token: "tok".to_string(),
                 email: email.to_string(),
                 last_state: last_state.map(str::to_string),
+                thread_id: None,
             },
         );
         Account {
@@ -1763,18 +2080,12 @@ mod tests {
             shared_accounts: HashMap::new(),
             accounts,
             muted: Vec::new(),
+            threads_enabled: None,
         }
     }
 
     fn state(data_dir: &Path, chat_id: i64, with_account: bool) -> AppState {
-        let config = Arc::new(crate::config::Config {
-            telegram_token: "123456:TEST_TOKEN".to_string(),
-            authorized_chat_ids: HashSet::from([ChatId(chat_id)]),
-            data_dir: data_dir.to_path_buf(),
-            allow_private_jmap_hosts: true,
-            timezone: chrono_tz::Tz::UTC,
-            default_language: "en".to_string(),
-        });
+        let config = Arc::new(crate::config::Config::for_testing(data_dir, chat_id));
         let store = Arc::new(crate::store::Store::open(data_dir).unwrap());
         if with_account {
             store
@@ -2213,6 +2524,7 @@ mod tests {
                     token: "t".to_string(),
                     email: "extra@b.c".to_string(),
                     last_state: Some("s".to_string()),
+                    thread_id: None,
                 },
             )
             .unwrap();
@@ -2247,6 +2559,7 @@ mod tests {
                         token: "t".to_string(),
                         email: email.to_string(),
                         last_state: Some("s".to_string()),
+                        thread_id: None,
                     },
                 )
                 .unwrap();
@@ -2400,6 +2713,7 @@ mod tests {
                     token: "extra-tok".to_string(),
                     email: "extra@example.org".to_string(),
                     last_state: Some("s".to_string()),
+                    thread_id: None,
                 },
             )
             .unwrap();
@@ -2483,6 +2797,7 @@ mod tests {
                     token: "tok2".to_string(),
                     email: "second@example.org".to_string(),
                     last_state: Some("s2".to_string()),
+                    thread_id: None,
                 },
             )
             .unwrap();
@@ -2534,6 +2849,7 @@ mod tests {
                     token: "tok2".to_string(),
                     email: "second@example.org".to_string(),
                     last_state: Some("s2".to_string()),
+                    thread_id: None,
                 },
             )
             .unwrap();
@@ -2561,5 +2877,51 @@ mod tests {
         );
         let text = mock.last_text();
         assert!(text.contains("Credentials and data deleted"), "got: {text}");
+    }
+
+    #[tokio::test]
+    async fn cmd_threads_without_account_reports_no_account() {
+        let mock = spawn_mock_telegram().await;
+        let bot = mock.bot();
+        let dir = tempfile::tempdir().unwrap();
+        let state = state(dir.path(), 42, false);
+
+        cmd_threads(&bot, &state, ChatId(42), "", "en")
+            .await
+            .unwrap();
+        let text = mock.last_text();
+        assert!(text.contains("No account connected"), "got: {text}");
+    }
+
+    #[tokio::test]
+    async fn cmd_threads_bare_shows_overview_and_buttons() {
+        let mock = spawn_mock_telegram().await;
+        let bot = mock.bot();
+        let dir = tempfile::tempdir().unwrap();
+        let state = state(dir.path(), 42, true);
+
+        cmd_threads(&bot, &state, ChatId(42), "", "en")
+            .await
+            .unwrap();
+        let text = mock.last_text();
+        assert!(text.contains("Threaded Conversations"), "got: {text}");
+        let body = mock.last_body("sendmessage").unwrap();
+        let markup = &body["reply_markup"]["inline_keyboard"];
+        assert_eq!(markup.as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn cmd_threads_off_disables_threads_mode() {
+        let mock = spawn_mock_telegram().await;
+        let bot = mock.bot();
+        let dir = tempfile::tempdir().unwrap();
+        let state = state(dir.path(), 42, true);
+
+        cmd_threads(&bot, &state, ChatId(42), "off", "en")
+            .await
+            .unwrap();
+        assert_eq!(state.store.get(42).unwrap().threads_enabled, Some(false));
+        let text = mock.last_text();
+        assert!(text.contains("Threaded mode disabled"), "got: {text}");
     }
 }
