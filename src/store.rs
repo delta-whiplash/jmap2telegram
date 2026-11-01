@@ -67,6 +67,11 @@ pub struct SharedAccount {
     /// address), shown in notifications and the toggle menu.
     pub name: String,
     pub last_state: Option<String>,
+    /// If this shared account belongs to an extra account (connected via
+    /// `/accounts`), this is that account's slot id. `None` means it belongs
+    /// to the chat's primary account.
+    #[serde(default)]
+    pub parent_slot: Option<String>,
 }
 
 /// A second (or third, ...) fully independent JMAP account connected to
@@ -209,13 +214,20 @@ impl Store {
         account_id: String,
         name: String,
         last_state: Option<String>,
+        parent_slot: Option<String>,
     ) -> Result<()> {
         {
             let mut data = self.data.write().unwrap();
             match data.accounts.get_mut(&chat_id) {
                 Some(acc) => {
-                    acc.shared_accounts
-                        .insert(account_id, SharedAccount { name, last_state });
+                    acc.shared_accounts.insert(
+                        account_id,
+                        SharedAccount {
+                            name,
+                            last_state,
+                            parent_slot,
+                        },
+                    );
                 }
                 None => return Ok(()),
             }
@@ -733,24 +745,30 @@ mod tests {
         store.set(1, account("a@b.c")).unwrap();
 
         store
-            .set_shared_account(1, "acc7".to_string(), "shared@b.c".to_string(), None)
+            .set_shared_account(1, "acc7".to_string(), "shared@b.c".to_string(), None, None)
             .unwrap();
         let shared = &store.get(1).unwrap().shared_accounts["acc7"];
         assert_eq!(shared.name, "shared@b.c");
         assert_eq!(shared.last_state, None);
+        assert_eq!(shared.parent_slot, None);
 
-        // Re-setting the same id updates it in place rather than erroring.
+        // Re-setting with parent_slot updates it.
         store
             .set_shared_account(
                 1,
                 "acc7".to_string(),
                 "shared@b.c".to_string(),
                 Some("state-1".to_string()),
+                Some("slot1".to_string()),
             )
             .unwrap();
         assert_eq!(
             store.get(1).unwrap().shared_accounts["acc7"].last_state,
             Some("state-1".to_string())
+        );
+        assert_eq!(
+            store.get(1).unwrap().shared_accounts["acc7"].parent_slot,
+            Some("slot1".to_string())
         );
     }
 
@@ -759,7 +777,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
         store
-            .set_shared_account(999, "acc1".to_string(), "x@y.z".to_string(), None)
+            .set_shared_account(999, "acc1".to_string(), "x@y.z".to_string(), None, None)
             .unwrap();
         assert!(store.get(999).is_none());
     }
@@ -770,7 +788,7 @@ mod tests {
         let store = Store::open(dir.path()).unwrap();
         store.set(1, account("a@b.c")).unwrap();
         store
-            .set_shared_account(1, "acc7".to_string(), "shared@b.c".to_string(), None)
+            .set_shared_account(1, "acc7".to_string(), "shared@b.c".to_string(), None, None)
             .unwrap();
 
         assert!(store.remove_shared_account(1, "acc7").unwrap());

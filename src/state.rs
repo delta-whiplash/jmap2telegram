@@ -186,13 +186,21 @@ impl AppState {
         let Some(account) = self.store.get(chat_id) else {
             return Ok(None);
         };
-        if !account.shared_accounts.contains_key(account_id) {
+        let Some(shared) = account.shared_accounts.get(account_id) else {
             return Ok(None);
-        }
+        };
+
+        let (server_url, token) = match &shared.parent_slot {
+            None => (&account.server_url, &account.token),
+            Some(slot_id) => match account.extra_accounts.get(slot_id) {
+                Some(extra) => (&extra.server_url, &extra.token),
+                None => return Ok(None),
+            },
+        };
 
         let client = crate::jmap::connect_shared(
-            &account.server_url,
-            &account.token,
+            server_url,
+            token,
             self.config.allow_private_jmap_hosts,
             account_id,
         )

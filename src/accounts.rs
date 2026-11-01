@@ -146,14 +146,20 @@ fn persisted_targets(account: &Account) -> Vec<ResumeTarget> {
         token: account.token.clone(),
     }];
     for (account_id, shared) in &account.shared_accounts {
+        let (server_url, token) = match &shared.parent_slot {
+            None => (account.server_url.clone(), account.token.clone()),
+            Some(slot_id) => match account.extra_accounts.get(slot_id) {
+                Some(extra) => (extra.server_url.clone(), extra.token.clone()),
+                None => continue,
+            },
+        };
         targets.push(ResumeTarget {
             target: WatchTarget::Shared {
                 account_id: account_id.clone(),
                 label: shared.name.clone(),
             },
-            // Delegated access rides on the chat's primary credentials.
-            server_url: account.server_url.clone(),
-            token: account.token.clone(),
+            server_url,
+            token,
         });
     }
     for (slot_id, extra) in &account.extra_accounts {
@@ -444,6 +450,7 @@ mod tests {
                 crate::store::SharedAccount {
                     name: "shared@b.c".to_string(),
                     last_state: Some("shared-state".to_string()),
+                    parent_slot: None,
                 },
             )]),
             extra_accounts: HashMap::from([(
@@ -553,6 +560,24 @@ mod tests {
         }
         assert_eq!(extra.server_url, "https://127.0.0.1:9");
         assert_eq!(extra.token, "other-tok");
+
+        // A shared account belonging to an extra account rides that extra account's credentials.
+        let mut with_extra_shared = unreachable_account();
+        with_extra_shared.shared_accounts.insert(
+            "acc8".to_string(),
+            crate::store::SharedAccount {
+                name: "extra-shared@b.c".to_string(),
+                last_state: None,
+                parent_slot: Some("slot1".to_string()),
+            },
+        );
+        let targets = persisted_targets(&with_extra_shared);
+        let extra_shared = targets
+            .iter()
+            .find(|t| matches!(&t.target, WatchTarget::Shared { account_id, .. } if account_id == "acc8"))
+            .expect("should find extra-shared target");
+        assert_eq!(extra_shared.server_url, "https://127.0.0.1:9");
+        assert_eq!(extra_shared.token, "other-tok");
     }
 
     #[tokio::test]
