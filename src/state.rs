@@ -51,7 +51,7 @@ impl PendingUndo {
 pub struct AppState {
     pub config: Arc<Config>,
     pub store: Arc<Store>,
-    /// Live watcher registry backing /readyz and /metrics (see health.rs).
+    /// Live watcher registry backing /metrics (see health.rs).
     pub health: Arc<crate::health::Health>,
     /// Application counters/gauges rendered by /metrics (see health.rs).
     pub metrics: Arc<crate::health::Metrics>,
@@ -251,11 +251,11 @@ impl AppState {
         // never gets to run its own registry cleanup (the deregister on
         // its clean-exit path). Without this sweep, the entry
         // `watcher::spawn` registered would outlive the task forever and
-        // pin /readyz at 503 for an account nobody is watching anymore.
-        // One prefix sweep covers the primary mailbox, every shared and
-        // every extra slot, *and* targets that hold a registry entry but
-        // no live handle to iterate over here - e.g. a boot-resume still
-        // waiting out its retry backoff (see accounts.rs).
+        // leak in the health registry for an account nobody is watching
+        // anymore. One prefix sweep covers the primary mailbox, every
+        // shared and every extra slot, *and* targets that hold a registry
+        // entry but no live handle to iterate over here - e.g. a
+        // boot-resume still waiting out its retry backoff (see accounts.rs).
         self.health.deregister_chat(chat_id);
 
         Self::forget_all_for_chat(&self.shared_clients, &self.shared_watchers, chat_id).await;
@@ -382,8 +382,8 @@ mod tests {
     #[tokio::test]
     async fn forget_deregisters_every_health_entry_of_the_chat() {
         // Regression test for the ghost-entry leak: `handle.abort()` used
-        // to leave the registry entry behind, pinning /readyz at 503
-        // forever for a chat nobody was watching anymore.
+        // to leave the registry entry behind, leaking it in the health
+        // registry forever for a chat nobody was watching anymore.
         let (state, _dir) = test_state().await;
         register_chat_42_targets(&state);
         // A different chat's watcher must survive chat 42's teardown.
@@ -421,7 +421,7 @@ mod tests {
         // Boot-resume shape (see accounts.rs): the registry entry exists -
         // registered *before* the first connect attempt - but no handle
         // sits in the watcher maps yet. A /logout racing that retry must
-        // still clear the entry, or /readyz would never recover.
+        // still clear the entry, or the registry would leak it forever.
         let (state, _dir) = test_state().await;
         state
             .health
@@ -458,17 +458,15 @@ mod tests {
         assert!(snapshot.contains_key("42/primary"), "{snapshot:?}");
         assert!(snapshot.contains_key("42/extra-slot1"), "{snapshot:?}");
         assert!(snapshot.contains_key("42/shared-acc8"), "{snapshot:?}");
-        // Readiness reflects the surviving state exactly: acc8 was
-        // registered but never connected, so it alone holds /readyz at
-        // 503 until its watcher comes up.
-        assert_eq!(
-            state.health.readiness(),
-            Err(vec!["42/shared-acc8".to_string()])
-        );
-        state
-            .health
-            .set_connected(&watcher::shared_health_key(42, "acc8"), true);
-        assert_eq!(state.health.readiness(), Ok(()));
+        // The snapshot reflects the surviving state exactly: acc8 was
+        // registered but never connected, all others are connected.
+        let acc8_key = watcher::shared_health_key(42, "acc8");
+        assert!(snapshot.contains_key(&acc8_key), "{snapshot:?}");
+        assert!(!snapshot.get(&acc8_key).unwrap().connected);
+        assert!(snapshot.values().filter(|s| s.connected).count() == snapshot.len() - 1);
+        state.health.set_connected(&acc8_key, true);
+        let snapshot = state.health.snapshot();
+        assert!(snapshot.get(&acc8_key).unwrap().connected);
     }
 
     #[tokio::test]

@@ -16,28 +16,13 @@
 //!   wedged runtime (deadlocked scheduler, exhausted memory) stops the
 //!   accept loop and the kubelet timeout restarts the pod.
 //!
-//! - **`/readyz` (readiness) reflects the watchers.** 200 when every
-//!   registered watcher currently holds an open EventSource connection (or
-//!   when none are registered yet - boot, or a bot with no `/login` at
-//!   all). A watcher stuck in reconnect backoff makes the pod NotReady.
-//!   There is no Service in front of this bot, so NotReady doesn't shed
-//!   traffic; what it does is surface a *silently broken* bot (revoked
-//!   token, unreachable JMAP server) in `kubectl` and - via the pod Ready
-//!   condition - in ArgoCD application health and the cluster's
-//!   ArgoCDAppDegraded alert, without restarting anything that a backoff
-//!   loop can heal on its own.
-//!
-//!   Registration is what makes that honest, so it happens *before* the
-//!   first connect attempt everywhere: `watcher::spawn` registers its key
-//!   before its task starts, and boot resume (see `accounts.rs`) registers
-//!   every persisted account up-front, then retries the connect with the
-//!   watcher's own backoff. An account whose server never comes back is
-//!   therefore a *permanent* registered-but-disconnected entry - /readyz
-//!   503 naming it - and never a green pod that quietly watches nothing.
-//!   The flip side is the pairing obligation: a registration must be
-//!   dropped on every teardown path (`Health::deregister` /
-//!   `deregister_chat`), including `handle.abort()`, since an aborted task
-//!   never gets to run its own cleanup.
+//! - **`/readyz` (readiness) reflects the Telegram bot process, NOT the
+//!   JMAP watchers.** A broken watcher (expired token, unreachable JMAP
+//!   server) is a user-level configuration issue, not a cluster-level
+//!   readiness problem. The bot can still serve Telegram commands (/login,
+//!   /logout, etc.) even if all watchers are disconnected. Watcher health
+//!   is exposed via Prometheus metrics for monitoring and alerting at the
+//!   appropriate level.
 //!
 //! - **`/metrics` exposes Prometheus text format** so vmagent can scrape
 //!   the same registry: `jmap2telegram_watchers_registered` /
@@ -164,23 +149,6 @@ impl Health {
     /// modules can assert on the same view the endpoints serve.
     pub(crate) fn snapshot(&self) -> HashMap<String, WatcherStatus> {
         self.watchers.lock().unwrap().clone()
-    }
-
-    /// Readiness: every registered watcher connected, or nothing to watch.
-    /// Returns the failing keys for the 503 body. Crate-visible for the
-    /// same cross-module test reasons as [`snapshot`](Health::snapshot).
-    pub(crate) fn readiness(&self) -> Result<(), Vec<String>> {
-        let disconnected: Vec<String> = self
-            .snapshot()
-            .iter()
-            .filter(|(_, s)| !s.connected)
-            .map(|(k, _)| k.clone())
-            .collect();
-        if disconnected.is_empty() {
-            Ok(())
-        } else {
-            Err(disconnected)
-        }
     }
 }
 
@@ -503,24 +471,13 @@ async fn respond(
 
     let (status, body) = match path {
         "/healthz" => ("200 OK", "ok\n".to_string()),
-        "/readyz" => match health.readiness() {
-            Ok(()) => ("200 OK", "ok\n".to_string()),
-            // The keys are escaped with the same rules as the /metrics
-            // label: one key can smuggle in a newline via a server-chosen
-            // account id, and a raw newline here would turn one 503 line
-            // into response-line confusion for whatever parses the body.
-            Err(disconnected) => (
-                "503 Service Unavailable",
-                format!(
-                    "watchers disconnected: {}\n",
-                    disconnected
-                        .iter()
-                        .map(|key| escape_prometheus_label(key).into_owned())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
-            ),
-        },
+        // /readyz reflects liveness of the Telegram bot process itself,
+        // NOT the JMAP watchers. A broken watcher (expired token, unreachable
+        // server) is a user-level issue, not a cluster-level readiness problem.
+        // The bot can still serve Telegram commands (/login, /logout, etc.)
+        // even if all watchers are disconnected. Watcher health is exposed
+        // via Prometheus metrics for monitoring.
+        "/readyz" => ("200 OK", "ok\n".to_string()),
         "/metrics" => ("200 OK", render_metrics(health, metrics)),
         _ => ("404 Not Found", String::new()),
     };
@@ -574,8 +531,7 @@ fn render_metrics(health: &Health, metrics: &Metrics) -> String {
     out
 }
 
-/// Escapes a string for inclusion in a Prometheus label value - and, for
-/// consistency, in the /readyz 503 body naming the same watcher keys.
+/// Escapes a string for inclusion in a Prometheus label value.
 ///
 /// The text format mandates label values be quoted with `\` (`\\`), `"`
 /// (`\"`) and newline (`\n`) escaped inside the quotes. Watcher keys embed
@@ -649,8 +605,8 @@ mod tests {
 
     #[tokio::test]
     async fn healthz_is_always_200_even_with_dead_watchers() {
-        // Liveness must stay conservative: a broken watcher is readiness's
-        // problem, restarting the pod over it would only make things worse.
+        // Liveness must stay conservative: a broken watcher must not
+        // restart the pod, it would only make things worse.
         let health = Arc::new(Health::default());
         health.register("42/primary");
         let addr = spawn_ephemeral(health).await;
@@ -678,7 +634,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn readyz_is_503_naming_disconnected_watchers() {
+    async fn readyz_is_200_even_with_disconnected_watchers() {
+        // /readyz reflects the Telegram bot process liveness, NOT watcher health.
+        // A broken watcher (expired token, unreachable server) is a user-level
+        // issue, not a cluster-level readiness problem.
         let health = Arc::new(Health::default());
         health.register("42/primary");
         health.set_connected("42/primary", true);
@@ -686,17 +645,20 @@ mod tests {
         // registered, never connected
         let addr = spawn_ephemeral(health).await;
         let (status, body) = get(addr, "/readyz").await;
-        assert_eq!(status, 503);
-        assert!(body.contains("42/shared-acc7"), "body: {body}");
+        assert_eq!(status, 200);
+        assert_eq!(body, "ok\n");
     }
 
     #[tokio::test]
-    async fn readyz_recovers_when_the_watcher_reconnects() {
+    async fn readyz_is_always_200_regardless_of_watcher_state() {
+        // /readyz returns 200 whether watchers are connected or not.
         let health = Arc::new(Health::default());
         health.register("42/primary");
         let addr = spawn_ephemeral(health.clone()).await;
-        assert_eq!(get(addr, "/readyz").await.0, 503);
+        assert_eq!(get(addr, "/readyz").await.0, 200);
         health.set_connected("42/primary", true);
+        assert_eq!(get(addr, "/readyz").await.0, 200);
+        health.set_connected("42/primary", false);
         assert_eq!(get(addr, "/readyz").await.0, 200);
     }
 
@@ -724,12 +686,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deregistered_watchers_disappear_from_every_signal() {
+    async fn deregistered_watchers_disappear_from_metrics() {
+        // Watchers disappear from /metrics when deregistered.
+        // /readyz stays 200 regardless.
         let health = Arc::new(Health::default());
         health.register("42/primary");
         health.set_connected("42/primary", false);
         let addr = spawn_ephemeral(health.clone()).await;
-        assert_eq!(get(addr, "/readyz").await.0, 503);
+        assert_eq!(get(addr, "/readyz").await.0, 200);
         health.deregister("42/primary");
         assert_eq!(get(addr, "/readyz").await.0, 200);
         let (_, body) = get(addr, "/metrics").await;
@@ -836,24 +800,6 @@ mod tests {
         // The sibling aggregate lines still parse as usual.
         assert!(
             body.contains("jmap2telegram_watchers_registered 1"),
-            "body: {body}"
-        );
-    }
-
-    #[tokio::test]
-    async fn readyz_503_body_escapes_watcher_keys() {
-        let health = Arc::new(Health::default());
-        let key = String::from(r#"42/shared-a"b\c"#) + "\n" + "d";
-        health.register(&key);
-        let addr = spawn_ephemeral(health).await;
-        let (status, body) = get(addr, "/readyz").await;
-        assert_eq!(status, 503);
-        // The raw newline inside the key must not leak into the body - it
-        // stays one line.
-        assert_eq!(body.lines().count(), 1, "body: {body}");
-        assert_eq!(
-            body.trim_end(),
-            r#"watchers disconnected: 42/shared-a\"b\\c\nd"#,
             "body: {body}"
         );
     }
