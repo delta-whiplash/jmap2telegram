@@ -38,6 +38,42 @@ pub struct Config {
     /// rather than silently falling back, so a typo in a deployment
     /// manifest is loud. Defaults to `en`.
     pub default_language: String,
+    /// Telegram threaded mode (topics in private chats).
+    /// - `auto`: attempts to use forum topics if enabled in BotFather,
+    ///   falling back cleanly to single-stream chat if not supported.
+    /// - `enabled`: forces topic creation.
+    /// - `disabled`: completely turns off forum topics on this deployment.
+    pub telegram_threaded_mode: ThreadedModeConfig,
+    /// Topic granularity strategy:
+    /// - `account`: one topic per connected account slot (recommended).
+    /// - `server`: one topic per JMAP host/server.
+    pub telegram_thread_strategy: ThreadStrategyConfig,
+    /// How shared/delegated mailboxes are routed into topics:
+    /// - `parent`: notifications land in the parent account's topic (default).
+    /// - `dedicated`: each shared mailbox receives its own dedicated topic.
+    pub telegram_shared_thread_mode: SharedThreadModeConfig,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ThreadedModeConfig {
+    #[default]
+    Auto,
+    Enabled,
+    Disabled,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ThreadStrategyConfig {
+    #[default]
+    Account,
+    Server,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum SharedThreadModeConfig {
+    #[default]
+    Parent,
+    Dedicated,
 }
 
 impl Config {
@@ -49,6 +85,9 @@ impl Config {
             std::env::var("ALLOW_PRIVATE_JMAP_HOSTS").ok(),
             std::env::var("TIMEZONE").ok(),
             std::env::var("BOT_LANGUAGE").ok(),
+            std::env::var("TELEGRAM_THREADED_MODE").ok(),
+            std::env::var("TELEGRAM_THREAD_STRATEGY").ok(),
+            std::env::var("TELEGRAM_SHARED_THREAD_MODE").ok(),
         )
     }
 
@@ -56,6 +95,7 @@ impl Config {
     /// exercised in tests without touching real process-wide environment
     /// variables (which are global mutable state and unsafe to fiddle with
     /// across parallel tests).
+    #[allow(clippy::too_many_arguments)]
     fn parse(
         telegram_token: Option<String>,
         raw_ids: Option<String>,
@@ -63,6 +103,9 @@ impl Config {
         allow_private_jmap_hosts: Option<String>,
         timezone: Option<String>,
         default_language: Option<String>,
+        telegram_threaded_mode: Option<String>,
+        telegram_thread_strategy: Option<String>,
+        telegram_shared_thread_mode: Option<String>,
     ) -> Result<Self> {
         let telegram_token = telegram_token.context("TELEGRAM_BOT_TOKEN is not set")?;
         if telegram_token.trim().is_empty() {
@@ -106,6 +149,42 @@ impl Config {
                 .to_string(),
         };
 
+        let telegram_threaded_mode = match telegram_threaded_mode.as_deref() {
+            Some(v)
+                if v.eq_ignore_ascii_case("disabled")
+                    || v.eq_ignore_ascii_case("off")
+                    || v == "0"
+                    || v.eq_ignore_ascii_case("false") =>
+            {
+                ThreadedModeConfig::Disabled
+            }
+            Some(v)
+                if v.eq_ignore_ascii_case("enabled")
+                    || v.eq_ignore_ascii_case("on")
+                    || v == "1"
+                    || v.eq_ignore_ascii_case("true") =>
+            {
+                ThreadedModeConfig::Enabled
+            }
+            _ => ThreadedModeConfig::Auto,
+        };
+
+        let telegram_thread_strategy = match telegram_thread_strategy.as_deref() {
+            Some(v) if v.eq_ignore_ascii_case("server") || v.eq_ignore_ascii_case("host") => {
+                ThreadStrategyConfig::Server
+            }
+            _ => ThreadStrategyConfig::Account,
+        };
+
+        let telegram_shared_thread_mode = match telegram_shared_thread_mode.as_deref() {
+            Some(v)
+                if v.eq_ignore_ascii_case("dedicated") || v.eq_ignore_ascii_case("separate") =>
+            {
+                SharedThreadModeConfig::Dedicated
+            }
+            _ => SharedThreadModeConfig::Parent,
+        };
+
         Ok(Self {
             telegram_token,
             authorized_chat_ids,
@@ -113,7 +192,27 @@ impl Config {
             allow_private_jmap_hosts,
             timezone,
             default_language,
+            telegram_threaded_mode,
+            telegram_thread_strategy,
+            telegram_shared_thread_mode,
         })
+    }
+
+    #[cfg(test)]
+    pub fn for_testing(data_dir: &std::path::Path, chat_id: i64) -> Self {
+        let mut authorized_chat_ids = HashSet::new();
+        authorized_chat_ids.insert(ChatId(chat_id));
+        Self {
+            telegram_token: "123456:TEST_TOKEN".to_string(),
+            authorized_chat_ids,
+            data_dir: data_dir.to_path_buf(),
+            allow_private_jmap_hosts: true,
+            timezone: chrono_tz::Tz::UTC,
+            default_language: "en".to_string(),
+            telegram_threaded_mode: ThreadedModeConfig::Auto,
+            telegram_thread_strategy: ThreadStrategyConfig::Account,
+            telegram_shared_thread_mode: SharedThreadModeConfig::Parent,
+        }
     }
 }
 
@@ -145,12 +244,26 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
+            None,
         )
     }
 
     #[test]
     fn rejects_missing_token() {
-        let err = Config::parse(None, Some("123".to_string()), None, None, None, None).unwrap_err();
+        let err = Config::parse(
+            None,
+            Some("123".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("TELEGRAM_BOT_TOKEN"));
     }
 
@@ -162,7 +275,18 @@ mod tests {
 
     #[test]
     fn rejects_missing_chat_ids() {
-        let err = Config::parse(Some("tok".to_string()), None, None, None, None, None).unwrap_err();
+        let err = Config::parse(
+            Some("tok".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("AUTHORIZED_CHAT_IDS"));
     }
 
@@ -202,6 +326,9 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
+            None,
         )
         .unwrap();
         assert_eq!(cfg.data_dir, PathBuf::from("/custom"));
@@ -222,6 +349,9 @@ mod tests {
             Some("true".to_string()),
             None,
             None,
+            None,
+            None,
+            None,
         )
         .unwrap();
         assert!(cfg.allow_private_jmap_hosts);
@@ -234,6 +364,9 @@ mod tests {
             Some("1".to_string()),
             None,
             Some("maybe".to_string()),
+            None,
+            None,
+            None,
             None,
             None,
         )
@@ -256,6 +389,9 @@ mod tests {
             None,
             Some("Europe/Paris".to_string()),
             None,
+            None,
+            None,
+            None,
         )
         .unwrap();
         assert_eq!(cfg.timezone, Tz::Europe__Paris);
@@ -269,6 +405,9 @@ mod tests {
             None,
             None,
             Some("Not/AZone".to_string()),
+            None,
+            None,
+            None,
             None,
         )
         .unwrap_err();
@@ -290,6 +429,9 @@ mod tests {
             None,
             None,
             Some("FR".to_string()),
+            None,
+            None,
+            None,
         )
         .unwrap();
         assert_eq!(cfg.default_language, "fr");
@@ -304,9 +446,65 @@ mod tests {
             None,
             None,
             Some("de".to_string()),
+            None,
+            None,
+            None,
         )
         .unwrap_err();
         assert!(err.to_string().contains("BOT_LANGUAGE"));
+    }
+
+    #[test]
+    fn threaded_mode_defaults_to_auto() {
+        let cfg = minimal("tok", "1").unwrap();
+        assert_eq!(cfg.telegram_threaded_mode, ThreadedModeConfig::Auto);
+        assert_eq!(cfg.telegram_thread_strategy, ThreadStrategyConfig::Account);
+        assert_eq!(
+            cfg.telegram_shared_thread_mode,
+            SharedThreadModeConfig::Parent
+        );
+    }
+
+    #[test]
+    fn threaded_mode_parses_explicit_values() {
+        let disabled = Config::parse(
+            Some("tok".to_string()),
+            Some("1".to_string()),
+            None,
+            None,
+            None,
+            None,
+            Some("disabled".to_string()),
+            Some("server".to_string()),
+            Some("dedicated".to_string()),
+        )
+        .unwrap();
+        assert_eq!(
+            disabled.telegram_threaded_mode,
+            ThreadedModeConfig::Disabled
+        );
+        assert_eq!(
+            disabled.telegram_thread_strategy,
+            ThreadStrategyConfig::Server
+        );
+        assert_eq!(
+            disabled.telegram_shared_thread_mode,
+            SharedThreadModeConfig::Dedicated
+        );
+
+        let enabled = Config::parse(
+            Some("tok".to_string()),
+            Some("1".to_string()),
+            None,
+            None,
+            None,
+            None,
+            Some("enabled".to_string()),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(enabled.telegram_threaded_mode, ThreadedModeConfig::Enabled);
     }
 
     #[test]

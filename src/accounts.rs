@@ -68,9 +68,13 @@ pub async fn adopt_shared(
         state.clone(),
         chat_id,
         client,
-        WatchTarget::Shared { account_id, label },
+        WatchTarget::Shared {
+            account_id: account_id.clone(),
+            label,
+        },
     );
     watchers.insert(key, handle);
+    let _ = crate::topics::ensure_shared_topic(bot, state, chat_id, &account_id).await;
     true
 }
 
@@ -100,9 +104,13 @@ pub async fn adopt_account(
         state.clone(),
         chat_id,
         client,
-        WatchTarget::Account { slot_id, label },
+        WatchTarget::Account {
+            slot_id: slot_id.clone(),
+            label,
+        },
     );
     watchers.insert(key, handle);
+    let _ = crate::topics::ensure_slot_topic(bot, state, chat_id, &slot_id).await;
     true
 }
 
@@ -388,7 +396,6 @@ impl ConnectJmap for RealConnect {
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use std::collections::HashSet;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
@@ -396,7 +403,6 @@ mod tests {
     use serde_json::json;
     use teloxide::adaptors::throttle::Limits;
     use teloxide::requests::RequesterExt;
-    use teloxide::types::ChatId;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -411,17 +417,7 @@ mod tests {
     /// `account` under chat 42.
     async fn state_with_account(account: Account) -> (AppState, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        let config = Arc::new(Config {
-            telegram_token: "123456:TEST_TOKEN".to_string(),
-            authorized_chat_ids: HashSet::from([ChatId(42)]),
-            data_dir: dir.path().to_path_buf(),
-            // Loopback JMAP URLs are deliberate in these tests (unreachable
-            // connect targets, wiremock); the SSRF guard would just get in
-            // the way of what's being observed.
-            allow_private_jmap_hosts: true,
-            timezone: chrono_tz::Tz::UTC,
-            default_language: "en".to_string(),
-        });
+        let config = Arc::new(Config::for_testing(dir.path(), 42));
         let store = Arc::new(crate::store::Store::open(dir.path()).unwrap());
         store.set(42, account).unwrap();
         (AppState::new(config, store), dir)
@@ -441,6 +437,7 @@ mod tests {
                 token: "tok".to_string(),
                 email: "a@b.c".to_string(),
                 last_state: Some("primary-state".to_string()),
+                thread_id: None,
             },
         );
         accounts.insert(
@@ -451,6 +448,7 @@ mod tests {
                 token: "other-tok".to_string(),
                 email: "second@other.example".to_string(),
                 last_state: Some("extra-state".to_string()),
+                thread_id: None,
             },
         );
         Account {
@@ -462,9 +460,11 @@ mod tests {
                     name: "shared@b.c".to_string(),
                     last_state: Some("shared-state".to_string()),
                     parent_slot: None,
+                    thread_id: None,
                 },
             )]),
             muted: Vec::new(),
+            threads_enabled: None,
         }
     }
 
@@ -587,6 +587,7 @@ mod tests {
                 name: "extra-shared@b.c".to_string(),
                 last_state: None,
                 parent_slot: Some("slot1".to_string()),
+                thread_id: None,
             },
         );
         let targets = persisted_targets(&with_extra_shared);

@@ -305,22 +305,13 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::watcher::{self, WatchTarget};
-    use std::collections::HashSet;
-    use teloxide::types::ChatId;
 
     /// An `AppState` pair around a throwaway encrypted store. The Config
     /// here is never exercised for anything the tests below touch (no JMAP
     /// connects, no Telegram requests) - it just has to exist.
     async fn test_state() -> (AppState, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        let config = Arc::new(Config {
-            telegram_token: "t:test-token".to_string(),
-            authorized_chat_ids: HashSet::from([ChatId(42)]),
-            data_dir: dir.path().to_path_buf(),
-            allow_private_jmap_hosts: true,
-            timezone: chrono_tz::Tz::UTC,
-            default_language: "en".to_string(),
-        });
+        let config = Arc::new(Config::for_testing(dir.path(), 42));
         let store = Arc::new(Store::open(dir.path()).unwrap());
         (AppState::new(config, store), dir)
     }
@@ -489,6 +480,7 @@ mod tests {
                 name: "shared@example.org".to_string(),
                 last_state: None,
                 parent_slot: None,
+                thread_id: None,
             },
         );
         state.store.set(42, acc).unwrap();

@@ -247,6 +247,7 @@ ways out:
 | `/unmute`      | Remove a filter added with `/mute`                                     |
 | `/search`      | `/search <text>` - full-text search of the connected mailbox (alias `/rechercher`) |
 | `/lang`        | `/lang <en\|fr>` - choose the bot's language (alias `/langue`)         |
+| `/threads`     | Configure or sync Telegram forum topics/threads for connected accounts (alias `/onglets`) |
 | `/logout`      | Erase stored credentials immediately (GDPR right to erasure)           |
 | `/help`        | List commands                                                          |
 
@@ -317,6 +318,24 @@ disconnect button per extra account. Disconnecting one only forgets that
 account - reconnecting means running `/accounts` again with its
 credentials.
 
+### Threaded Conversations (Forum Topics)
+
+Telegram Bot API 8+ supports **Topics in Private Chats** (Threaded Mode in
+@BotFather -> *Bot Settings* -> *Threads Settings* -> *Threaded Mode*).
+
+When Threaded Mode is active, `jmap2telegram` automatically isolates each
+connected email account into its own forum topic tab inside your private 1-on-1
+DM with the bot:
+- incoming emails arrive neatly grouped in their respective account's topic;
+- running `/search <term>` inside an account's topic automatically scopes
+  the search to that specific account;
+- shared mailboxes can either join their parent account's thread (default) or
+  get their own dedicated thread;
+- if Threaded Mode is disabled in BotFather, or if an individual topic is deleted,
+  the bot automatically falls back to root chat delivery without dropping any email;
+- users can use `/threads` (or `/threads on` / `/threads off` / `/threads sync`)
+  to inspect and toggle topic behavior or recreate missing topics.
+
 ### Languages
 
 The bot ships English (`en`) and French (`fr`). A chat's language is
@@ -343,6 +362,9 @@ never rewritten.
 | `ALLOW_PRIVATE_JMAP_HOSTS` | no       | `0`     | Set to `1` to allow `/login` to a private/internal JMAP server (SSRF guard bypass) |
 | `TIMEZONE`                 | no       | `UTC`   | IANA zone name (e.g. `Europe/Paris`) for notification and log timestamps |
 | `BOT_LANGUAGE`             | no       | `en`    | Default language (`en` or `fr`) for chats that haven't chosen one with `/lang`; an unsupported value refuses to start |
+| `TELEGRAM_THREADED_MODE`   | no       | `auto`  | `auto`, `enabled`, or `disabled`; controls forum topics in private chats |
+| `TELEGRAM_THREAD_STRATEGY` | no       | `account` | `account` (one topic per email account) or `server` (one topic per server) |
+| `TELEGRAM_SHARED_THREAD_MODE` | no    | `parent` | `parent` (route shared inboxes to parent account topic) or `dedicated` |
 | `HEALTH_ADDR`              | no       | `0.0.0.0:8080` | Address the `/healthz`, `/readyz` and `/metrics` listener binds to |
 | `LOG_LEVEL`                | no       | `info`  | `trace`, `debug`, `info`, `warn`, or `error`                           |
 | `RUST_LOG`                 | no       | -       | Advanced per-module filter (tracing's `EnvFilter` syntax); overrides `LOG_LEVEL` when set |

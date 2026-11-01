@@ -30,6 +30,13 @@ telegram:
   # deliberately pointing the bot at a JMAP server on an internal network
   # you control (and trust every authorized chat with that access).
   allowPrivateJmapHosts: false
+  # Forum topics in private chats (Threaded Mode in BotFather).
+  # 'auto' (default), 'enabled', or 'disabled'.
+  threadedMode: "auto"
+  # Topic strategy: 'account' (default, 1 topic per account) or 'server'.
+  threadStrategy: "account"
+  # Shared mailbox topic mode: 'parent' (default, in parent account topic) or 'dedicated'.
+  sharedThreadMode: "parent"
 
 # Persistent storage for the AES-256-GCM-encrypted credential store
 # (master.key + state.enc). This is the only state the bot keeps; losing

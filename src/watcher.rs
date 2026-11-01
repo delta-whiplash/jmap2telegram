@@ -303,6 +303,7 @@ pub fn spawn(
                                 &bot,
                                 &state,
                                 chat_id,
+                                &target,
                                 connection_recovered_text(&target, lang),
                             )
                             .await;
@@ -319,8 +320,14 @@ pub fn spawn(
                             // connection_broken_text for why the chat
                             // must never see it).
                             let lang = state.language_for(chat_id, None);
-                            notify(&bot, &state, chat_id, connection_broken_text(&target, lang))
-                                .await;
+                            notify(
+                                &bot,
+                                &state,
+                                chat_id,
+                                &target,
+                                connection_broken_text(&target, lang),
+                            )
+                            .await;
                         }
                     }
                 }
@@ -334,12 +341,21 @@ pub fn spawn(
 
 /// Sends a connection-health notice, unless the chat has since disconnected
 /// entirely (a race with /logout while we were mid-retry).
-async fn notify(bot: &Bot, state: &AppState, chat_id: i64, text: String) {
-    if state.store.get(chat_id).is_none() {
+async fn notify(bot: &Bot, state: &AppState, chat_id: i64, target: &WatchTarget, text: String) {
+    let Some(account) = state.store.get(chat_id) else {
         return;
+    };
+    let thread_id = crate::topics::target_thread_id(&state.config, &account, target);
+    let mut req = bot.send_message(ChatId(chat_id), text.clone());
+    if let Some(tid) = thread_id {
+        req = req.message_thread_id(tid);
     }
-    if let Err(e) = bot.send_message(ChatId(chat_id), text).await {
-        tracing::warn!(chat_id, error = %e, "failed to deliver connection-health notice");
+    if let Err(e) = req.await {
+        if crate::topics::is_thread_not_found_error(&e) {
+            let _ = bot.send_message(ChatId(chat_id), text).await;
+        } else {
+            tracing::warn!(chat_id, error = %e, "failed to deliver connection-health notice");
+        }
     }
 }
 
@@ -447,13 +463,46 @@ async fn sync_and_notify(
         let text = notification_text(&email.summary, state.config.timezone, target.label(), lang);
         let keyboard =
             notification_keyboard(&email.summary.id, target.account_id(), false, false, lang);
-        match bot
-            .send_message(ChatId(chat_id), text)
+
+        let thread_id = crate::topics::target_thread_id(&state.config, &account, target);
+        let mut req = bot
+            .send_message(ChatId(chat_id), text.clone())
             .parse_mode(ParseMode::MarkdownV2)
-            .reply_markup(keyboard)
-            .await
-        {
+            .reply_markup(keyboard.clone());
+        if let Some(tid) = thread_id {
+            req = req.message_thread_id(tid);
+        }
+
+        match req.await {
             Ok(_) => state.metrics.notification_delivered(target.kind()),
+            Err(ref e) if crate::topics::is_thread_not_found_error(e) => {
+                // Topic was deleted by the user in the Telegram client.
+                // Clear the stored thread_id so subsequent notifications don't fail.
+                match target {
+                    WatchTarget::Primary => {
+                        let _ = state.store.set_account_thread_id(chat_id, "default", None);
+                    }
+                    WatchTarget::Account { slot_id, .. } | WatchTarget::Extra { slot_id, .. } => {
+                        let _ = state.store.set_account_thread_id(chat_id, slot_id, None);
+                    }
+                    WatchTarget::Shared { account_id, .. } => {
+                        let _ = state
+                            .store
+                            .set_shared_account_thread_id(chat_id, account_id, None);
+                    }
+                }
+                // Fallback to sending in main chat so the email notification is never lost
+                let fallback = bot
+                    .send_message(ChatId(chat_id), text)
+                    .parse_mode(ParseMode::MarkdownV2)
+                    .reply_markup(keyboard)
+                    .await;
+                if fallback.is_ok() {
+                    state.metrics.notification_delivered(target.kind());
+                } else {
+                    state.metrics.notification_send_error(target.kind());
+                }
+            }
             Err(e) => {
                 state.metrics.notification_send_error(target.kind());
                 tracing::warn!(chat_id, error = %e, "failed to deliver notification");
@@ -582,6 +631,7 @@ mod tests {
                 name: "shared@b.c".to_string(),
                 last_state: Some("shared-state".to_string()),
                 parent_slot: None,
+                thread_id: None,
             },
         );
         acc.accounts.insert(
@@ -592,6 +642,7 @@ mod tests {
                 token: "other-tok".to_string(),
                 email: "second@other.example".to_string(),
                 last_state: Some("extra-state".to_string()),
+                thread_id: None,
             },
         );
         acc

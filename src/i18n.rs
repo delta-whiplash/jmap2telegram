@@ -73,6 +73,7 @@ pub fn bot_commands(lang: &str) -> Vec<BotCommand> {
         BotCommand::new("mute", t!("cmd.mute", locale = lang)),
         BotCommand::new("unmute", t!("cmd.unmute", locale = lang)),
         BotCommand::new("search", t!("cmd.search", locale = lang)),
+        BotCommand::new("threads", t!("cmd.threads", locale = lang)),
         BotCommand::new("lang", t!("cmd.lang", locale = lang)),
         BotCommand::new("help", t!("cmd.help", locale = lang)),
     ]

@@ -26,6 +26,7 @@ mod jmap;
 mod logging;
 mod state;
 mod store;
+mod topics;
 mod watcher;
 
 use std::sync::Arc;
