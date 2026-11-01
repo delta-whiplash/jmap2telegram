@@ -464,9 +464,7 @@ mod tests {
         assert!(snapshot.contains_key(&acc8_key), "{snapshot:?}");
         assert!(!snapshot.get(&acc8_key).unwrap().connected);
         assert!(snapshot.values().filter(|s| s.connected).count() == snapshot.len() - 1);
-        state
-            .health
-            .set_connected(&acc8_key, true);
+        state.health.set_connected(&acc8_key, true);
         let snapshot = state.health.snapshot();
         assert!(snapshot.get(&acc8_key).unwrap().connected);
     }

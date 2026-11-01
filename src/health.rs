@@ -150,7 +150,6 @@ impl Health {
     pub(crate) fn snapshot(&self) -> HashMap<String, WatcherStatus> {
         self.watchers.lock().unwrap().clone()
     }
-
 }
 
 /// Application-level counters and gauges, rendered alongside the watcher
