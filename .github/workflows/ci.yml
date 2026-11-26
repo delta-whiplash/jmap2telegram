@@ -72,7 +72,11 @@ jobs:
       - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
         with:
           tool: cargo-audit
-      - run: cargo audit
+      # --deny warnings turns informational advisories (unmaintained,
+      # unsound) into failures, so a dependency going quiet reddens the
+      # build instead of printing a line nobody reads. The two transitive
+      # exceptions we cannot fix from here live in .cargo/audit.toml.
+      - run: cargo audit --deny warnings
 
   helm-lint:
     runs-on: ubuntu-latest
