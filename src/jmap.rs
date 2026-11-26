@@ -232,7 +232,60 @@ pub async fn connect(server_url: &str, token: &str, allow_private_hosts: bool) -
             JmapError::Unreachable
         })?;
 
+    assert_session_urls(&client, allow_private_hosts).await?;
     Ok(client)
+}
+
+/// The JMAP session document names the URL every later request goes to
+/// (`apiUrl`) and where the EventSource stream is opened
+/// (`eventSourceUrl`), and `jmap-client` takes both verbatim: they are
+/// what its request builder and its push client use, with the bearer
+/// token attached, for the whole life of the connection.
+///
+/// [`assert_public_host`] only validates the host the *user* typed when
+/// running `/login`. A server that answers the session handshake with
+/// `"apiUrl": "http://10.0.0.5:8080/jmap"` would therefore have the bot
+/// POST into its own internal network on every sync, and over plain HTTP
+/// the token would travel unencrypted - the check on the typed host is
+/// irrelevant to both. Re-validating the effective URLs, once, at the
+/// point they are adopted, is what closes that gap.
+///
+/// A session may legitimately put these on a different *public* host than
+/// the typed one (a provider splitting webmail from API), so this checks
+/// scheme and reachability, not same-origin.
+async fn assert_session_urls(client: &Client, allow_private_hosts: bool) -> Result<()> {
+    let session = client.session();
+    let mut urls = vec![("apiUrl", session.api_url())];
+    // An absent event-source URL is what tells us push notifications are
+    // not offered; an empty string is the protocol's way of saying so.
+    if !session.event_source_url().is_empty() {
+        urls.push(("eventSourceUrl", session.event_source_url()));
+    }
+
+    for (field, raw) in urls {
+        let parsed = url::Url::parse(raw).map_err(|_| {
+            tracing::warn!(
+                field,
+                "session names an unparseable URL; refusing to use it"
+            );
+            JmapError::InvalidUrl
+        })?;
+        if parsed.scheme() != "https" {
+            // Same requirement as the typed URL: a bearer token never
+            // travels in the clear, whichever side chose the endpoint.
+            tracing::warn!(
+                field,
+                scheme = parsed.scheme(),
+                "session names a non-https endpoint; refusing to use it"
+            );
+            return Err(JmapError::InsecureUrl);
+        }
+        let host = parsed.host_str().ok_or(JmapError::NoHost)?;
+        if !allow_private_hosts {
+            assert_public_host(host, raw).await?;
+        }
+    }
+    Ok(())
 }
 
 /// Connects the same way as [`connect`], then switches the client's default
@@ -874,6 +927,71 @@ mod tests {
             // a silent English fallback.
             assert_ne!(en, fr, "untranslated variant: {err:?}");
         }
+    }
+
+    /// The host the user typed can be perfectly public while the session
+    /// document points the *actual* API somewhere else - which is what a
+    /// hostile or compromised "free JMAP host" would answer. `connect`
+    /// only guards the typed host, so the effective URLs need their own
+    /// check before the bearer token starts flowing to them.
+    ///
+    /// These drive `assert_session_urls` directly: wiremock speaks plain
+    /// HTTP, so every fixture it serves is already the shape being
+    /// refused, which is precisely what makes it a usable hostile server.
+    async fn session_client(server: &MockServer, body: serde_json::Value) -> Client {
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jmap"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(server)
+            .await;
+        Client::new()
+            .credentials(Credentials::bearer("tok"))
+            .connect(&server.uri())
+            .await
+            .expect("the mock session itself is reachable")
+    }
+
+    #[tokio::test]
+    async fn session_urls_must_be_https_to_carry_the_bearer_token() {
+        let server = MockServer::start().await;
+        let client = session_client(&server, session_body(&server.uri())).await;
+
+        let err = assert_session_urls(&client, false)
+            .await
+            .expect_err("a session naming an http endpoint must be refused");
+        assert!(
+            matches!(err, JmapError::InsecureUrl),
+            "expected InsecureUrl, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_urls_are_held_to_the_same_ssrf_guard_as_the_typed_host() {
+        let server = MockServer::start().await;
+        let mut body = session_body(&server.uri());
+        // The cloud metadata endpoint, this time chosen by the server
+        // rather than typed by the user, and over https so only the
+        // address check can catch it.
+        body["apiUrl"] = json!("https://169.254.169.254/latest/meta-data/jmap");
+        // Both endpoints, so the follow-up check below isolates the
+        // address rule from the scheme rule.
+        body["eventSourceUrl"] = json!("https://169.254.169.254/latest/meta-data/events");
+        let client = session_client(&server, body).await;
+
+        let err = assert_session_urls(&client, false)
+            .await
+            .expect_err("a session pointing at link-local space must be refused");
+        match err {
+            JmapError::PrivateHost { host, .. } => assert_eq!(host, "169.254.169.254"),
+            other => panic!("expected PrivateHost, got {other:?}"),
+        }
+
+        // The documented opt-in has to keep working, or an operator who
+        // runs JMAP on their own private network cannot log in at all.
+        assert!(
+            assert_session_urls(&client, true).await.is_ok(),
+            "ALLOW_PRIVATE_JMAP_HOSTS must cover the session URLs too"
+        );
     }
 
     #[tokio::test]
