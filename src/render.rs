@@ -525,10 +525,7 @@ impl<'a> Converter<'a> {
                     self.text.push('\n');
                 }
             }
-            if self.space_pending && !self.text.is_empty() && !self.text.ends_with('\n') {
-                self.text.push(' ');
-            }
-            self.space_pending = false;
+            self.emit_pending_space();
             self.text.push(c);
             if self.table_depth > 0 {
                 self.cell_text = true;
@@ -554,6 +551,35 @@ impl<'a> Converter<'a> {
         }
         if !self.text.ends_with('\n') {
             self.text.push('\n');
+        }
+    }
+
+    /// Emits a space held since the last whitespace character.
+    ///
+    /// When the space was seen right after a style boundary the text run
+    /// it belongs to is still empty, and the space has to go on the span
+    /// that just closed - dropping it there glues the runs together
+    /// ("**bold**word"), which is what a `<b>…</b> word` body rendered as.
+    fn emit_pending_space(&mut self) {
+        if !self.space_pending {
+            return;
+        }
+        self.space_pending = false;
+        if !self.text.is_empty() {
+            if !self.text.ends_with('\n') && !self.text.ends_with(' ') {
+                self.text.push(' ');
+            }
+            return;
+        }
+        if self.break_pending {
+            // The pending newline replaces the space.
+            return;
+        }
+        if let Some(last) = self.spans.last_mut()
+            && !last.text.ends_with(' ')
+            && !last.text.ends_with('\n')
+        {
+            last.text.push(' ');
         }
     }
 
@@ -924,17 +950,55 @@ mod tests {
         assert_eq!(find_closing_tag("no tag here", "style"), None);
     }
 
+    /// The text a reader sees once Telegram has parsed the markup.
+    fn text_of(html: &str) -> String {
+        let mut out = String::new();
+        let mut in_tag = false;
+        for ch in html.chars() {
+            match ch {
+                '<' => in_tag = true,
+                '>' => in_tag = false,
+                _ if !in_tag => out.push(ch),
+                _ => {}
+            }
+        }
+        out.replace("&amp;", "&")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+    }
+
     #[test]
     fn keeps_bold_italic_and_links_as_markup() {
         let html = r#"<p><b>Tu fais de gros progrès !</b> <a href="https://ex.com/a?b=1&amp;c=2">Commence</a> <i>doucement</i></p>"#;
         let spans = spans_from_html(html);
         let out = html_of(&spans);
-        assert!(out.contains("<b>Tu fais de gros progrès !</b>"), "{out:?}");
+        // The space at a style boundary may land on either side of the tag,
+        // so assert on the rendered text, then on the markup being there.
+        assert_eq!(
+            text_of(&out),
+            "Tu fais de gros progrès ! Commence doucement",
+            "{out:?}"
+        );
+        assert!(out.starts_with("<b>Tu fais de gros progrès !"), "{out:?}");
         assert!(
-            out.contains(r#"<a href="https://ex.com/a?b=1&amp;c=2">Commence</a>"#),
+            out.contains(r#"<a href="https://ex.com/a?b=1&amp;c=2">Commence"#),
             "{out:?}"
         );
         assert!(out.contains("<i>doucement</i>"), "{out:?}");
+    }
+
+    #[test]
+    fn keeps_the_space_that_follows_a_closing_style_tag() {
+        // Regression: the space after `</b>` used to be dropped when the
+        // next run started a new span, gluing "progrès !" to "Tom".
+        let spans = spans_from_html("<p><b>Tu fais de gros progrès !</b> Tom arrive</p>");
+        let out = html_of(&spans);
+        assert_eq!(
+            text_of(&out),
+            "Tu fais de gros progrès ! Tom arrive",
+            "{out:?}"
+        );
     }
 
     #[test]

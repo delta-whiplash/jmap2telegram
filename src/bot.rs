@@ -1969,6 +1969,11 @@ mod tests {
     struct MockTelegram {
         base_url: String,
         requests: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
+        /// Payloads real Telegram would have rejected with 400. The mock
+        /// answers that 400 too, so the bot's own error handling kicks in;
+        /// this list exists so a failing test can say *why* the message
+        /// never arrived instead of just "no message was sent".
+        violations: Arc<Mutex<Vec<String>>>,
     }
 
     impl MockTelegram {
@@ -1988,9 +1993,17 @@ mod tests {
         }
 
         fn last_text(&self) -> String {
-            self.sent_texts()
-                .pop()
-                .expect("the handler under test must send at least one message")
+            let mut texts = self.sent_texts();
+            match texts.pop() {
+                Some(text) => text,
+                None => {
+                    // When nothing arrived, prefer the actionable reason:
+                    // the mock refusing the payload says far more than
+                    // "no message was sent".
+                    self.assert_contract();
+                    panic!("the handler under test must send at least one message")
+                }
+            }
         }
 
         fn methods(&self) -> Vec<String> {
@@ -2018,6 +2031,19 @@ mod tests {
             self.requests.lock().unwrap().clear();
         }
 
+        /// Panics with every contract violation the mock refused, so a
+        /// rendering regression reports the payload rather than a missing
+        /// message.
+        fn assert_contract(&self) {
+            let violations = self.violations.lock().unwrap();
+            assert!(
+                violations.is_empty(),
+                "Telegram would have rejected {} message(s):\n{}",
+                violations.len(),
+                violations.join("\n")
+            );
+        }
+
         fn bot(&self) -> Bot {
             teloxide::Bot::new("123456:TEST_TOKEN")
                 .set_api_url(url::Url::parse(&self.base_url).unwrap())
@@ -2030,12 +2056,15 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let sink = requests.clone();
+        let violations = Arc::new(Mutex::new(Vec::new()));
+        let violation_sink = violations.clone();
         tokio::spawn(async move {
             loop {
                 let Ok((mut socket, _)) = listener.accept().await else {
                     break;
                 };
                 let sink = sink.clone();
+                let violation_sink = violation_sink.clone();
                 tokio::spawn(async move {
                     let mut raw = Vec::new();
                     let mut chunk = [0u8; 4096];
@@ -2060,7 +2089,38 @@ mod tests {
                     let (method, body) = parse_request(&raw);
                     let json: serde_json::Value =
                         serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
-                    sink.lock().unwrap().push((method.clone(), json));
+                    sink.lock().unwrap().push((method.clone(), json.clone()));
+
+                    // Behave like Telegram on the two methods that carry
+                    // text: a payload it would reject gets the same 400 here,
+                    // so a rendering regression fails the suite instead of
+                    // shipping.
+                    if matches!(method.as_str(), "sendmessage" | "editmessagetext") {
+                        let text = json.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                        let parse_mode = json.get("parse_mode").and_then(|m| m.as_str());
+                        if let Some(reason) = crate::telegram_contract::violation(text, parse_mode)
+                        {
+                            violation_sink
+                                .lock()
+                                .unwrap()
+                                .push(format!("{method}: {reason}"));
+                            let payload = serde_json::json!({
+                                "ok": false,
+                                "error_code": 400,
+                                "description": format!("Bad Request: {reason}"),
+                            })
+                            .to_string();
+                            let response = format!(
+                                "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\n\
+                                 Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                payload.len(),
+                                payload
+                            );
+                            let _ = socket.write_all(response.as_bytes()).await;
+                            let _ = socket.shutdown().await;
+                            return;
+                        }
+                    }
 
                     // `SendMessage`/`EditMessageReplyMarkup` must answer with
                     // a deserializable Message; every other method the
@@ -2090,6 +2150,7 @@ mod tests {
         MockTelegram {
             base_url: format!("http://{addr}"),
             requests,
+            violations,
         }
     }
 
