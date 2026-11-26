@@ -30,6 +30,11 @@ mod store;
 mod topics;
 mod watcher;
 
+// Telegram's message contract as the mock server enforces it; test-only so
+// the validator never ships in the binary.
+#[cfg(test)]
+mod telegram_contract;
+
 use std::sync::Arc;
 
 use teloxide::adaptors::throttle::Limits;
