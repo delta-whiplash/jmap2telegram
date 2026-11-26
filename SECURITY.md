@@ -23,7 +23,12 @@
   preview text are attacker-controlled (they're whatever showed up in the
   mailbox) and are fully escaped before being interpolated into a
   Telegram `MarkdownV2` message, so a crafted email can't inject
-  formatting or break message rendering.
+  formatting or break message rendering. The "Read all" body takes the
+  same input through `src/render.rs`, which converts the message's HTML to
+  Telegram HTML with its own escaping (`&`, `<`, `>` in text, plus `"`
+  inside `href`) and only keeps links whose scheme is
+  `http`/`https`/`mailto`/`tel`/`tg` - no `javascript:`, no `data:`, no
+  raw passthrough of the sender's markup.
 - **Malformed/oversized JMAP ids.** Inline button `callback_data` is
   capped by Telegram at 64 bytes; if a JMAP id would exceed that, the bot
   drops the action buttons for that notification rather than sending a

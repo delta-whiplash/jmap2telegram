@@ -1,0 +1,22 @@
+# cargo-audit reads this file automatically when run from the repository root.
+#
+# Policy: informational advisories (unmaintained, unsound, ...) are failures.
+# CI runs `cargo audit --deny warnings`, so a dependency that quietly goes
+# unmaintained turns the build red instead of printing a line nobody reads.
+# A crate is only listed under `ignore` when it is *transitive and unfixable
+# from this repository*, and the comment has to name the path that pulls it
+# in so the entry can be re-checked when upstream moves.
+[advisories]
+ignore = [
+    # chrono is pulled in by jmap-client (JMAP date parsing) and by
+    # teloxide-core (Telegram API dates). Both are third-party: this
+    # repository holds no direct chrono dependency any more (see the
+    # chrono-tz -> jiff migration in src/format.rs and src/logging.rs).
+    # Re-check when both release a chrono-free version.
+    "RUSTSEC-2026-0543",
+    # proc-macro-error2 is pulled in by teloxide -> aquamarine, a
+    # non-optional dependency used for the crate's documentation diagrams.
+    # There is no feature flag to drop it; re-check on the next teloxide
+    # major release.
+    "RUSTSEC-2026-0173",
+]

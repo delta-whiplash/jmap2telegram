@@ -168,6 +168,26 @@ What you get on Stalwart specifically:
 See [`SECURITY.md`](SECURITY.md) for the full threat model and how to
 report a vulnerability.
 
+### Dependency policy
+
+- **Unmaintained code is a build failure, not a warning.** The `audit`
+  job runs `cargo audit --deny warnings`, so a dependency advisory of any
+  kind (vulnerability, unsound API, abandoned crate) turns CI red.
+- **Two transitive advisories are accepted, and only these two.** Both are
+  pulled in by crates this project does not control and both are listed,
+  with their reason, in `.cargo/audit.toml`: `chrono` (via `jmap-client`
+  and `teloxide-core`) and `proc-macro-error2` (via
+  `teloxide -> aquamarine`, a mandatory build dependency with no opt-out
+  feature). A new entry needs the same kind of justification.
+- **Maintained replacements are preferred over convenience.** `chrono-tz`
+  went away in favour of `jiff`, which ships the timezone database in the
+  binary and is actively maintained; the direct `chrono` dependency went
+  with it.
+- **Default features are dropped unless used.** `jmap-client` is built
+  without its WebSocket/AWS-LC features, `teloxide` without its optional
+  storage/webhook stack, and `jiff` without the system timezone lookup it
+  does not need.
+
 ## Quickstart (Docker)
 
 ```bash
