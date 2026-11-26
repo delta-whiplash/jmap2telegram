@@ -94,6 +94,20 @@ impl AppState {
         }
     }
 
+    /// Records the undo slot for a triage action, dropping expired ones on
+    /// the way in. The map is only written here, so purging at insertion is
+    /// enough to keep the `pending_undos` gauge honest - it used to count
+    /// every slot ever created until that chat happened to tap "Annuler".
+    pub async fn remember_undo(&self, chat_id: i64, undo: PendingUndo) {
+        {
+            let mut slots = self.pending_undo.write().await;
+            let now = Instant::now();
+            slots.retain(|_, slot| slot.expires_at > now);
+            slots.insert(chat_id, undo);
+        }
+        self.refresh_undo_gauge().await;
+    }
+
     /// Recomputes the `pending_undos` gauge from the source of truth.
     /// Called after every mutation of `pending_undo` so the gauge can never
     /// drift from the map it reports on.

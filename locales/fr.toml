@@ -94,6 +94,7 @@ lang_usage = "Usage : /lang <en|fr> (actuelle : %{current})"
 lang_set = "✅ Langue mise à jour."
 lang_invalid = "Langue non prise en charge. Disponibles : en, fr."
 error_generic = "❌ Erreur : %{error}"
+logout_failed = "❌ La déconnexion n'a pas pu être enregistrée (détail dans les logs) - rien n'a changé, réessaie."
 
 [button]
 read_all = "📖 Lire tout"

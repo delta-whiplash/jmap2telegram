@@ -493,10 +493,7 @@ impl<'a> Converter<'a> {
     /// Skips the raw body of a `<script>`/`<style>`/`<title>` up to its
     /// closing tag. CSS (`a > b`) would otherwise parse as markup.
     fn raw_skip(&mut self, name: &str) {
-        let rest = &self.src[self.pos..];
-        let needle = format!("</{name}");
-        let lower = rest.to_ascii_lowercase();
-        match lower.find(&needle) {
+        match find_closing_tag(&self.src[self.pos..], name) {
             Some(offset) => {
                 let after = self.pos + offset;
                 match self.src[after..].find('>') {
@@ -752,6 +749,41 @@ fn is_invisible(c: char) -> bool {
     )
 }
 
+/// Finds `</name` case-insensitively without allocating.
+///
+/// The obvious implementation - lowercasing the whole remaining document
+/// and searching it - is quadratic when the document repeats the tag: a
+/// 256 KiB body of empty `<style></style>` pairs is ~37k skipped tags and
+/// several gigabytes of copying, all on a tokio worker with no await
+/// point. Everything here works on the existing bytes, so the scan stays
+/// linear and allocation-free.
+fn find_closing_tag(haystack: &str, name: &str) -> Option<usize> {
+    let mut from = 0;
+    while let Some(relative) = haystack[from..].find("</") {
+        let at = from + relative;
+        let name_start = at + 2;
+        let name_end = name_start + name.len();
+        if name_end <= haystack.len()
+            && haystack[name_start..name_end].eq_ignore_ascii_case(name)
+            && matches!(
+                haystack.as_bytes().get(name_end),
+                // The name has to end where the tag name does: `</stylex`
+                // is a different tag, not our closing tag.
+                None | Some(b'>')
+                    | Some(b'/')
+                    | Some(b' ')
+                    | Some(b'\t')
+                    | Some(b'\n')
+                    | Some(b'\r')
+            )
+        {
+            return Some(at);
+        }
+        from = at + 2;
+    }
+    None
+}
+
 fn decode_entities(input: &str) -> Cow<'_, str> {
     if !input.contains('&') {
         return Cow::Borrowed(input);
@@ -864,6 +896,32 @@ mod tests {
         "#;
         let text = render(html);
         assert_eq!(text, "Commence une leçon", "got {text:?}");
+    }
+
+    /// A body made of thousands of empty skipped tags used to cost time
+    /// quadratic in the document size, because each skip lowercased the
+    /// whole remaining document. The skip is allocation-free now; this
+    /// pins the behaviour (the text around the tags still renders) rather
+    /// than a wall-clock bound, which would be flaky on CI.
+    #[test]
+    fn survives_thousands_of_empty_skipped_tags() {
+        let mut html = String::from("<p>Début</p>");
+        for _ in 0..5_000 {
+            html.push_str("<style></style>");
+        }
+        html.push_str("<p>Fin</p>");
+        let text = render(&html);
+        assert_eq!(text, "Début\nFin", "got {text:?}");
+    }
+
+    #[test]
+    fn closing_tag_search_is_case_insensitive_and_prefix_exact() {
+        assert_eq!(find_closing_tag("x</STYLE>y", "style"), Some(1));
+        assert_eq!(find_closing_tag("x</style>y", "style"), Some(1));
+        // `</stylex` must not count as the closing tag for `style`.
+        assert_eq!(find_closing_tag("</stylex>", "style"), None);
+        assert_eq!(find_closing_tag("</script>", "style"), None);
+        assert_eq!(find_closing_tag("no tag here", "style"), None);
     }
 
     #[test]
