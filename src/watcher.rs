@@ -16,6 +16,12 @@ use crate::state::AppState;
 
 const FALLBACK_POLL: Duration = Duration::from_secs(300);
 
+/// How many consecutive syncs a batch may fail to deliver before the
+/// watcher stops holding the cursor back for it. Without a bound, one
+/// message Telegram refuses permanently would freeze that account's
+/// cursor and hide every message behind it.
+const MAX_NOTIFY_ATTEMPTS: u32 = 5;
+
 /// Backoff schedule shared by this module's reconnect loop and the
 /// boot-resume retry loop in accounts.rs: double after each failure,
 /// starting at 2s and never exceeding [`MAX_BACKOFF`]. Shared constants
@@ -438,6 +444,7 @@ async fn sync_and_notify(
     state.metrics.watcher_sync();
 
     let self_address = target.self_address(&account);
+    let mut undelivered: usize = 0;
     for email in &changed {
         // Not every message the account gained is news: a draft the
         // user is still writing, a copy of a mail they sent. Announcing
@@ -506,18 +513,61 @@ async fn sync_and_notify(
                     state.metrics.notification_delivered(target.kind());
                 } else {
                     state.metrics.notification_send_error(target.kind());
+                    undelivered += 1;
                 }
             }
             Err(e) => {
                 state.metrics.notification_send_error(target.kind());
                 tracing::warn!(chat_id, error = %e, "failed to deliver notification");
+                undelivered += 1;
             }
         }
     }
 
-    if new_state != since_state {
-        target.update_state(&state.store, chat_id, new_state);
+    if new_state == since_state {
+        return;
     }
+    let key = target.health_key(chat_id);
+    if undelivered == 0 {
+        // Everything in this batch reached the chat: only now is it safe
+        // to move the cursor past it.
+        state.notify_failures.write().await.remove(&key);
+        target.update_state(&state.store, chat_id, new_state);
+        return;
+    }
+    // Some notifications failed. Advancing the cursor here is what used to
+    // lose mail for good: the messages counted in `new_state` would never
+    // be fetched again, so a transient Telegram outage or one 400 meant
+    // "never notified" rather than "notified late". Hold the cursor back
+    // and retry the batch on the next sync instead - the messages already
+    // delivered in this batch are announced twice, which is the recoverable
+    // direction to be wrong in.
+    let attempts = {
+        let mut failures = state.notify_failures.write().await;
+        let attempts = failures.entry(key.clone()).or_insert(0);
+        *attempts += 1;
+        *attempts
+    };
+    if attempts < MAX_NOTIFY_ATTEMPTS {
+        tracing::warn!(
+            chat_id,
+            undelivered,
+            attempts,
+            "some notifications failed to send, keeping the sync cursor to retry them"
+        );
+        return;
+    }
+    // Giving up is the last resort: a message Telegram refuses outright
+    // (blocked bot, deleted chat) would otherwise pin the cursor forever
+    // and hide every later message behind it.
+    tracing::warn!(
+        chat_id,
+        undelivered,
+        attempts,
+        "giving up on undeliverable notifications and advancing the sync cursor"
+    );
+    state.notify_failures.write().await.remove(&key);
+    target.update_state(&state.store, chat_id, new_state);
 }
 
 /// Why a new message is not worth a notification.

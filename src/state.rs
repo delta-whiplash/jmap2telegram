@@ -66,6 +66,16 @@ pub struct AppState {
     /// this is a short-lived safety net for an accidental tap, not
     /// durable state anything depends on surviving a restart.
     pub pending_undo: Arc<RwLock<HashMap<i64, PendingUndo>>>,
+    /// Per-watcher count of consecutive syncs where at least one
+    /// notification could not be delivered, keyed by
+    /// [`crate::watcher::WatchTarget::health_key`]. The watcher holds the
+    /// sync cursor back while a delivery is failing so the next tick
+    /// retries it instead of skipping it forever; this bounds that hold so
+    /// one permanently refused message (a chat that blocked the bot, say)
+    /// cannot freeze the cursor for good. In-memory only: a restart
+    /// forgetting the count just means the retry budget starts over, which
+    /// is the safe direction.
+    pub notify_failures: Arc<RwLock<HashMap<String, u32>>>,
 }
 
 impl AppState {
@@ -80,6 +90,7 @@ impl AppState {
             shared_clients: Arc::new(RwLock::new(HashMap::new())),
             shared_watchers: Arc::new(RwLock::new(HashMap::new())),
             pending_undo: Arc::new(RwLock::new(HashMap::new())),
+            notify_failures: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
