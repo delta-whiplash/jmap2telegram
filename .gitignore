@@ -2,3 +2,6 @@
 .env
 /data
 *.tgz
+
+# Local gh CLI cache (XDG_CACHE_HOME)
+.cache/
