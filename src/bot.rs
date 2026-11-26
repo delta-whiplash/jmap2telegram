@@ -1380,16 +1380,17 @@ async fn perform_triage_action(
         Ok(()) => {
             state.metrics.triage_action(action_label, "ok");
             bot.answer_callback_query(query_id).text(toast).await?;
-            state.pending_undo.write().await.insert(
-                chat_id.0,
-                PendingUndo {
-                    account_id: account_id.map(str::to_string),
-                    email_id: email_id.to_string(),
-                    restore_mailbox_ids,
-                    expires_at: Instant::now() + UNDO_WINDOW,
-                },
-            );
-            state.refresh_undo_gauge().await;
+            state
+                .remember_undo(
+                    chat_id.0,
+                    PendingUndo {
+                        account_id: account_id.map(str::to_string),
+                        email_id: email_id.to_string(),
+                        restore_mailbox_ids,
+                        expires_at: Instant::now() + UNDO_WINDOW,
+                    },
+                )
+                .await;
             let _ = bot
                 .edit_message_reply_markup(chat_id, message_id)
                 .reply_markup(format::undo_keyboard(email_id, account_id, lang))
@@ -1518,7 +1519,18 @@ async fn callback_handler(bot: Bot, q: CallbackQuery, state: AppState) -> Handle
             }
         }
         state.forget(chat_id.0).await;
-        let _ = state.store.remove(chat_id.0);
+        // Announcing "disconnected" before the removal is persisted would
+        // be a lie that comes back at the next restart: the encrypted state
+        // would still hold the tokens, and boot resume would log the
+        // accounts back in.
+        if let Err(e) = state.store.remove(chat_id.0) {
+            tracing::warn!(chat_id = chat_id.0, error = %e, "failed to persist the logout");
+            bot.answer_callback_query(q.id)
+                .text(t!("bot.logout_failed", locale = lang))
+                .show_alert(true)
+                .await?;
+            return Ok(());
+        }
         state.refresh_accounts_gauge();
         let _ = bot
             .edit_message_reply_markup(chat_id, message_id)
@@ -1730,10 +1742,23 @@ async fn callback_handler(bot: Bot, q: CallbackQuery, state: AppState) -> Handle
             }
         }
         "f" => {
+            // Answer before the network round trip. Telegram invalidates a
+            // callback query after a few seconds, and the fetch below can
+            // take longer than that on a slow server; answering afterwards
+            // made the `?` abort the whole branch, so the body the user
+            // asked for was never sent at all.
+            bot.answer_callback_query(q.id).await?;
             let _ = bot.send_chat_action(chat_id, ChatAction::Typing).await;
+            // Post where the notification lives. In forum mode the button
+            // is tapped inside the account's topic, and the body used to
+            // land in the chat root - away from the message it expands.
+            let thread_id = q
+                .message
+                .as_ref()
+                .and_then(|message| message.regular_message())
+                .and_then(|message| message.thread_id);
             match jmap::fetch_full_body(&client, email_id).await {
                 Ok(mut body) => {
-                    bot.answer_callback_query(q.id).await?;
                     // The HTML part is the one the sender designed: it
                     // carries real bold, tappable links and tables that
                     // collapse onto one line, where the text part is an
@@ -1784,6 +1809,9 @@ async fn callback_handler(bot: Bot, q: CallbackQuery, state: AppState) -> Handle
                         if as_html {
                             request = request.parse_mode(ParseMode::Html);
                         }
+                        if let Some(thread_id) = thread_id {
+                            request = request.message_thread_id(thread_id);
+                        }
                         if let Err(e) = request.await {
                             tracing::error!(
                                 chat_id = chat_id.0,
@@ -1807,24 +1835,31 @@ async fn callback_handler(bot: Bot, q: CallbackQuery, state: AppState) -> Handle
                             .map(|p| format!("{p}/{total}"))
                             .collect::<Vec<_>>()
                             .join(", ");
-                        let _ = bot
-                            .send_message(
-                                chat_id,
-                                t!(
-                                    "bot.full_text_partial",
-                                    locale = lang,
-                                    count = failed.len(),
-                                    listing = listing
-                                ),
-                            )
-                            .await;
+                        let mut notice = bot.send_message(
+                            chat_id,
+                            t!(
+                                "bot.full_text_partial",
+                                locale = lang,
+                                count = failed.len(),
+                                listing = listing
+                            ),
+                        );
+                        if let Some(thread_id) = thread_id {
+                            notice = notice.message_thread_id(thread_id);
+                        }
+                        let _ = notice.await;
                     }
                 }
                 Err(e) => {
-                    bot.answer_callback_query(q.id)
-                        .text(format!("❌ {}", e.localized(lang)))
-                        .show_alert(true)
-                        .await?;
+                    // The callback is already answered, so there is no
+                    // alert left to show: report in the chat rather than
+                    // letting the failure end in silence.
+                    let mut failure =
+                        bot.send_message(chat_id, format!("❌ {}", e.localized(lang)));
+                    if let Some(thread_id) = thread_id {
+                        failure = failure.message_thread_id(thread_id);
+                    }
+                    let _ = failure.await;
                 }
             }
         }

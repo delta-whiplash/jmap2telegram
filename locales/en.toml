@@ -95,6 +95,7 @@ lang_usage = "Usage: /lang <en|fr> (current: %{current})"
 lang_set = "✅ Language updated."
 lang_invalid = "Unsupported language. Available: en, fr."
 error_generic = "❌ Error: %{error}"
+logout_failed = "❌ The disconnect could not be saved (details in the logs) - nothing changed, try again."
 
 [button]
 read_all = "📖 Read all"
