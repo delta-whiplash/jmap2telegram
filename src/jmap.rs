@@ -389,23 +389,69 @@ pub async fn fetch_changed_emails(
     client: &Client,
     since_state: &str,
 ) -> Result<(Vec<ChangedEmail>, String)> {
-    let changes = client
-        .email_changes(since_state, Some(50))
-        .await
-        .map_err(|_| JmapError::Protocol {
-            operation: "Email/changes",
-        })?;
-    let new_state = changes.new_state().to_string();
-    let created = changes.created().to_vec();
+    // A single `Email/changes` call is capped by both the server and the
+    // page size asked for, and RFC 8620 answers "there is more" with
+    // `hasMoreChanges` plus a cursor that only covers the page returned.
+    // This used to ask for 50 and persist `newState` regardless, so a
+    // mailbox that gained more than 50 messages while the bot was down
+    // (a night, a redeploy) silently lost everything past the first page:
+    // the cursor jumped over them and nothing would ever report them
+    // again. Draining the pages here is what makes a restart lossless.
+    let mut state = since_state.to_string();
+    let mut created: Vec<String> = Vec::new();
+    let mut drained = false;
+    for _ in 0..MAX_CHANGES_PAGES {
+        let changes = client
+            .email_changes(&state, Some(CHANGES_PAGE_SIZE))
+            .await
+            .map_err(|_| JmapError::Protocol {
+                operation: "Email/changes",
+            })?;
+        created.extend(changes.created().iter().cloned());
+        let next_state = changes.new_state().to_string();
+        let more = changes.has_more_changes();
+        state = next_state;
+        if !more {
+            drained = true;
+            break;
+        }
+    }
+    // A server that keeps answering "more changes" would spin here, so
+    // the loop is bounded. Hitting the bound is not an error - the cursor
+    // still advances over what was drained - but it is loud, because the
+    // changes past it are not going to be reported.
+    if !drained {
+        tracing::warn!(
+            changes = created.len(),
+            "more changes than one sync drains; anything past this batch will not be notified"
+        );
+    }
     if created.is_empty() {
         // Nothing to classify, so the mailbox lookup below would be a
         // wasted round trip on every idle sync.
-        return Ok((Vec::new(), new_state));
+        return Ok((Vec::new(), state));
     }
+    Ok((changed_emails(client, created).await?, state))
+}
+
+/// How many changes one `Email/changes` request asks for. The server may
+/// answer with fewer; the loop in [`fetch_changed_emails`] asks again
+/// until it stops saying there are more.
+const CHANGES_PAGE_SIZE: usize = 200;
+
+/// Ceiling on the number of pages one sync drains, so a misbehaving
+/// server cannot keep the loop alive forever. 25 pages is 5000 changes,
+/// an order of magnitude more than a week of mail for a personal mailbox.
+const MAX_CHANGES_PAGES: usize = 25;
+
+/// Resolves the messages behind a batch of ids into what a notification
+/// needs: the summary plus the roles and keywords that let the caller
+/// classify it.
+async fn changed_emails(client: &Client, ids: Vec<String>) -> Result<Vec<ChangedEmail>> {
     let roles = mailbox_roles(client).await?;
 
-    let mut changed = Vec::with_capacity(created.len());
-    for id in created {
+    let mut changed = Vec::with_capacity(ids.len());
+    for id in ids {
         if let Some(email) = client
             .email_get(
                 &id,
@@ -458,7 +504,7 @@ pub async fn fetch_changed_emails(
         }
     }
 
-    Ok((changed, new_state))
+    Ok(changed)
 }
 
 /// The role of every mailbox in the account, by mailbox id.
@@ -1262,6 +1308,15 @@ mod tests {
                 .get(method)
                 .cloned()
                 .unwrap_or_else(|| json!({}));
+            // A paged `Email/changes` answers by cursor, so a fixture can
+            // say `{"__by_since": {"s1": {...}, "s2": {...}}}` to give a
+            // different page per `sinceState` and exercise the drain loop.
+            if method == "Email/changes"
+                && let Some(by_since) = args.get("__by_since").and_then(|v| v.as_object()).cloned()
+            {
+                let since = call[1]["sinceState"].as_str().unwrap_or_default();
+                args = by_since.get(since).cloned().unwrap_or_else(|| json!({}));
+            }
             // An `Email/get` answers for the ids it was asked about: the
             // fixture holds every message of the scenario, so the list
             // has to be narrowed to the request. Without this, every
@@ -1464,6 +1519,57 @@ mod tests {
         assert_eq!(changed[0].summary.id, "m1");
         assert_eq!(changed[0].summary.subject, "Invoice");
         assert_eq!(changed[0].summary.attachments.len(), 2);
+    }
+
+    /// A mailbox that gained more messages than one `Email/changes` page
+    /// holds must still report all of them: the cursor used to jump to
+    /// the last page's state while only the first page was announced, so
+    /// everything in between was lost for good (no restart, no re-sync
+    /// could bring it back).
+    #[tokio::test]
+    async fn fetch_changed_emails_drains_every_page_of_changes() {
+        let server = MockServer::start().await;
+        let client = mock_client(
+            &server,
+            json!({
+                "Email/changes": {"__by_since": {
+                    "s1": {
+                        "accountId": "acc1", "oldState": "s1", "newState": "s2",
+                        "hasMoreChanges": true, "created": ["m1"],
+                        "updated": [], "destroyed": []
+                    },
+                    "s2": {
+                        "accountId": "acc1", "oldState": "s2", "newState": "s3",
+                        "hasMoreChanges": false, "created": ["m2"],
+                        "updated": [], "destroyed": []
+                    }
+                }},
+                "Email/get": {
+                    "accountId": "acc1", "state": "s3", "notFound": [],
+                    "list": [
+                        changed_email_json("m1", &["inbox"], &[], "alice@example.org"),
+                        changed_email_json("m2", &["inbox"], &[], "bob@example.org")
+                    ]
+                },
+                "Mailbox/get": mailboxes_json()
+            }),
+        )
+        .await;
+
+        let (changed, new_state) = fetch_changed_emails(&client, "s1").await.unwrap();
+        assert_eq!(
+            new_state, "s3",
+            "the cursor must end at the last page's state"
+        );
+        let ids: Vec<&str> = changed
+            .iter()
+            .map(|email| email.summary.id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            ["m1", "m2"],
+            "every page of changes must be reported, not just the first"
+        );
     }
 
     /// The mailbox a message sits in is what tells a draft from a

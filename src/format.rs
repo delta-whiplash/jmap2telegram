@@ -12,10 +12,60 @@ pub const TELEGRAM_MAX_MESSAGE_LEN: usize = 4096;
 /// whatever mail showed up in the mailbox, so all of them are bounded
 /// before being sent: an unbounded field could push the rendered message
 /// past Telegram's 4096-char limit, and `send_message` would then fail
-/// for that notification alone - silently and permanently losing it,
-/// since the JMAP sync cursor still advances past it.
+/// for that notification alone.
+///
+/// Budget for a whole notification, in UTF-16 units. Telegram's hard
+/// limit is [`TELEGRAM_MAX_MESSAGE_LEN`]; the margin keeps a little room
+/// for the discrepancy between counting the sent text and the text
+/// Telegram reassembles after parsing entities.
+const NOTIFICATION_MAX_UNITS: usize = TELEGRAM_MAX_MESSAGE_LEN - 16;
+
+/// Per-field cap applied before escaping. The rendered message is bounded
+/// separately by [`clamp_markdown`], so these only have to keep one field
+/// from drowning the others.
 const FIELD_LIMIT: usize = 300;
 const PREVIEW_LIMIT: usize = 400;
+
+/// Telegram's 4096 limit applies to the text *after* entities are parsed,
+/// counted in UTF-16 units. Every field is capped on its own raw text
+/// before escaping, but `escape_markdown` can double a field's width and
+/// an emoji costs two units, so a sender who fills every field can still
+/// push the finished message past the limit. Telegram answers that with a
+/// `400 message is too long`, which the watcher can only report as a
+/// failed send - i.e. a notification the user never sees, for a message
+/// any third party can craft. Clamping the assembled message makes that
+/// unreachable.
+///
+/// The cut lands on a character boundary and never right after a
+/// backslash, so it cannot leave a dangling escape - which would make the
+/// whole message invalid MarkdownV2 and get it rejected for a different
+/// reason.
+fn clamp_markdown(input: &str, max_units: usize) -> String {
+    if input.encode_utf16().count() <= max_units {
+        return input.to_string();
+    }
+    // One unit is reserved for the ellipsis that marks the cut.
+    let budget = max_units.saturating_sub(1);
+    let mut units = 0;
+    let mut cut = 0;
+    for (index, ch) in input.char_indices() {
+        let width = ch.len_utf16();
+        if units + width > budget {
+            break;
+        }
+        units += width;
+        cut = index + ch.len_utf8();
+    }
+    let mut text = &input[..cut];
+    // An escape is two characters ("." preceded by a backslash), so a cut
+    // between them would
+    // leave a lone backslash that escapes the ellipsis we are about to
+    // append.
+    while text.ends_with('\\') {
+        text = &text[..text.len() - 1];
+    }
+    format!("{}…", text.trim_end())
+}
 
 fn truncate(input: &str, limit: usize) -> String {
     if input.chars().count() > limit {
@@ -79,7 +129,7 @@ pub fn notification_text(
 
     let attachments_line = attachments_field(&summary.attachments, lang);
 
-    format!(
+    let text = format!(
         "{title}\n\n{mailbox_line}{from_line}\n{subject_line}\n{received_line}\n{attachments_line}\n{preview}",
         title = t!("notif.title", locale = lang),
         from_line = t!("notif.from", locale = lang, value = from),
@@ -93,7 +143,8 @@ pub fn notification_text(
             locale = lang,
             value = escape_markdown(&when)
         ),
-    )
+    );
+    clamp_markdown(&text, NOTIFICATION_MAX_UNITS)
 }
 
 /// Attachments are never downloaded (this bot fetches message bodies on
@@ -555,6 +606,48 @@ mod tests {
         // 400 chars kept + ellipsis marker, well short of the original 1000.
         assert!(text.len() < 700);
         assert!(text.contains('…'));
+    }
+
+    /// The worst case a sender can compose: every bounded field filled
+    /// with characters that each double under MarkdownV2 escaping. The
+    /// per-field caps alone do not add up to a legal message, so the
+    /// assembled text is clamped; without that, Telegram answers 400 and
+    /// the notification is lost for a mail anyone can send.
+    #[test]
+    fn notification_text_stays_sendable_when_every_field_escalates() {
+        let reserved = "-._*()[]{}>#+=".repeat(200);
+        let mut s = summary(&reserved, Some(&reserved), Some("a@b.c"), &reserved);
+        s.attachments = (0..8)
+            .map(|n| (format!("{n}-{}", "-._".repeat(120)), 1024 * n))
+            .collect();
+
+        let text = notification_text(&s, TimeZone::UTC, Some(&reserved), "fr");
+
+        assert!(
+            text.encode_utf16().count() <= TELEGRAM_MAX_MESSAGE_LEN,
+            "rendered length {} exceeds Telegram's limit",
+            text.encode_utf16().count()
+        );
+        assert!(text.ends_with('…'), "a clamped message must say it was cut");
+        let trailing_backslashes = text.chars().rev().take_while(|c| *c == '\\').count();
+        assert_eq!(
+            trailing_backslashes, 0,
+            "the cut must not leave a dangling escape"
+        );
+    }
+
+    #[test]
+    fn clamp_markdown_leaves_a_short_message_untouched() {
+        assert_eq!(clamp_markdown("Bonjour \\. toi", 100), "Bonjour \\. toi");
+    }
+
+    #[test]
+    fn clamp_markdown_never_splits_an_escape_pair() {
+        // "a\.b" is two units per escaped character; a budget that lands
+        // between the backslash and the dot must back off to before it.
+        let text = clamp_markdown("aaaaaaaaaa\\.", 12);
+        assert!(!text.trim_end_matches('…').ends_with('\\'), "got: {text:?}");
+        assert!(text.encode_utf16().count() <= 12);
     }
 
     #[test]
