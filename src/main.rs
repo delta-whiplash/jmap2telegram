@@ -24,6 +24,7 @@ mod health;
 mod i18n;
 mod jmap;
 mod logging;
+mod render;
 mod state;
 mod store;
 mod topics;

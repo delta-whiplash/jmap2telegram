@@ -15,6 +15,7 @@ use crate::config::ThreadedModeConfig;
 use crate::format::{self, TELEGRAM_MAX_MESSAGE_LEN, chunk_text};
 use crate::i18n;
 use crate::jmap;
+use crate::render;
 use crate::state::{AppState, PendingUndo, UNDO_WINDOW};
 use crate::store::{Account, AccountSlot};
 
@@ -1729,17 +1730,45 @@ async fn callback_handler(bot: Bot, q: CallbackQuery, state: AppState) -> Handle
         }
         "f" => {
             let _ = bot.send_chat_action(chat_id, ChatAction::Typing).await;
-            match jmap::fetch_full_text(&client, email_id).await {
-                Ok(text) => {
+            match jmap::fetch_full_body(&client, email_id).await {
+                Ok(mut body) => {
                     bot.answer_callback_query(q.id).await?;
-                    // An empty body (no text part, no preview) still needs
-                    // *something* readable; the placeholder is localized
-                    // here rather than in the JMAP layer.
-                    let text = if text.trim().is_empty() {
-                        t!("notif.empty_message", locale = lang).to_string()
+                    // The HTML part is the one the sender designed: it
+                    // carries real bold, tappable links and tables that
+                    // collapse onto one line, where the text part is an
+                    // auto-generated afterthought full of `**`, raw URLs
+                    // and one-word-per-line cells. Fall back to it only
+                    // when the HTML renders to nothing (some senders ship
+                    // an image-only body).
+                    let rich = body
+                        .html
+                        .as_deref()
+                        .map(render::spans_from_html)
+                        .unwrap_or_default();
+                    let (mut chunks, as_html) = if rich.is_empty() {
+                        // An empty body (no text part, no preview) still
+                        // needs *something* readable; the placeholder is
+                        // localized here rather than in the JMAP layer.
+                        let text = if body.text.trim().is_empty() {
+                            t!("notif.empty_message", locale = lang).to_string()
+                        } else {
+                            std::mem::take(&mut body.text)
+                        };
+                        (chunk_text(&text, TELEGRAM_MAX_MESSAGE_LEN - 16), false)
                     } else {
-                        text
+                        (
+                            render::chunk_spans(&rich, TELEGRAM_MAX_MESSAGE_LEN - 16),
+                            true,
+                        )
                     };
+                    // The server truncated the body value at our byte cap:
+                    // say so rather than ending mid-sentence as if that
+                    // were the whole mail.
+                    if body.truncated
+                        && let Some(last) = chunks.last_mut()
+                    {
+                        last.push_str("\n…");
+                    }
                     // One chunk failing to send (a flood limit, a network
                     // blip, Telegram hiccup) must not silently abort every
                     // chunk after it - the reader would get the first
@@ -1747,11 +1776,14 @@ async fn callback_handler(bot: Bot, q: CallbackQuery, state: AppState) -> Handle
                     // to hint that content is missing. So: log each
                     // failure, keep sending the rest, and close with a
                     // message listing which parts never arrived.
-                    let chunks = chunk_text(&text, TELEGRAM_MAX_MESSAGE_LEN - 16);
                     let total = chunks.len();
                     let mut failed: Vec<usize> = Vec::new();
                     for (index, chunk) in chunks.into_iter().enumerate() {
-                        if let Err(e) = bot.send_message(chat_id, chunk).await {
+                        let mut request = bot.send_message(chat_id, chunk);
+                        if as_html {
+                            request = request.parse_mode(ParseMode::Html);
+                        }
+                        if let Err(e) = request.await {
                             tracing::error!(
                                 chat_id = chat_id.0,
                                 email_id,

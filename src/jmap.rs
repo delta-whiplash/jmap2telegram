@@ -548,19 +548,34 @@ pub async fn search(client: &Client, query: &str) -> Result<Vec<EmailSummary>> {
         .collect())
 }
 
-/// Fetches the full plain-text body of a message on demand (never cached
-/// to disk, only held in memory long enough to render the Telegram
-/// message).
-pub async fn fetch_full_text(client: &Client, id: &str) -> Result<String> {
+/// The two body shapes "read all" can render: the sender's plain-text
+/// part (the fallback) and the HTML part (the one worth showing).
+#[derive(Debug)]
+pub struct FullBody {
+    pub text: String,
+    pub html: Option<String>,
+    pub truncated: bool,
+}
+
+/// How many bytes of each body value to ask the server for. Body values are
+/// truncated by the server at whatever this says, so it has to be generous:
+/// at the previous 8 KiB, a marketing mail's text part was cut mid-word
+/// ("Si t...") and its HTML part mid-tag, which no converter can repair.
+const MAX_BODY_VALUE_BYTES: usize = 256 * 1024;
+
+/// Fetches the full body of a message on demand (never cached to disk, only
+/// held in memory long enough to render the Telegram message).
+pub async fn fetch_full_body(client: &Client, id: &str) -> Result<FullBody> {
     let mut request = client.build();
     let get_req = request.get_email();
     get_req
         .ids([id])
-        .properties([Property::TextBody, Property::Preview]);
+        .properties([Property::TextBody, Property::HtmlBody, Property::Preview]);
     get_req
         .arguments()
         .fetch_text_body_values(true)
-        .max_body_value_bytes(8000);
+        .fetch_html_body_values(true)
+        .max_body_value_bytes(MAX_BODY_VALUE_BYTES);
 
     let mut response = request
         .send_single::<EmailGetResponse>()
@@ -574,12 +589,25 @@ pub async fn fetch_full_text(client: &Client, id: &str) -> Result<String> {
     };
 
     let mut text = String::new();
+    let mut html = String::new();
+    let mut truncated = false;
     if let Some(parts) = email.text_body() {
         for part in parts {
             if let Some(part_id) = part.part_id()
                 && let Some(value) = email.body_value(part_id)
             {
+                truncated |= value.is_truncated();
                 text.push_str(value.value());
+            }
+        }
+    }
+    if let Some(parts) = email.html_body() {
+        for part in parts {
+            if let Some(part_id) = part.part_id()
+                && let Some(value) = email.body_value(part_id)
+            {
+                truncated |= value.is_truncated();
+                html.push_str(value.value());
             }
         }
     }
@@ -588,7 +616,11 @@ pub async fn fetch_full_text(client: &Client, id: &str) -> Result<String> {
         // localized at the presentation layer (the bot), not here.
         text = email.preview().unwrap_or_default().to_string();
     }
-    Ok(text)
+    Ok(FullBody {
+        text,
+        html: (!html.trim().is_empty()).then_some(html),
+        truncated,
+    })
 }
 
 async fn mailbox_with_role(client: &Client, role: Role) -> Result<Option<String>> {
@@ -1597,7 +1629,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_full_text_reads_the_body_then_falls_back_to_the_preview() {
+    async fn fetch_full_body_reads_both_the_text_part_and_the_html_part() {
         let server = MockServer::start().await;
         let client = mock_client(
             &server,
@@ -1608,18 +1640,27 @@ mod tests {
                         "id": "m1",
                         "preview": "snippet only",
                         "textBody": [{"partId": "1"}],
-                        "bodyValues": {"1": {"value": "Hello, world."}}
+                        "htmlBody": [{"partId": "2"}],
+                        "bodyValues": {
+                            "1": {"value": "Hello, world."},
+                            "2": {"value": "<p>Hello, <b>world</b>.</p>"}
+                        }
                     }]
                 }
             }),
         )
         .await;
-        assert_eq!(
-            fetch_full_text(&client, "m1").await.unwrap(),
-            "Hello, world."
-        );
 
-        // No body parts at all: the preview is the fallback.
+        let body = fetch_full_body(&client, "m1").await.unwrap();
+        assert_eq!(body.text, "Hello, world.");
+        assert_eq!(body.html.as_deref(), Some("<p>Hello, <b>world</b>.</p>"));
+        assert!(!body.truncated);
+    }
+
+    #[tokio::test]
+    async fn fetch_full_body_falls_back_to_the_preview_and_reports_truncation() {
+        // No body parts at all: the preview is the fallback, and there is
+        // no HTML to render.
         let preview_server = MockServer::start().await;
         let preview_client = mock_client(
             &preview_server,
@@ -1631,12 +1672,38 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(
-            fetch_full_text(&preview_client, "m1").await.unwrap(),
-            "snippet only"
-        );
+        let body = fetch_full_body(&preview_client, "m1").await.unwrap();
+        assert_eq!(body.text, "snippet only");
+        assert!(body.html.is_none());
+        assert!(!body.truncated);
 
-        // An empty list means the message is gone.
+        // A body value the server cut at our byte cap is flagged, so the
+        // reader is told the mail ends there instead of guessing.
+        let truncated_server = MockServer::start().await;
+        let truncated_client = mock_client(
+            &truncated_server,
+            json!({
+                "Email/get": {
+                    "accountId": "acc1", "state": "s", "notFound": [],
+                    "list": [{
+                        "id": "m1",
+                        "preview": "snippet",
+                        "textBody": [{"partId": "1"}],
+                        "bodyValues": {
+                            "1": {"value": "Hello, wor", "isTruncated": true}
+                        }
+                    }]
+                }
+            }),
+        )
+        .await;
+        let body = fetch_full_body(&truncated_client, "m1").await.unwrap();
+        assert_eq!(body.text, "Hello, wor");
+        assert!(body.truncated);
+    }
+
+    #[tokio::test]
+    async fn fetch_full_body_reports_a_message_that_is_gone() {
         let empty_server = MockServer::start().await;
         let empty_client = mock_client(
             &empty_server,
@@ -1648,7 +1715,7 @@ mod tests {
         )
         .await;
         assert!(matches!(
-            fetch_full_text(&empty_client, "m1").await.unwrap_err(),
+            fetch_full_body(&empty_client, "m1").await.unwrap_err(),
             JmapError::MessageNotFound
         ));
     }
