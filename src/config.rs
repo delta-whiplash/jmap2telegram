@@ -1,9 +1,8 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::str::FromStr;
 
 use anyhow::{Context, Result, bail};
-use chrono_tz::Tz;
+use jiff::tz::TimeZone;
 use teloxide::types::ChatId;
 
 /// Runtime configuration, loaded exclusively from environment variables.
@@ -27,10 +26,10 @@ pub struct Config {
     pub allow_private_jmap_hosts: bool,
     /// IANA timezone (e.g. `Europe/Paris`) used to render timestamps in
     /// notifications and log output. Defaults to UTC. Backed by
-    /// `chrono-tz`'s bundled zone database rather than the system's
-    /// (the distroless runtime image has none), so this works the same
+    /// `jiff`'s bundled zone database rather than the system's (the
+    /// distroless runtime image has none), so this works the same
     /// regardless of deployment target.
-    pub timezone: Tz,
+    pub timezone: TimeZone,
     /// Language used when neither a stored preference nor the Telegram
     /// `language_code` resolves to a shipped locale. Backed by
     /// `BOT_LANGUAGE`; must be one of the locales in `locales/` (see
@@ -207,7 +206,7 @@ impl Config {
             authorized_chat_ids,
             data_dir: data_dir.to_path_buf(),
             allow_private_jmap_hosts: true,
-            timezone: chrono_tz::Tz::UTC,
+            timezone: TimeZone::UTC,
             default_language: "en".to_string(),
             telegram_threaded_mode: ThreadedModeConfig::Auto,
             telegram_thread_strategy: ThreadStrategyConfig::Account,
@@ -219,10 +218,10 @@ impl Config {
 /// Shared by `Config::parse` and `main`'s early logging setup (which needs
 /// the timezone before `Config` itself is loaded, to time-stamp log lines
 /// from the very first one).
-pub fn parse_timezone(raw: Option<&str>) -> Result<Tz> {
+pub fn parse_timezone(raw: Option<&str>) -> Result<TimeZone> {
     match raw {
-        None | Some("") => Ok(Tz::UTC),
-        Some(name) => Tz::from_str(name).map_err(|_| {
+        None | Some("") => Ok(TimeZone::UTC),
+        Some(name) => TimeZone::get(name).map_err(|_| {
             anyhow::anyhow!(
                 "invalid TIMEZONE '{name}' (expected an IANA zone name, e.g. 'Europe/Paris')"
             )
@@ -377,7 +376,7 @@ mod tests {
     #[test]
     fn timezone_defaults_to_utc() {
         let cfg = minimal("tok", "1").unwrap();
-        assert_eq!(cfg.timezone, Tz::UTC);
+        assert_eq!(cfg.timezone, TimeZone::UTC);
     }
 
     #[test]
@@ -394,7 +393,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(cfg.timezone, Tz::Europe__Paris);
+        assert_eq!(cfg.timezone, TimeZone::get("Europe/Paris").unwrap());
     }
 
     #[test]
@@ -509,7 +508,7 @@ mod tests {
 
     #[test]
     fn parse_timezone_treats_empty_string_as_utc() {
-        assert_eq!(parse_timezone(Some("")).unwrap(), Tz::UTC);
-        assert_eq!(parse_timezone(None).unwrap(), Tz::UTC);
+        assert_eq!(parse_timezone(Some("")).unwrap(), TimeZone::UTC);
+        assert_eq!(parse_timezone(None).unwrap(), TimeZone::UTC);
     }
 }

@@ -1188,7 +1188,8 @@ async fn cmd_rechercher(
         } else {
             Some(slot_id.as_str())
         };
-        let text = format::notification_text(summary, state.config.timezone, account_label, lang);
+        let text =
+            format::notification_text(summary, state.config.timezone.clone(), account_label, lang);
         let keyboard =
             format::notification_keyboard(&summary.id, btn_account_id, false, false, lang);
         target

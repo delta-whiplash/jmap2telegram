@@ -460,7 +460,12 @@ async fn sync_and_notify(
         }
 
         let lang = state.language_for(chat_id, None);
-        let text = notification_text(&email.summary, state.config.timezone, target.label(), lang);
+        let text = notification_text(
+            &email.summary,
+            state.config.timezone.clone(),
+            target.label(),
+            lang,
+        );
         let keyboard =
             notification_keyboard(&email.summary.id, target.account_id(), false, false, lang);
 
