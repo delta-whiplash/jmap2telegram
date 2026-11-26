@@ -148,9 +148,12 @@ What you get on Stalwart specifically:
   refused before anything is read, stored, or logged.
 - **Encrypted at rest.** Credentials are stored AES-256-GCM encrypted,
   with a random master key generated on first boot and kept at 0600 on
-  disk. No email content is ever written to disk - full message bodies
-  are fetched on demand and only held in memory long enough to relay them
-  to Telegram.
+  disk. If `state.enc` is present but `master.key` is missing (a wiped
+  volume, a restored data directory), the bot refuses to start rather than
+  mint a key that could never decrypt the existing state: restore the key
+  from a backup, or remove `state.enc` to start from an empty store. No
+  email content is ever written to disk - full message bodies are fetched
+  on demand and only held in memory long enough to relay them to Telegram.
 - **The `/login` message self-destructs.** The message carrying your JMAP
   token is deleted from the chat immediately after the bot reads it.
 - **Right to erasure.** `/logout` permanently and immediately wipes that

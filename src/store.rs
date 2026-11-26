@@ -338,9 +338,27 @@ impl Store {
         fs::create_dir_all(dir).with_context(|| format!("creating data dir {dir:?}"))?;
 
         let key_path = dir.join("master.key");
+        let state_path = dir.join("state.enc");
+
+        // Refuse to mint a key behind an existing state file. The old key
+        // is the only thing that can decrypt `state.enc`, and a fresh one
+        // written in its place can only ever decrypt what it wrote itself
+        // - so the previous state (every connected account) would be
+        // silently lost forever, with the file still sitting there looking
+        // healthy. Failing loudly leaves it intact for an operator to
+        // restore the key from their backup and fix the mount.
+        if state_path.exists() && !key_path.exists() {
+            bail!(
+                "found {:?} without its master key {:?}: refusing to create a new key \
+                 (it could never decrypt the existing state) - restore master.key from \
+                 a backup, or remove state.enc to start from an empty store",
+                state_path,
+                key_path
+            );
+        }
+
         let key = load_or_create_key(&key_path)?;
 
-        let state_path = dir.join("state.enc");
         let data = if state_path.exists() {
             let ciphertext = fs::read(&state_path).context("reading state file")?;
             decrypt(&key, &ciphertext)
@@ -936,6 +954,35 @@ mod tests {
         drop(store);
         let reopened = Store::open(dir.path()).unwrap();
         assert_eq!(reopened.get(42).unwrap().email(), "user@example.org");
+    }
+
+    /// Losing `master.key` while `state.enc` survives used to mint a new
+    /// key on the next boot, which then failed to decrypt the state and
+    /// left an undecryptable file plus a brand-new key - a crash loop with
+    /// the data effectively destroyed. `open` now refuses before writing
+    /// anything.
+    #[test]
+    fn open_refuses_to_replace_a_missing_key_next_to_an_existing_state_file() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("state.enc"), b"ciphertext-with-unknown-key").unwrap();
+
+        let err = Store::open(dir.path())
+            .err()
+            .expect("an orphaned state file must not be silently re-keyed");
+
+        assert!(
+            err.to_string().contains("refusing to create a new key"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !dir.path().join("master.key").exists(),
+            "a new key must not be written on that path"
+        );
+        assert_eq!(
+            fs::read(dir.path().join("state.enc")).unwrap(),
+            b"ciphertext-with-unknown-key",
+            "the existing state file must be left untouched"
+        );
     }
 
     #[test]
