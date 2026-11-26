@@ -1,4 +1,4 @@
-use chrono_tz::Tz;
+use jiff::tz::TimeZone;
 use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup};
 
 use crate::jmap::EmailSummary;
@@ -31,7 +31,7 @@ fn truncate(input: &str, limit: usize) -> String {
 /// case). `lang` is the recipient chat's resolved locale.
 pub fn notification_text(
     summary: &EmailSummary,
-    tz: Tz,
+    tz: TimeZone,
     account_label: Option<&str>,
     lang: &str,
 ) -> String {
@@ -43,10 +43,10 @@ pub fn notification_text(
 
     let when = summary
         .received_at
-        .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0))
-        .map(|dt| {
-            dt.with_timezone(&tz)
-                .format("%d/%m/%Y %H:%M %Z")
+        .and_then(|ts| jiff::Timestamp::from_second(ts).ok())
+        .map(|ts| {
+            jiff::ZonedDateTime::new(ts, tz)
+                .strftime("%d/%m/%Y %H:%M %Z")
                 .to_string()
         })
         .unwrap_or_default();
@@ -510,7 +510,7 @@ mod tests {
             Some("alice@example.org"),
             "Hi there",
         );
-        let text = notification_text(&s, Tz::UTC, None, "fr");
+        let text = notification_text(&s, TimeZone::UTC, None, "fr");
         assert!(text.contains("Alice"));
         // '.' is a MarkdownV2 special char, so the address is expected
         // escaped in the rendered text, not verbatim.
@@ -522,14 +522,14 @@ mod tests {
     #[test]
     fn notification_text_falls_back_when_sender_unknown() {
         let s = summary("Hello", None, None, "Hi there");
-        let text = notification_text(&s, Tz::UTC, None, "fr");
+        let text = notification_text(&s, TimeZone::UTC, None, "fr");
         assert!(text.contains("expéditeur inconnu"));
     }
 
     #[test]
     fn notification_text_uses_address_when_name_missing() {
         let s = summary("Hello", None, Some("bob@example.org"), "Hi");
-        let text = notification_text(&s, Tz::UTC, None, "fr");
+        let text = notification_text(&s, TimeZone::UTC, None, "fr");
         assert!(text.contains(r"bob@example\.org"));
     }
 
@@ -543,7 +543,7 @@ mod tests {
             Some("a@b.c"),
             "",
         );
-        let text = notification_text(&s, Tz::UTC, None, "fr");
+        let text = notification_text(&s, TimeZone::UTC, None, "fr");
         assert!(text.contains(r"\*bold\* \_italic\_ \[link\]\(evil\) \`code\`"));
     }
 
@@ -551,7 +551,7 @@ mod tests {
     fn notification_text_truncates_long_preview() {
         let long_preview = "a".repeat(1000);
         let s = summary("Subject", None, Some("a@b.c"), &long_preview);
-        let text = notification_text(&s, Tz::UTC, None, "fr");
+        let text = notification_text(&s, TimeZone::UTC, None, "fr");
         // 400 chars kept + ellipsis marker, well short of the original 1000.
         assert!(text.len() < 700);
         assert!(text.contains('…'));
@@ -564,7 +564,7 @@ mod tests {
         // dropped (send_message fails, but the JMAP cursor still advances).
         let long_subject = "s".repeat(5000);
         let s = summary(&long_subject, None, Some("a@b.c"), "preview");
-        let text = notification_text(&s, Tz::UTC, None, "fr");
+        let text = notification_text(&s, TimeZone::UTC, None, "fr");
         assert!(text.chars().count() < TELEGRAM_MAX_MESSAGE_LEN);
         assert!(text.contains('…'));
     }
@@ -573,7 +573,7 @@ mod tests {
     fn notification_text_truncates_malicious_long_sender_name() {
         let long_name = "n".repeat(5000);
         let s = summary("Subject", Some(&long_name), Some("a@b.c"), "preview");
-        let text = notification_text(&s, Tz::UTC, None, "fr");
+        let text = notification_text(&s, TimeZone::UTC, None, "fr");
         assert!(text.chars().count() < TELEGRAM_MAX_MESSAGE_LEN);
     }
 
@@ -584,11 +584,11 @@ mod tests {
         // a display name is also present.
         let long_addr = format!("{}@example.org", "a".repeat(5000));
         let s = summary("Subject", None, Some(&long_addr), "preview");
-        let text = notification_text(&s, Tz::UTC, None, "fr");
+        let text = notification_text(&s, TimeZone::UTC, None, "fr");
         assert!(text.chars().count() < TELEGRAM_MAX_MESSAGE_LEN);
 
         let s_with_name = summary("Subject", Some("Alice"), Some(&long_addr), "preview");
-        let text_with_name = notification_text(&s_with_name, Tz::UTC, None, "fr");
+        let text_with_name = notification_text(&s_with_name, TimeZone::UTC, None, "fr");
         assert!(text_with_name.chars().count() < TELEGRAM_MAX_MESSAGE_LEN);
     }
 
@@ -598,10 +598,12 @@ mod tests {
         // CET (UTC+1) at that instant, so the rendered hour must differ
         // from the UTC rendering rather than silently always being UTC.
         let s = summary("Subject", None, Some("a@b.c"), "preview");
-        let utc_text = notification_text(&s, Tz::UTC, None, "fr");
-        let paris_text = notification_text(&s, chrono_tz::Europe::Paris, None, "fr");
+        let utc_text = notification_text(&s, TimeZone::UTC, None, "fr");
+        let paris_text = notification_text(&s, TimeZone::get("Europe/Paris").unwrap(), None, "fr");
         assert!(utc_text.contains("22:13"));
+        assert!(utc_text.contains("UTC"));
         assert!(paris_text.contains("23:13"));
+        assert!(paris_text.contains("CET"));
         assert_ne!(utc_text, paris_text);
     }
 
@@ -728,7 +730,7 @@ mod tests {
             Some("alice@example.org"),
             "Hi there",
         );
-        let text = notification_text(&s, Tz::UTC, None, "fr");
+        let text = notification_text(&s, TimeZone::UTC, None, "fr");
         assert!(text.contains("(mailto:alice@example.org)"));
     }
 
@@ -738,21 +740,21 @@ mod tests {
         // must not be able to break out of the MarkdownV2 link's URL part.
         let hostile_addr = "a)\\evil@example.org";
         let s = summary("Hello", None, Some(hostile_addr), "Hi");
-        let text = notification_text(&s, Tz::UTC, None, "fr");
+        let text = notification_text(&s, TimeZone::UTC, None, "fr");
         assert!(text.contains(r"(mailto:a\)\\evil@example.org)"));
     }
 
     #[test]
     fn notification_text_falls_back_to_plain_text_when_no_address() {
         let s = summary("Hello", None, None, "Hi there");
-        let text = notification_text(&s, Tz::UTC, None, "fr");
+        let text = notification_text(&s, TimeZone::UTC, None, "fr");
         assert!(!text.contains("mailto:"));
     }
 
     #[test]
     fn notification_text_renders_preview_as_a_blockquote() {
         let s = summary("Hello", None, Some("a@b.c"), "line one\nline two");
-        let text = notification_text(&s, Tz::UTC, None, "fr");
+        let text = notification_text(&s, TimeZone::UTC, None, "fr");
         assert!(text.contains(">line one"));
         assert!(text.contains(">line two"));
     }
@@ -764,7 +766,7 @@ mod tests {
             ("rapport.pdf".to_string(), 250_000),
             ("photo.jpg".to_string(), 1_500_000),
         ];
-        let text = notification_text(&s, Tz::UTC, None, "fr");
+        let text = notification_text(&s, TimeZone::UTC, None, "fr");
         assert!(text.contains("📎"));
         // '.' and the parens are all MarkdownV2-reserved, so they're
         // expected escaped in the rendered text.
@@ -775,7 +777,7 @@ mod tests {
     #[test]
     fn notification_text_omits_attachments_line_when_none() {
         let s = summary("Hello", None, Some("a@b.c"), "Hi");
-        let text = notification_text(&s, Tz::UTC, None, "fr");
+        let text = notification_text(&s, TimeZone::UTC, None, "fr");
         assert!(!text.contains("📎"));
     }
 
@@ -783,7 +785,7 @@ mod tests {
     fn notification_text_caps_attachment_list_and_escapes_hostile_names() {
         let mut s = summary("Hello", None, Some("a@b.c"), "Hi");
         s.attachments = (0..8).map(|i| (format!("*evil{i}*.txt"), 100)).collect();
-        let text = notification_text(&s, Tz::UTC, None, "fr");
+        let text = notification_text(&s, TimeZone::UTC, None, "fr");
         // Only the first 5 are listed, with the rest summarized.
         assert!(text.contains(r"\(\+3 autres\)"));
         // A malicious attachment name must not inject Markdown formatting.
@@ -793,10 +795,10 @@ mod tests {
     #[test]
     fn notification_text_includes_mailbox_line_for_shared_account() {
         let s = summary("Hello", Some("Alice"), Some("alice@example.org"), "Hi");
-        let text = notification_text(&s, Tz::UTC, Some("contact@delta-net.ovh"), "fr");
+        let text = notification_text(&s, TimeZone::UTC, Some("contact@delta-net.ovh"), "fr");
         assert!(text.contains(r"contact@delta\-net\.ovh"));
         // The common (no shared account) case must stay unaffected.
-        let plain = notification_text(&s, Tz::UTC, None, "fr");
+        let plain = notification_text(&s, TimeZone::UTC, None, "fr");
         assert!(!plain.contains("Boîte"));
     }
 
@@ -807,7 +809,7 @@ mod tests {
         // nothing French leaks through.
         let mut s = summary("", None, None, "");
         s.attachments = vec![("report.pdf".to_string(), 1_500_000)];
-        let text = notification_text(&s, Tz::UTC, None, "en");
+        let text = notification_text(&s, TimeZone::UTC, None, "en");
         assert!(text.contains("*New message*"));
         assert!(text.contains(r"\(unknown sender\)"));
         assert!(text.contains(r"\(no subject\)"));

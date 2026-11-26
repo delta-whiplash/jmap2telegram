@@ -54,7 +54,7 @@ async fn main() -> anyhow::Result<()> {
     // even the earliest log lines), so it's parsed once here and again
     // inside `Config::parse` - both go through the same validated helper.
     let early_timezone = config::parse_timezone(std::env::var("TIMEZONE").ok().as_deref())
-        .unwrap_or(chrono_tz::Tz::UTC);
+        .unwrap_or(jiff::tz::TimeZone::UTC);
     logging::init(std::env::var("LOG_LEVEL").ok().as_deref(), early_timezone);
 
     let config = Arc::new(Config::from_env()?);

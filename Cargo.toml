@@ -16,9 +16,15 @@ repository = "https://github.com/delta-whiplash/jmap2telegram"
 [dependencies]
 aes-gcm = "0.11.1"
 anyhow = "1.0.104"
-chrono = "0.4.45"
-chrono-tz = "0.10.4"
 futures-util = "0.3.34"
+# jiff replaces chrono + chrono-tz (both unmaintained since 2026-09,
+# RUSTSEC-2026-0543 / -0555). `tzdb-bundle-always` embeds the IANA
+# database in the binary, which is what chrono-tz's bundled DB gave us and
+# what the distroless runtime image needs (no /usr/share/zoneinfo);
+# `tz-fat` keeps zone abbreviations so `%Z` renders "CET"/"JST" instead of
+# a numeric offset. Default features are dropped to avoid pulling both the
+# bundled and the system/zoneinfo lookups.
+jiff = { version = "1.0.3", default-features = false, features = ["std", "tz-fat", "tzdb-bundle-always"] }
 # default-features = false matters here: jmap-client's defaults are
 # [async, websockets, aws_lc_rs] and we only need `async` (plain
 # HTTP + EventSource, not JMAP-over-WebSocket) - this drops the unused
