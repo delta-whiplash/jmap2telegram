@@ -269,6 +269,13 @@ restores the message to exactly the mailboxes it was in before - an
 in-memory, non-persisted safety net for an accidental tap, not a second
 trash bin.
 
+**📖 Read all** renders the body from the message's HTML part - real bold,
+italic and tappable links, table rows collapsed onto one line, hidden
+preheaders dropped - and falls back to the plain-text part (then the
+preview) only when there is no HTML to read. The body is fetched on
+demand, capped at 256 KiB, and a body the server cut at that cap ends
+with a visible `…` instead of stopping mid-word.
+
 ### What gets notified
 
 The bot reports **what arrived**, not what the mailbox contains. Every
