@@ -87,6 +87,22 @@
   but not the error oracle - even opted in, network failures still only
   ever produce the generic chat message.
 
+  The same guard also covers the endpoints the *server* names: the
+  session document's `apiUrl` and `eventSourceUrl` are what every later
+  request and the push stream actually use, with the bearer token
+  attached, and `jmap-client` takes them verbatim. Validating only the
+  host the user typed would let a hostile (or compromised) JMAP server
+  answer `/login` with `"apiUrl": "http://10.0.0.5/jmap"` and receive
+  every sync of the session, token included, from inside the
+  deployment's own network. Both URLs are now re-checked once, where
+  they are adopted: `https` only, and the resolution guard above unless
+  `ALLOW_PRIVATE_JMAP_HOSTS=1`. A provider that splits its webmail and
+  API across two public hostnames keeps working - the check is about
+  scheme and reachability, not same-origin. Regression tests:
+  `session_urls_must_be_https_to_carry_the_bearer_token` and
+  `session_urls_are_held_to_the_same_ssrf_guard_as_the_typed_host` in
+  `src/jmap.rs`.
+
   Residual risk - a known, accepted TOCTOU: the guard resolves the
   hostname once, right before the session handshake, and `jmap-client`
   re-resolves on every request (the crate builds its own internal
